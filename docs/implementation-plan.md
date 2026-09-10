@@ -19,6 +19,14 @@ design. Three change this plan rather than only the specification:
 - **P3** gains three guards that are correctness requirements, not polish: the unhealthy-pod guard, external
   replica-change detection, and the rollout hold.
 
+**Architecture closure (v0.1.2).** That P2 prerequisite is now **closed**, not merely scheduled: the work
+store is a PostgreSQL work-item table with `FOR UPDATE SKIP LOCKED` claiming and transactional
+acknowledgement, and the backlog signal moves from NiFi's REST API to the store's claimable count
+([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)…[ADR-20](architecture.md#adr-20-how-is-in-flight-work-protected-without-a-shared-filesystem),
+[architecture § 11](architecture.md#11-phase-1-architecture-baseline)). All seven open questions are resolved
+or deferred with a stated default ([§8](#8-open-questions)); **no Phase 1 blockers remain**, and P1 becomes
+slightly smaller because the NiFi REST client disappears.
+
 ---
 
 ## 1. Sequencing principle
@@ -81,8 +89,8 @@ gantt
     Observability + dry-run run    :p1e, after p1d, 3d
 
     section P2 Demo pipeline
-    SFTP + NiFi 2.6.7 + work store :p2a, after p1e, 4d
-    Processing app + reaper        :p2b, after p2a, 4d
+    SFTP + NiFi + Postgres store   :p2a, after p1e, 4d
+    Processing app + claim loop    :p2b, after p2a, 4d
     kind topology, ballast, generator :p2c, after p2b, 3d
 
     section P3 Actuation
@@ -144,9 +152,11 @@ This is the phase where the project's central claim is validated.
   [resource-calculation](resource-calculation.md) — candidate filtering with taints, `nodeSelector`, required
   node affinity; effective pod request with sidecars, init containers, and overhead; per-node free requestable
   resources; fit capacity with margin; blocking dimension.
-- `internal/metrics`: `metrics.k8s.io` utilization (Ready pods only) and a backlog source behind an interface.
-  P1 uses `workload.source: none|http` — a static or HTTP-provided backlog — so the engine can be exercised
-  before NiFi exists.
+- `internal/metrics`: `metrics.k8s.io` utilization (Ready **and warm** pods only,
+  [FR-28](requirements.md#review-driven-requirements-v011)) and a backlog source behind an interface. P1 uses
+  `workload.source: none|http` — a static or HTTP-provided backlog — so the engine can be exercised before the
+  pipeline exists. The `workstore` source arrives in P2; no NiFi REST client is built at any point
+  ([ADR-19](architecture.md#adr-19-where-does-the-backlog-signal-come-from)).
 - `internal/scaling`: `Snapshot`, `Decision`, reason codes, and `Decide` implementing
   [scaling-algorithm §§ 3–6](scaling-algorithm.md#3-step-1--compute-desired-replicas). Cooldown/window/backoff
   fields exist in the snapshot and are honoured, but the controller does not yet maintain history across
@@ -174,7 +184,7 @@ comparison against a real cluster proves the *model* matches Kubernetes. This is
 discover a misunderstanding of `allocatable`, sidecar accounting, or taint semantics — before any code can
 scale anything.
 
-**Not in this phase.** Writes of any kind, cooldown state persistence, the watchdog, NiFi.
+**Not in this phase.** Writes of any kind, cooldown state persistence, the watchdog, the demo pipeline.
 
 ---
 
@@ -183,36 +193,44 @@ scale anything.
 **Goal.** A real pipeline whose backlog is a genuine demand signal, and a cluster topology in which resource
 exhaustion is reachable on purpose.
 
-**Blocking prerequisite (resolve before any pipeline work).** Choose and verify the work store, per
-[DR-12](design-review.md#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment):
-either an in-cluster **NFS RWX provisioner** (recommended — POSIX rename stays atomic, so the claim protocol
-is trivially correct) or **MinIO with a conditional-write claim** (`If-None-Match` or a lease object) instead
-of rename. kind's default `local-path-provisioner` is **not** an option: it yields node-local `ReadWriteOnce`
-volumes, so a "shared" PVC silently becomes per-node directories and items become invisible to workers on
-other nodes. DI-08 must pass, on a multi-node cluster, before the rest of P2 proceeds.
+**Architecture is settled before this phase starts.** The work store is a PostgreSQL work-item table
+([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)); the former blocking
+prerequisite is closed ([§8.2](#82-formerly-blocking-items-now-closed)). **DI-08 and DI-09 gate the rest of
+the phase**: until exclusive claiming and transactional acknowledgement are proven on a multi-node cluster,
+no conservation assertion built on them means anything.
 
 **Deliverables**
 
-- `deploy/demo/`: `atmoz/sftp` server; NiFi 2.6.7 StatefulSet with FlowFile/content/provenance repositories on
-  PVCs ([D-01](requirements.md#7-data-loss-protection-assumptions)); flow definition `ListSFTP → FetchSFTP →
-  PutFile` into the shared work store; work store as an RWX PVC (MinIO remains the alternative — see
-  [§8](#8-open-questions)).
-- Processing application (small Go binary): claims items by atomic rename into `/work/inflight/<pod>/`, writes
-  output to a temporary name then atomically renames, deletes the input last, exposes an in-flight count for
-  `pod-deletion-cost`, and implements a `preStop` drain (D-02…D-06).
-- Reaper returning stale claims after `inflightReclaimAfter` (D-04).
+- `deploy/demo/`: `atmoz/sftp`; NiFi 2.6.7 StatefulSet with repositories on PVCs
+  ([D-01](requirements.md#7-data-loss-protection-assumptions)); **PostgreSQL StatefulSet** with the schema
+  from [ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline), two roles
+  (read/write for the pipeline, **read-only** for the controller), and a single `ReadWriteOnce` PVC.
+- NiFi flow `ListSFTP → FetchSFTP → ConvertRecord → PutDatabaseRecord`, plus an **init container supplying a
+  pinned PostgreSQL JDBC driver** — the NiFi image does not bundle one, and this is the detail most likely to
+  cost an unplanned afternoon.
+- Processing application (small Go binary): claim loop (`FOR UPDATE SKIP LOCKED` + lease), per-item
+  normalization with a configurable CPU cost, **output insert and acknowledgement in one transaction**,
+  in-flight count endpoint for `pod-deletion-cost`, and a `preStop` drain
+  ([WR-01](requirements.md#work-store-requirements-v012)…[WR-07](requirements.md#work-store-requirements-v012)).
+- `work-store-cleanup` CronJob: prunes `done` rows, exports a stuck-item gauge. Explicitly **not** on the
+  correctness path.
 - `file-generator` Job producing controlled spikes (rate, count, size distribution).
 - `ballast` Deployment for deterministic capacity shaping, plus the kind topology from
   [test-plan § 7](test-plan.md#7-local-demonstration-environment).
-- `internal/metrics` NiFi backlog source: authenticated REST client, connection-queue summation, timeout,
-  staleness stamping, EWMA smoothing.
-- `PodDisruptionBudget`, memory limits, and `terminationGracePeriodSeconds` on the processor (D-07, A-07).
+- `internal/metrics` work-store backlog source: read-only pool capped at 2, query timeout, staleness stamping,
+  EWMA smoothing, and *unavailable*-on-error semantics
+  ([FR-36](requirements.md#work-store-requirements-v012)…[FR-38](requirements.md#work-store-requirements-v012)).
+- `PodDisruptionBudget`, memory limits, and `terminationGracePeriodSeconds` on the processor (D-07, A-07), with
+  `leaseDuration` validated to exceed both the grace period and the maximum item time
+  ([FS-29](failure-scenarios.md#fs-29-lease-expires-while-the-worker-is-still-alive)).
 
 **Exit criteria**
 
-- Files flow SFTP → NiFi → processor → output at a fixed replica count, with conservation verified
-  (`DI-04`, `DI-05`).
-- The controller's backlog metric tracks NiFi's own queue count within one sample interval.
+- `DI-08` and `DI-09` pass on the 3-worker kind cluster **before** any other P2 exit criterion is assessed.
+- Files flow SFTP → NiFi → work store → processor → output at a fixed replica count, with conservation
+  verified (`DI-04`, `DI-05`, `DI-10`).
+- The controller's backlog metric equals a direct `count(*)` of claimable rows within one sample interval, and
+  `IT-16` confirms the read-only role and the unavailable-not-zero behaviour.
 - **`itemsPerReplica` measured, not guessed:** at fixed replica counts, find the backlog level at which
   per-item latency reaches the SLO; record the measurement and its method in `docs/` alongside the resulting
   default.
@@ -338,14 +356,16 @@ Two of these deserve a note because they are the ones most likely to be requeste
 | --- | --- | --- | --- | --- | --- |
 | R-1 | Fit-capacity model diverges from real scheduler behaviour | Pending pods; the core claim fails | Medium | P1 manual validation gate; `fitCapacityMarginPods`; Pending watchdog; predicate table as an explicit contract | P1, P3 |
 | R-2 | `itemsPerReplica` unstable across file mixes | Under- or over-provisioning | High | Measure in P2; utilization signal as the safety net ([scaling-algorithm § 3.2](scaling-algorithm.md#32-utilization-derived-target)); queueing model in P5 | P2 |
-| R-3 | NiFi 2.6.7 REST/auth surprises (TLS, single-user auth, connection IDs) | Backlog signal unavailable | Medium | Interface + fake from P1; `source: none|http` fallback keeps P1 unblocked; `HoldStaleMetrics` is a safe degradation | P2 |
+| R-3 | ~~NiFi REST/auth surprises~~ → **NiFi→PostgreSQL integration** (JDBC driver provisioning, record-to-row conversion, `item_key` determinism) | Pipeline cannot land work | Medium | Driver pinned and vendored in `deploy/demo/`; `source: none\|http` fallback keeps P1 and the controller unblocked regardless. The controller no longer depends on NiFi at all, which removes the original form of this risk ([ADR-19](architecture.md#adr-19-where-does-the-backlog-signal-come-from)) | P2 |
 | R-4 | kind cannot make resource exhaustion reproducible | Demo unconvincing | Low | Ballast pods as the primary mechanism (deterministic, and a better illustration than small nodes); kubelet reserved as a refinement | P2 |
 | R-5 | Hysteresis parameters mis-tuned; sluggish or flappy | Poor demo, distrust | Medium | `E2E-06` bounds action counts; `SK-01` soak; tuning table in [scaling-algorithm § 12](scaling-algorithm.md#12-tuning-guidance) | P3, P4 |
 | R-6 | Data-integrity assumptions violated by the workload implementation | S1 data loss in the demo | Medium | D-01…D-07 are explicit requirements with owning DI tests; [FS-4.3](failure-scenarios.md#43-what-would-invalidate-the-claim) lists invalidating changes as review items | P2, P3 |
 | R-7 | Scope creep toward a production controller | POC never lands | High | Phase gates with test-based exit criteria; P5 exists to absorb good ideas without absorbing schedule | all |
 | R-8 | Metrics cardinality (per-node series) on large clusters | Prometheus load | Low | Per-node metrics toggleable; bounded by cluster size ([resource-calculation § 9](resource-calculation.md#9-complexity-and-performance)) | P4 |
 | R-9 | Docs drift from implementation | Design set becomes misleading | Medium | Link check in CI; P4 documentation reconciliation task; ADRs amended, not rewritten | P4 |
-| R-10 | Work store cannot provide atomic exclusive claiming; a "shared" volume is silently per-node | **S1 in the demo**: items invisible to some workers, indistinguishable from loss | Medium | Blocking P2 prerequisite with a cross-node verification test (DI-08); NFS provisioner recommended ([DR-12](design-review.md#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment)) | P2 |
+| R-10 | ~~Work store cannot provide atomic exclusive claiming~~ **Closed by design change** | Was S1 in the demo | — | Claiming is now database-enforced (`FOR UPDATE SKIP LOCKED`) and gated by DI-08/DI-09 ([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)) | Closed |
+| R-13 | Work store becomes the bottleneck or a single point of failure | Backlog measures database contention, not demand; more replicas cannot help | Medium | Bounded worker pools; claim-latency and connection-saturation metrics beside the backlog on the dashboard; accepted POC trade recorded as [A-14](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)/[A-15](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful) ([FS-28](failure-scenarios.md#fs-28-work-store-unavailable-or-saturated)) | P2, P4 |
+| R-14 | `leaseDuration` mis-set below the maximum item time | Silent duplicate processing; wasted capacity that looks like insufficient capacity | Medium | Startup validation in the worker; reprocessing-rate metric; the constraint is stated in [requirements § 7](requirements.md#7-data-loss-protection-assumptions) rather than left in a manifest comment ([FS-29](failure-scenarios.md#fs-29-lease-expires-while-the-worker-is-still-alive)) | P2 |
 | R-11 | A GitOps controller or operator also manages `replicas` | Unbounded oscillation with an external actor | Medium | Detect, adopt, and abstain ([FR-31](requirements.md#review-driven-requirements-v011)); deployment prerequisite to grant field ownership ([A-10](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)) | P3 |
 | R-12 | Performance-motivated refactors reintroduce the DR-01 ordering bug | Backoff silently becomes timer-based; recovery latency grows to 15 min | Medium | UT-25 asserts reset-on-recomputed-capacity; [I-10](design-review.md#5-immutable-phase-1-decisions) marks the ordering immutable | P3, P4 |
 
@@ -405,14 +425,44 @@ expedience — invalidates parts of this plan and its tests, so it requires an a
 
 ## 8. Open questions
 
-Resolve during the phase indicated; each is a genuine fork, not a placeholder.
+**All questions are now closed for Phase 1.** Five are resolved by decision, two are deferred with a stated
+default that implementation will follow unless data contradicts it. **No Phase 1 blockers remain.**
 
-| # | Question | Options | Resolve in |
+| # | Question | Status | Resolution and why |
 | --- | --- | --- | --- |
-| Q-1 | Backlog signal: NiFi queued FlowFiles, work-store file count, or both? | NiFi count is one API call and reflects upstream demand earliest; the file count is what processing pods actually consume, and the two diverge while NiFi is writing | P2, once both can be measured side by side |
-| Q-2 | ~~Work store: RWX PVC or MinIO/S3?~~ **Resolved as a blocking prerequisite** | Not a free choice: kind's default provisioner is node-local, and object stores have no atomic rename. Either an NFS RWX provisioner (recommended) or MinIO with conditional-write claims | **Decided before P2 starts**; verified by DI-08 ([DR-12](design-review.md#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment)) |
-| Q-3 | Reaper as a sidecar in each pod, or a cluster-wide CronJob? | Sidecar dies with the pod it would clean up; CronJob has a coarser interval but survives | P2 (current lean: CronJob, for exactly that reason) |
-| Q-4 | Does the utilization signal earn its keep, given the backlog signal? | Keep as a safety net for expensive items ([Example D](scaling-algorithm.md#example-d--expensive-items-caught-by-the-utilization-signal)), or drop it and rely on a measured `itemsPerReplica` | P4, using recorded P3 data on how often it was the binding signal |
-| Q-5 | ~~Should `HoldPendingPods` also block scale-*downs* triggered by a revert?~~ **Resolved by review** | Blocking would make remediation impossible | **Decided**: remediation writes bypass the scale-down gates, including the new settled-replicas gate ([DR-03](design-review.md#dr-03-demand-driven-scale-down-can-fire-while-replicas-are-still-starting)) |
-| Q-6 | Is `fitCapacityMarginPods: 1` right, or should the margin scale with cluster size? | A constant is over-cautious on a 3-node cluster and under-cautious on a 200-node one | P4, from observed estimate-vs-reality error rates |
-| Q-7 | Which environment runs E2E in CI: kind on GitHub-hosted runners, or a self-hosted cluster? | Hosted runners are free but slow and memory-constrained; the ballast approach may need tuning to fit | P3 |
+| Q-1 | Backlog signal: NiFi queued FlowFiles, work-store count, or both? | **Resolved** | The **work store's claimable count**. Not a preference: once NiFi lands records on arrival, its queue drains to near zero and no longer represents outstanding work, so reading it would mean scaling on a structurally-zero number. Summing both is meaningless — they count different things at different stages. This also deletes the NiFi REST client, its credentials, and its TLS configuration from the controller ([ADR-19](architecture.md#adr-19-where-does-the-backlog-signal-come-from)) |
+| Q-2 | Work store: RWX PVC or MinIO/S3? | **Resolved — neither** | **PostgreSQL work-item table** with `FOR UPDATE SKIP LOCKED`. Both original options required building a claim protocol on a primitive the environment does not reliably provide; the database enforces exclusion and idempotency directly, and transactional ack removes the dual-write problem entirely ([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)). Verified by DI-08 and DI-09 |
+| Q-3 | Reaper as a sidecar or a CronJob? | **Dissolved** | **Neither — there is no reaper.** Lease expiry is handled inside the claim query itself, so crash recovery has no separate component and no interval to tune. A CronJob remains only for pruning `done` rows, which is off the correctness path ([ADR-20](architecture.md#adr-20-how-is-in-flight-work-protected-without-a-shared-filesystem)) |
+| Q-4 | Does the utilization signal earn its keep? | **Deferred to P4, default: keep** | Genuinely needs data — the question is empirical, not architectural. P3 records how often utilization was the binding signal; removing it early would forfeit the only safety net against a wrong `itemsPerReplica` ([R-2](#6-risk-register)). Deferring costs nothing because the signal is already designed and tested |
+| Q-5 | Should `HoldPendingPods` block revert-driven scale-downs? | **Resolved** | No. Remediation writes bypass the scale-down gates, including the settled-replicas gate — otherwise remediation would be impossible ([DR-03](design-review.md#dr-03-demand-driven-scale-down-can-fire-while-replicas-are-still-starting)) |
+| Q-6 | Is `fitCapacityMarginPods: 1` right for all cluster sizes? | **Deferred to P4, default: 1** | Also empirical: the right margin follows from the observed estimate-versus-reality error rate, which only exists after P3. A constant is correct for the 3-node POC cluster; scaling it with cluster size is a Phase 5 concern that no Phase 1 code decision forecloses |
+| Q-7 | Which environment runs E2E in CI? | **Resolved** | **kind on GitHub-hosted runners**, with the ballast sized to fit a 7 GB runner, and E2E/DI label-gated so they do not run on every push. Chosen because a self-hosted cluster adds infrastructure ownership to a POC; if the runner proves too small, the fallback is to shrink node count rather than to acquire hardware ([§4](#p4--poc-completion-and-hardening)) |
+
+### 8.1 Prerequisites for starting Phase 1 implementation
+
+Every item is satisfied or explicitly scheduled; none is outstanding.
+
+| # | Prerequisite | Status |
+| --- | --- | --- |
+| 1 | Architecture baseline agreed and written down | **Done** — [architecture § 11](architecture.md#11-phase-1-architecture-baseline) |
+| 2 | Durable work-store mechanism chosen, with claim/ack/recovery semantics specified as executable SQL | **Done** — [ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline) |
+| 3 | Demand-signal source decided and its dependency surface fixed | **Done** — [ADR-19](architecture.md#adr-19-where-does-the-backlog-signal-come-from); read-only role, one indexed query |
+| 4 | All open questions resolved or deferred with a default | **Done** — [§8](#8-open-questions); Q-4 and Q-6 deferred to P4 with defaults `keep` and `1` |
+| 5 | Design-review findings folded in, each with an owning test | **Done** — `DR-01`…`DR-16`, [test-plan § 11](test-plan.md#11-traceability-matrix) |
+| 6 | Immutable decisions recorded, so implementation cannot drift silently | **Done** — [`I-1`…`I-16`](design-review.md#5-immutable-phase-1-decisions) |
+| 7 | Config schema frozen for P0 (keys, defaults, validation rules) | **Done** — [requirements § 8](requirements.md#8-configuration-requirements), now including `workload.workStore.*` |
+| 8 | Toolchain: Go ≥ 1.24, kind ≥ 0.23, kubectl ≥ 1.29, Docker, `make`; PostgreSQL 16 image; pinned PostgreSQL JDBC driver for NiFi | **Environment task in P0/P2** — [test-plan § 7.3](test-plan.md#73-prerequisites) |
+| 9 | RBAC set final, including the `replicasets` read added by review | **Done** — [architecture § 7](architecture.md#7-kubernetes-permissions-and-rbac) |
+| 10 | CI shape decided (kind on hosted runners, E2E label-gated) | **Done** — Q-7 |
+
+**Not prerequisites, deliberately.** `itemsPerReplica` (measured in P2, not guessed beforehand), the
+utilization signal's long-term value (Q-4), and the fit-capacity margin policy (Q-6). Each is an empirical
+question that P0/P1 code does not foreclose, and blocking on data that does not exist yet would be false rigour.
+
+### 8.2 Formerly-blocking items, now closed
+
+| Item | Was | Now |
+| --- | --- | --- |
+| [DR-12](design-review.md#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment) / Q-2 | **Blocking prerequisite for P2** — the work store's claim semantics were unimplementable on kind | Closed by [ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline). The primitive is database-enforced and gated by DI-08/DI-09 |
+| Q-1 | Open fork, to be measured in P2 | Closed by the same change — the signal source follows from where work is durably held |
+| Q-3 | Open fork, to be decided in P2 | Dissolved; the component no longer exists |

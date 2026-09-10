@@ -138,6 +138,7 @@ semantics matter — subresources, preconditions, RBAC, events.
 | IT-13 | External replica writes | A simulated GitOps loop rewrites `replicas` after each of our writes: first drift is adopted silently-plus-event with history reset, and after `externalChangeTolerance` recurrences the controller stops writing (`HoldExternalChange`). Asserts **no** unbounded write loop ([FS-22](failure-scenarios.md#fs-22-external-actor-changes-the-replica-count)) |
 | IT-14 | Rollout hold | With `generation != observedGeneration`, no write occurs in either direction; scaling resumes within one interval of rollout completion ([FS-23](failure-scenarios.md#fs-23-scale-up-requested-during-a-rollout)) |
 | IT-15 | Unhealthy pods | Pods forced into `ImagePullBackOff` with a rising backlog: after `podStartupTimeout` the controller emits `PodStartupFailure` and issues **no further scale-ups**, even though demand keeps growing. Asserts the DR-06 loop is broken; also asserts no auto-revert ([FS-24](failure-scenarios.md#fs-24-scheduled-but-unhealthy-pods)) |
+| IT-16 | Work-store backlog source | Against a real PostgreSQL instance: the collected backlog equals `pending` + expired-lease rows and **excludes** live claims; a stopped database yields an *unavailable* signal (→ `HoldStaleMetrics`), never zero; a query slower than `workStore.timeout` behaves identically; the controller's role is verified to be **read-only** by asserting that an attempted write fails ([FR-36](requirements.md#work-store-requirements-v012)…[FR-38](requirements.md#work-store-requirements-v012), [FS-28](failure-scenarios.md#fs-28-work-store-unavailable-or-saturated)) |
 
 ---
 
@@ -145,29 +146,42 @@ semantics matter — subresources, preconditions, RBAC, events.
 
 Run on kind against the real pipeline. Every test ends with the conservation assertion:
 
-> `count(final outputs) == count(input files)`, every output byte-identical to the expected normalization, no
-> `.tmp` files remaining, no duplicate final outputs, and `/work/inflight` empty.
+> `count(output_records) == count(input items)`, every output identical to the expected normalization, no
+> duplicate `item_key`, and no `work_items` row left in `processing` once the pipeline is idle.
+
+Because the work store is a database, this assertion is a handful of SQL statements against the same instance
+the pipeline uses — the ledger is inherent rather than reconstructed
+([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)).
 
 | ID | Scenario | Method | Asserts | Verifies |
 | --- | --- | --- | --- | --- |
-| DI-01 | Worker killed mid-item | `kubectl delete pod --grace-period=0 --force` during processing | Item reclaimed by the reaper and reprocessed; conservation holds | [D-04](requirements.md#7-data-loss-protection-assumptions), [FS-12](failure-scenarios.md#fs-12-worker-pod-crashes-mid-item) |
+| DI-01 | Worker killed mid-item | `kubectl delete pod --grace-period=0 --force` during processing | Item reclaimed after lease expiry and reprocessed; conservation holds | [D-04](requirements.md#7-data-loss-protection-assumptions), [FS-12](failure-scenarios.md#fs-12-worker-pod-crashes-mid-item) |
 | DI-02 | Scale-down during processing | Force a scale-down while all replicas are busy | Terminating pod finishes its current item; drain completes inside the grace period; conservation holds | [D-05](requirements.md#7-data-loss-protection-assumptions), [FS-14](failure-scenarios.md#fs-14-scale-down-terminates-a-busy-pod) |
-| DI-03 | Crash-looping replica | One pod configured to exit repeatedly | Other replicas continue; the failing pod's claims are reclaimed; conservation holds | D-04 |
-| DI-04 | Duplicate delivery | Same file injected twice / an item deliberately reprocessed | Exactly one final output; atomic rename overwrites identically | [D-03](requirements.md#7-data-loss-protection-assumptions) |
-| DI-05 | Reaper behaviour | Abandon a claim in `/work/inflight` with an old timestamp | Reclaimed after `inflightReclaimAfter`; not reclaimed before (no double-processing of live claims) | D-04 |
+| DI-03 | Crash-looping replica | One pod configured to exit repeatedly | Other replicas continue; the failing pod's claims are reclaimed on lease expiry; conservation holds | D-04 |
+| DI-04 | Duplicate delivery | Same file injected twice / an item deliberately reprocessed | Exactly one `output_records` row; the second insert is a no-op by `ON CONFLICT` | [D-03](requirements.md#7-data-loss-protection-assumptions) |
+| DI-05 | Lease behaviour | Abandon a claim with an expired lease; separately, hold a **live** claim past a competing claim attempt | Expired claim reclaimed on the next claim query; **live** claim never stolen (no double-processing while a worker is healthy) | D-04, [FS-29](failure-scenarios.md#fs-29-lease-expires-while-the-worker-is-still-alive) |
 | DI-06 | Node memory pressure | Ballast pod balloons past its request until the kubelet evicts | Evicted worker's items reclaimed; conservation holds; the node's `memory-pressure` taint removes it from the candidate set | [FS-11](failure-scenarios.md#fs-11-node-memory-pressure-evicts-running-workers) |
-| DI-07 | Spike with full scaling churn | 5000 files, scale-up + partial + scale-down all occurring | Conservation holds across every scaling action; no item stalls beyond the reaper interval | [§4 of failure-scenarios](failure-scenarios.md#4-data-loss-analysis) |
-| DI-08 | **Work-store claim primitive** | Two pods on **different nodes** race to claim the same 100 items; then repeat with the reaper active | Every item claimed by exactly one pod; all pods see the same `/work/incoming` contents (proving the store is genuinely shared, not per-node); zero duplicate final outputs | [FS-25](failure-scenarios.md#fs-25-work-store-does-not-provide-the-assumed-claim-semantics), [A-12](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful) |
+| DI-07 | Spike with full scaling churn | 5000 files, scale-up + partial + scale-down all occurring | Conservation holds across every scaling action; no item stalls beyond one lease period | [§4 of failure-scenarios](failure-scenarios.md#4-data-loss-analysis) |
+| DI-08 | **Claim exclusivity** | 8 workers spread across **3 nodes** claim continuously from a 5000-item table, with a batch size that guarantees contention | Every item is claimed by exactly one worker at a time (`claimed_by` transitions are never concurrent); no item is skipped; no worker starves; `SKIP LOCKED` produces no lock waits above the query timeout | [FS-25](failure-scenarios.md#fs-25-work-store-does-not-provide-the-assumed-claim-semantics), [WR-01](requirements.md#work-store-requirements-v012) |
+| DI-09 | **Transactional acknowledgement** | `SIGKILL` a worker at three points: after claim/before output, mid-transaction, after commit/before the next claim | Never a partial output; never an acknowledged item without its output row; the item is reclaimed after lease expiry in the first two cases and left `done` in the third; total output rows equal total input items with **zero** duplicates | [FS-12](failure-scenarios.md#fs-12-worker-pod-crashes-mid-item), [FS-29](failure-scenarios.md#fs-29-lease-expires-while-the-worker-is-still-alive), [WR-02](requirements.md#work-store-requirements-v012) |
+| DI-10 | **Store saturation** | Cap `max_connections` low, scale the pool to 12 replicas | Workers back off rather than failing items; no item is lost or double-committed; claim latency and connection saturation are observable, so a growing backlog is distinguishable from an undrainable one | [FS-28](failure-scenarios.md#fs-28-work-store-unavailable-or-saturated), [A-15](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful) |
 
-DI-05's negative half matters as much as the positive: a reaper that reclaims *live* claims causes duplicate
+DI-05's negative half matters as much as the positive: reclaiming a *live* claim causes duplicate
 processing on every long item, which is the classic way this pattern is implemented incorrectly.
 
-**DI-08 runs first and gates the rest.** It validates the storage primitive that D-02 and D-03 are built on;
-until it passes, every other conservation assertion is testing the pipeline on top of an unverified
-foundation. Its cross-node assertion exists specifically to catch the silent failure in
-[FS-25](failure-scenarios.md#fs-25-work-store-does-not-provide-the-assumed-claim-semantics) — a "shared" volume
-that is actually per-node looks healthy in a single-node test and loses items in the multi-node topology the
-fit-capacity demo requires.
+**DI-08 and DI-09 run first and gate the rest.** They validate the two primitives that D-02, D-03, and D-04
+are built on — exclusive claiming and transactional acknowledgement. Until they pass, every other
+conservation assertion is testing the pipeline on top of an unverified foundation. Both are deliberately
+run **across three nodes**, because the failure they exist to catch
+([FS-25](failure-scenarios.md#fs-25-work-store-does-not-provide-the-assumed-claim-semantics)) is invisible in
+a single-node test.
+
+A note on what these tests are *not*. They do not verify PostgreSQL's implementation of `SKIP LOCKED` — that
+is the database's contract and the reason it was chosen
+([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)). They verify that the
+**application uses it correctly**: right isolation level, claim and ack in the transactions they belong to,
+lease arithmetic consistent with the grace period. Those are the parts that were previously convention and
+are now testable.
 
 ---
 
@@ -191,6 +205,7 @@ flowchart TB
     subgraph NS["namespace: data-pipeline"]
         SFTP["sftp (atmoz/sftp)"]
         NIFI["nifi-0 (NiFi 2.6.7, StatefulSet, PVCs)"]
+        PG[("postgres-0<br/>work store, 1 RWO PVC")]
         PROC["file-processor Deployment<br/>500m / 512Mi per pod ← the scaling target"]
         GEN["file-generator Job<br/>spike driver"]
     end
@@ -200,9 +215,9 @@ flowchart TB
         PROM["prometheus + metrics-server"]
     end
 
-    GEN --> SFTP --> NIFI --> PROC
+    GEN --> SFTP --> NIFI --> PG --> PROC
     KSS -->|scale| PROC
-    NIFI -.->|backlog| KSS
+    PG -.->|"backlog: claimable rows"| KSS
     PROM -.->|utilization| KSS
 
     classDef full fill:#9e6a03,color:#fff,stroke:#7d4e00
@@ -260,6 +275,14 @@ node capacity should never assume it.
 
 `metrics-server` needs `--kubelet-insecure-tls` on kind. Scripts live in `tests/e2e/`; nothing in the demo
 requires cloud access or a paid service.
+
+Deliberately **not** required, following the [work-store closure](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline):
+no CSI driver, no RWX StorageClass, no NFS server, no object store, no message broker. The work store is one
+PostgreSQL StatefulSet with a single `ReadWriteOnce` PVC from kind's default `local-path` provisioner — which
+is exactly what that provisioner *can* do correctly. One environment prerequisite is easy to miss: NiFi needs
+the PostgreSQL JDBC driver, supplied by an init container that fetches a pinned version into a shared volume;
+`make demo-up` must therefore be able to reach the driver's source, or the driver must be vendored into
+`deploy/demo/`.
 
 ### 7.4 Demo narrative
 
@@ -371,6 +394,8 @@ flowchart LR
 | [FS-25](failure-scenarios.md#fs-25-work-store-does-not-provide-the-assumed-claim-semantics) | DI-08 |
 | [FS-26](failure-scenarios.md#fs-26-leadership-handoff-races-with-an-in-flight-write) | IT-02, IT-09 |
 | [FS-27](failure-scenarios.md#fs-27-stabilization-window-gap-after-an-outage) | UT-24, E2E-07, E2E-11 |
+| [FS-28](failure-scenarios.md#fs-28-work-store-unavailable-or-saturated) | IT-16, DI-10 |
+| [FS-29](failure-scenarios.md#fs-29-lease-expires-while-the-worker-is-still-alive) | DI-05, DI-09 |
 
 ### Requirements → tests
 
@@ -385,6 +410,8 @@ flowchart LR
 | [NFR-01](requirements.md#5-non-functional-requirements)–NFR-04 performance | PF-01, PF-02, PF-03, E2E-01 |
 | [NFR-05](requirements.md#5-non-functional-requirements)–NFR-08 correctness bias | UT-22, IT-01, E2E-02, E2E-11 |
 | [NFR-09](requirements.md#5-non-functional-requirements)–NFR-10 portability, audit | E2E suite on kind + minikube; IT-04, IT-05 |
-| [D-01](requirements.md#7-data-loss-protection-assumptions)–D-07 data protection | DI-01…DI-08 |
+| [D-01](requirements.md#7-data-loss-protection-assumptions)–D-07 data protection | DI-01…DI-10 |
 | [FR-28](requirements.md#review-driven-requirements-v011)–FR-35 review-driven | UT-23, UT-24, UT-25, UT-26, IT-13, IT-14, IT-15, DI-08 |
+| [FR-36](requirements.md#work-store-requirements-v012)–FR-39 work-store signal | IT-16, E2E-07 |
+| [WR-01](requirements.md#work-store-requirements-v012)–WR-07 workload contract | DI-08, DI-09, DI-10, DI-02, DI-05 |
 | [§10.1 guarantees](requirements.md#101-what-the-poc-guarantees) | 1 → UT-08/E2E-02 · 2 → UT-12/E2E-07 · 3 → UT-11/E2E-06 · 4 → UT-25/E2E-03 · 5 → IT-07/IT-15/E2E-08 · 6 → IT-11/DI-02 · 7 → IT-04/IT-05 · 8 → UT-22 · 9 → IT-06/IT-13 |

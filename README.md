@@ -29,7 +29,7 @@ Every scaling decision must satisfy **two independent conditions**:
 
 | Question | Answered from | Establishes |
 | --- | --- | --- |
-| Is the workload under pressure? | NiFi backlog depth + pod CPU utilization | **Demand** |
+| Is the workload under pressure? | Claimable work-item count + pod CPU utilization | **Demand** |
 | Can the cluster place N more pods of this exact shape? | Node `allocatable` **minus already-requested** resources, per node, on nodes passing the pod's scheduling predicates | **Feasibility** |
 
 Demand without feasibility produces Pending pods. Feasibility without demand produces waste. KubeScaleSense
@@ -77,16 +77,22 @@ itself ([NG-1](docs/requirements.md#3-non-goals)).
 ```mermaid
 flowchart LR
     SFTP["SFTP server"] --> NIFI["NiFi 2.6.7<br/>ingest + durable buffer"]
-    NIFI --> PROC["Processing pods<br/>← the scaling target"]
-    PROC --> OUT["Normalized data"]
+    NIFI -->|PutDatabaseRecord| WS[("Work store<br/>PostgreSQL work_items")]
+    WS -->|"claim: SKIP LOCKED"| PROC["Processing pods<br/>← the scaling target"]
+    PROC -->|"output + ack, one transaction"| OUT["Normalized data"]
     KSS["KubeScaleSense"] -->|"scale subresource"| PROC
-    NIFI -.->|backlog| KSS
+    WS -.->|"backlog: claimable count"| KSS
     PROC -.->|utilization| KSS
     K8S["Kubernetes API<br/>nodes + pod requests"] -.->|feasibility| KSS
 
     classDef ctrl fill:#1f6feb,color:#fff,stroke:#0b3d91,stroke-width:2px
     class KSS ctrl
 ```
+
+Workers **pull** work, which is what makes the replica count the throughput knob — and therefore what makes
+the autoscaling demonstration mean anything. The work store is a PostgreSQL table rather than a shared
+filesystem: claiming is `FOR UPDATE SKIP LOCKED` under a lease, and each item's output and acknowledgement
+commit in one transaction ([ADR-18](docs/architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)).
 
 ---
 
@@ -105,6 +111,7 @@ rather than restating it.
 | [docs/test-plan.md](docs/test-plan.md) | Test strategy and IDs, local kind demo environment, demo narrative, CI gates, traceability matrix | `UT/IT/DI/E2E/PF/SK-xx` |
 | [docs/implementation-plan.md](docs/implementation-plan.md) | Phases P0–P5 with exit criteria, risk register, deferred scope, definition of done, open questions | `P0`–`P5`, `R-x`, `Q-x` |
 | [docs/design-review.md](docs/design-review.md) | Correctness review of the design set: the L1/L2/L3 distinction, 16 findings with fixes, and the decisions that are immutable for Phase 1 | `DR-xx`, `I-x` |
+| [architecture § 11](docs/architecture.md#11-phase-1-architecture-baseline) | **The settled architecture implementation will follow** — topology, component contracts, data flow, assumptions | Phase 1 baseline |
 
 ### Design decisions at a glance
 
@@ -137,7 +144,7 @@ internal/
   config/               # schema, defaults, validation
   kubernetes/           # clients, informers, scale writes, events
   resources/            # node filtering, free-resource math, fit capacity
-  metrics/              # NiFi backlog, pod utilization, staleness
+  metrics/              # work-store backlog, pod utilization, staleness
   scaling/              # pure decision engine: Snapshot -> Decision
   controller/           # reconcile loop, actuator, pending watchdog
   observability/        # Prometheus metrics, health, logging
@@ -149,9 +156,9 @@ docs/                   # this design set
 
 ## Technology
 
-Go (≥ 1.24) · `client-go` informers and typed clients · `metrics.k8s.io` · NiFi 2.6.7 REST API ·
-Prometheus · `kind` for local demonstration. A pure decision engine with injected clock and no I/O keeps the
-interesting logic exhaustively unit-testable.
+Go (≥ 1.24) · `client-go` informers and typed clients · `metrics.k8s.io` · PostgreSQL 16 work store
+(read-only access from the controller) · NiFi 2.6.7 for ingest · Prometheus · `kind` for local demonstration.
+A pure decision engine with injected clock and no I/O keeps the interesting logic exhaustively unit-testable.
 
 ## Non-goals for the first version
 
@@ -163,7 +170,12 @@ Rationale for each: [requirements § 3](docs/requirements.md#3-non-goals). When 
 
 ## Next step
 
-Review this design set, then begin [P0 — Foundation](docs/implementation-plan.md#p0--foundation). The first
-code milestone is [P1](docs/implementation-plan.md#p1--observation-dry-run-only): a controller that computes
-fit capacity and reports the decisions it *would* make, validated by hand against `kubectl describe node`
-before it is ever allowed to write.
+Design and architecture are closed: the [design review](docs/design-review.md) findings are folded in, all
+open questions are resolved or deferred with a stated default, and the settled architecture is
+[architecture § 11](docs/architecture.md#11-phase-1-architecture-baseline). **No Phase 1 blockers remain**
+([prerequisites](docs/implementation-plan.md#81-prerequisites-for-starting-phase-1-implementation)).
+
+Begin [P0 — Foundation](docs/implementation-plan.md#p0--foundation). The first code milestone is
+[P1](docs/implementation-plan.md#p1--observation-dry-run-only): a controller that computes fit capacity and
+reports the decisions it *would* make, validated by hand against `kubectl describe node` before it is ever
+allowed to write.

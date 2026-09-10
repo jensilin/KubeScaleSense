@@ -50,10 +50,10 @@ Two rules govern every response below, and most of the table is a consequence of
 | [FS-09](#fs-09-kubernetes-api-failure) | API errors, conflicts, throttling | S2 | Freeze, bounded retry, `409` → re-decide | IT-02, IT-03 |
 | [FS-10](#fs-10-namespace-resourcequota-blocks-pod-creation) | Quota rejects pod creation | S2 | Watchdog on unmaterialised replicas | IT-08 |
 | [FS-11](#fs-11-node-memory-pressure-evicts-running-workers) | Node pressure evicts healthy pods | S1 | Prevented by request-based math + reserves | DI-06 |
-| [FS-12](#fs-12-worker-pod-crashes-mid-item) | Pod OOM/panic while processing | S1 | Out of scope for the controller; workload reaper | DI-01 |
+| [FS-12](#fs-12-worker-pod-crashes-mid-item) | Pod OOM/panic while processing | S1 | Out of scope for the controller; lease expiry reclaims the item | DI-01, DI-09 |
 | [FS-13](#fs-13-node-failure-or-drain-removes-workers) | Node lost or drained | S2 | Candidate set shrinks; re-scale if feasible | E2E-05 |
 | [FS-14](#fs-14-scale-down-terminates-a-busy-pod) | Scale-down hits a working pod | S1 | Deletion cost + graceful drain | DI-02 |
-| [FS-15](#fs-15-metrics-source-unavailable) | NiFi API or metrics-server down | S3 | Degrade or `HoldStaleMetrics` | IT-10, E2E-07 |
+| [FS-15](#fs-15-metrics-source-unavailable) | Work store or metrics-server unreachable | S3 | Degrade or `HoldStaleMetrics` | IT-10, E2E-07 |
 | [FS-16](#fs-16-competing-controller-on-the-same-target) | HPA also scaling the target | S2 | `HoldScalingConflict`, refuse to act | IT-06 |
 | [FS-17](#fs-17-controller-crash-restart-or-leadership-change) | Controller dies or loses lease | S3 | Cold start, cooled down, re-derive | IT-09, E2E-11 |
 | [FS-18](#fs-18-replica-oscillation) | Sawtooth demand near a threshold | S4 | Deadband + window + cooldowns | UT-10, E2E-06 |
@@ -63,12 +63,16 @@ Two rules govern every response below, and most of the table is a consequence of
 | [FS-22](#fs-22-external-actor-changes-the-replica-count) | GitOps/operator/human writes `replicas` | S2 | Adopt baseline; refuse after repeated drift | IT-13 |
 | [FS-23](#fs-23-scale-up-requested-during-a-rollout) | Scale-up during a rollout; surge exceeds the estimate | S2 | `HoldRolloutInProgress` | IT-14 |
 | [FS-24](#fs-24-scheduled-but-unhealthy-pods) | Pods schedule then fail to become Ready | S2 | `HoldUnhealthyPods`, no auto-remediation | IT-15 |
-| [FS-25](#fs-25-work-store-does-not-provide-the-assumed-claim-semantics) | Work store cannot claim atomically | **S1** | Prerequisite, verified by test | DI-08 |
+| [FS-25](#fs-25-work-store-does-not-provide-the-assumed-claim-semantics) | Work store cannot claim atomically | **S1** | **Resolved by design change**: database-enforced claiming | DI-08 |
 | [FS-26](#fs-26-leadership-handoff-races-with-an-in-flight-write) | Old and new leader both write | S4 | Precondition rejects the loser; silent baseline adoption | IT-09 |
 | [FS-27](#fs-27-stabilization-window-gap-after-an-outage) | Window nearly empty after an outage | S2 | Coverage requirement blocks scale-down | UT-24 |
+| [FS-28](#fs-28-work-store-unavailable-or-saturated) | Work store down or throttling claims | S2 | Freeze; distinguish "growing" from "undrainable" | IT-16, DI-10 |
+| [FS-29](#fs-29-lease-expires-while-the-worker-is-still-alive) | Lease expiry during slow processing | S4 | Concurrent reprocessing; one output wins by constraint | DI-09 |
 
 Scenarios FS-22 through FS-27 were added by the [design review](design-review.md); FS-22, FS-24, and FS-25
-were genuine omissions rather than refinements.
+were genuine omissions rather than refinements. FS-28 and FS-29 are the two failure modes **introduced** by
+choosing a database work store — recorded deliberately, because a design change that closes one scenario and
+silently opens two others has not been closed honestly.
 
 ---
 
@@ -250,8 +254,8 @@ usage-based autoscaler invites by packing pods onto nodes whose committed reques
 
 **Residual risk.** Under-requesting neighbours can still pressure a node
 ([resource-calculation § 4.1](resource-calculation.md#41-known-over-estimation-under-requesting-neighbours)).
-Residual loss is then absorbed by [D-04](requirements.md#7-data-loss-protection-assumptions) (reaper) — an
-evicted pod's claimed items are reclaimed and reprocessed.
+Residual loss is then absorbed by [D-04](requirements.md#7-data-loss-protection-assumptions) — an evicted
+pod's claims expire and are reclaimed by the next claim query.
 **Test.** DI-06.
 
 ### FS-12: Worker pod crashes mid-item
@@ -259,12 +263,15 @@ evicted pod's claimed items are reclaimed and reprocessed.
 **Trigger.** OOM kill, panic, SIGKILL, node loss.
 **Behaviour.** Not a controller concern — no autoscaler can prevent it
 ([ADR-15](architecture.md#adr-15-how-do-we-protect-data-processing-when-a-worker-pod-crashes)). Correctness
-comes from the workload contract: the item is still in the durable store, claimed via atomic rename; the
-reaper returns claims older than `inflightReclaimAfter`; output is written to a temporary name and atomically
-renamed, so a partial write is never visible as final; the input is deleted only after the output commits.
+comes from the workload contract, now expressed in database terms
+([ADR-20](architecture.md#adr-20-how-is-in-flight-work-protected-without-a-shared-filesystem)): the item's row
+is untouched because its transaction never committed, its lease expires, and the next claim query reclaims it.
+Because output and acknowledgement commit **together**, a crash can leave neither a partial output nor an
+acknowledged-but-unwritten item — the two states that made the filesystem design delicate are now
+unrepresentable.
 **Data-loss risk.** S1 without D-01…D-04; none with them. Duplicate processing is possible and harmless by
-[D-03](requirements.md#7-data-loss-protection-assumptions).
-**Test.** DI-01, DI-04, DI-05.
+[D-03](requirements.md#7-data-loss-protection-assumptions), which is enforced by a `PRIMARY KEY`.
+**Test.** DI-01, DI-04, DI-05, DI-09.
 
 ### FS-13: Node failure or drain removes workers
 
@@ -273,7 +280,7 @@ renamed, so a partial write is never visible as final; the input is deleted only
 **Behaviour.** The ReplicaSet controller recreates the lost pods; KubeScaleSense recomputes `F` against the
 smaller cluster and either replaces capacity elsewhere or reports `HoldInsufficientResources`. Because the
 drained node is excluded, the controller does not attempt to place pods on it.
-**Data-loss risk.** In-flight items on lost pods are reclaimed by the reaper (D-04).
+**Data-loss risk.** In-flight items on lost pods are reclaimed on lease expiry (D-04).
 **Mitigation.** A drain and a capacity shortfall converge on the same well-tested path, which is why no
 special-case logic exists for it.
 **Test.** E2E-05.
@@ -288,7 +295,7 @@ is graceful: `preStop` stops claiming new items and waits for the current one, w
 `terminationGracePeriodSeconds` larger than the maximum item processing time
 ([A-07](requirements.md#6-workload-and-environment-assumptions), D-05).
 **Data-loss risk.** S1 if the pod were killed abruptly; none with graceful drain, and even a hard kill only
-delays the item (reaper, D-04).
+delays the item by one lease period (D-04).
 **Mitigation, stated precisely after review.** Two claims were too strong:
 
 - **Deletion cost is a preference within the Ready cohort, not a selector.** The ReplicaSet controller ranks
@@ -301,18 +308,19 @@ delays the item (reaper, D-04).
   ([DR-10](design-review.md#dr-10-poddisruptionbudget-does-not-protect-against-scale-down)).
 
 So the actual guarantees for in-flight work during scale-down are, in increasing order of reliability:
-`maxScaleDownStep: 1`, graceful drain via `preStop`, and the reaper as the backstop that holds even on a hard
-kill.
+`maxScaleDownStep: 1`, graceful drain via `preStop`, and lease expiry as the backstop that holds even on a
+hard kill.
 **Test.** DI-02.
 
 ### FS-15: Metrics source unavailable
 
-**Trigger.** NiFi REST API down/unauthorized/slow, or metrics-server missing.
+**Trigger.** Work store unreachable, refusing connections, or slow past `workStore.timeout`; or
+metrics-server missing.
 **Behaviour.**
 
 | Missing source | Response |
 | --- | --- |
-| Backlog (NiFi) | Required signal → `HoldStaleMetrics` once age > `metricsStaleAfter`; event `MetricsUnavailable` |
+| Backlog (work store) | Required signal → `HoldStaleMetrics` once age > `metricsStaleAfter`; event `MetricsUnavailable`. A query timeout counts as unavailable, never as zero ([FR-38](requirements.md#work-store-requirements-v012)) |
 | Utilization (metrics-server) | Degrade to backlog-only (`desiredUtilization` omitted from the `max()`), emit `MetricsUnavailable`, continue scaling |
 
 **Rationale for the asymmetry.** The backlog is the primary demand signal and has no substitute; utilization
@@ -457,10 +465,16 @@ expensive and say so loudly.
 
 ### FS-25: Work store does not provide the assumed claim semantics
 
+> **Resolved by design change, not mitigation.** The atomic-rename protocol was abandoned in favour of a
+> PostgreSQL work-item table with `FOR UPDATE SKIP LOCKED`
+> ([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)). This scenario is
+> retained because it records *why* — and because the class of failure it describes reappears the moment
+> anyone reintroduces a shared filesystem or an object store. DI-08 exists to keep the primitive verified.
+
 **Trigger.** The shared work store cannot support atomic, mutually-exclusive item claiming — the primitive
 [D-02](requirements.md#7-data-loss-protection-assumptions) and
 [D-03](requirements.md#7-data-loss-protection-assumptions) depend on.
-**Two concrete cases in the proposed POC:**
+**Two concrete cases in the *original* POC design:**
 
 | Store | Failure |
 | --- | --- |
@@ -469,13 +483,50 @@ expensive and say so loudly.
 
 **Behaviour.** Outside the controller's control and undetectable by it — which is exactly why it is recorded
 as a scenario rather than left as a storage detail.
-**Mitigation.** Resolved as a **blocking prerequisite for P2**, not an open question: either install an
-in-cluster NFS RWX provisioner (POSIX rename is atomic within one NFS server) **or** switch the claim protocol
-to a conditional write (`If-None-Match` on a per-item claim object, or a lease). The POC recommendation is the
-NFS provisioner, keeping the claim protocol trivially correct and the demo focused on scheduling rather than
-storage ([DR-12](design-review.md#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment),
+**Resolution.** Neither option was taken. Both were rejected in favour of a primitive the *database* enforces:
+an NFS provisioner would have added a CSI driver and a server pod in exchange for a claim that is only
+probably correct under NFSv3 retransmits and client attribute caching, and object storage would have required
+rebuilding the claim on conditional `PUT` while leaving acknowledgement and output as a dual write. The chosen
+design makes exclusion a property of `SKIP LOCKED` and idempotency a property of a `PRIMARY KEY`
+([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline),
 [A-12](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)).
-**Test.** DI-08 verifies the primitive under concurrent claims rather than assuming it.
+**Test.** DI-08 verifies the primitive under concurrent cross-node claims rather than assuming it.
+
+### FS-28: Work store unavailable or saturated
+
+**Trigger.** The PostgreSQL pod is restarting, its node is gone, connections are exhausted, or queries queue
+behind lock contention.
+**Detection (controller).** The backlog query fails or exceeds `workStore.timeout`; the signal is recorded
+**unavailable**, never zero ([FR-38](requirements.md#work-store-requirements-v012)).
+**Behaviour.** `HoldStaleMetrics` — freeze. The replica count is left exactly as it is: workers whose claims
+are still valid keep processing, and no scale-down removes capacity on the basis of a database outage.
+**Why this is the price of the design.** The work store is a **single point of failure** for the pipeline, and
+in the POC it runs as one instance on a node-local PVC ([A-14](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)).
+That is an accepted POC trade, not an oversight: an HA store would add a replicated database to a project
+whose subject is scheduling. The saturation case is subtler than the outage case — a store slow enough to
+throttle claiming makes the backlog grow for reasons that **more replicas cannot fix**, so the controller
+would scale up into a bottleneck it cannot see ([A-15](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)).
+**Mitigation.** Export claim latency and store connection saturation on the demo dashboard next to the
+backlog, so "the queue is growing" can be distinguished from "the queue cannot be drained". Bounded worker
+connection pools keep a scale-up from exhausting `max_connections` — the specific way this failure would
+otherwise be *caused* by scaling.
+**Data-loss risk.** None: committed rows are durable, and uncommitted work is reclaimed by lease expiry.
+**Test.** IT-16, DI-10.
+
+### FS-29: Lease expires while the worker is still alive
+
+**Trigger.** An item takes longer than `leaseDuration` — a large item, a slow store, or CPU starvation on a
+crowded node.
+**Behaviour.** Another worker legitimately reclaims the item and processes it concurrently. Both may finish;
+only one output survives, because the insert is `ON CONFLICT (item_key) DO NOTHING` against a `PRIMARY KEY`,
+and the losing acknowledgement simply marks an already-`done` row.
+**Data-loss risk.** None. The cost is wasted CPU, which is bounded by `attempts` and visible as a
+reprocessing-rate metric.
+**Mitigation.** `leaseDuration` must exceed both the maximum per-item processing time and
+`terminationGracePeriodSeconds` ([§7](requirements.md#7-data-loss-protection-assumptions)). This is the one
+new tuning constraint the work-store design introduces, and getting it wrong degrades throughput silently —
+hence the explicit metric rather than a comment in a manifest.
+**Test.** DI-05 (negative half), DI-09.
 
 ### FS-26: Leadership handoff races with an in-flight write
 
@@ -510,14 +561,13 @@ This is the same error as reading "no backlog data" as "no backlog", re-entering
 ```mermaid
 flowchart LR
     S["SFTP<br/>source of truth<br/>until fetched"] -->|"1"| N["NiFi repositories<br/>on PersistentVolume"]
-    N -->|"2"| Q["Work store<br/>/work/incoming"]
-    Q -->|"3 claim"| I["/work/inflight/pod-x"]
-    I -->|"4 process"| TMP["/work/output/.tmp"]
-    TMP -->|"5 atomic rename"| OUT["/work/output/final"]
-    OUT -->|"6 delete input"| DONE["Item complete"]
+    N -->|"2 PutDatabaseRecord"| Q["work_items<br/>status = pending"]
+    Q -->|"3 claim: SKIP LOCKED + lease"| I["status = processing<br/>claimed_by = pod-x"]
+    I -->|"4 normalize"| TX["one transaction:<br/>INSERT output_records<br/>+ UPDATE status = done"]
+    TX -->|"5 COMMIT"| DONE["Item complete"]
 
-    R["Reaper:<br/>returns stale claims"] -.-> Q
-    I -.-> R
+    L["Lease expiry,<br/>reclaimed by the next claim"] -.-> Q
+    I -.-> L
 
     classDef risk fill:#da3633,color:#fff,stroke:#a02622
     class I risk
@@ -527,19 +577,23 @@ flowchart LR
 | --- | --- | --- | --- |
 | 1 | Fetch interrupted | File remains on SFTP; re-listed | NiFi commits before deleting the remote file (D-01) |
 | 2 | NiFi pod dies | FlowFile survives in the repository on its PV | D-01 |
-| 3 | Pod dies after claim | Claim goes stale; reaper returns it | D-02, D-04 |
-| 4 | Pod dies mid-processing | Partial work discarded; item reprocessed | D-04 (reaper) |
-| 5 | Pod dies before rename | Temp file orphaned; final output never partially visible | D-03 (atomic rename) |
-| 6 | Pod dies after rename, before input delete | Item reprocessed; rename overwrites identically | D-03 (idempotent output) |
+| 3 | Pod dies after claim | Lease expires; the next claim query reclaims the row | D-02, D-04 |
+| 4 | Pod dies mid-processing | Partial work discarded; item reclaimed after lease expiry | D-04 |
+| 5 | Pod dies mid-commit | The transaction rolls back — **no** output row, **no** acknowledgement, so the item is simply reclaimed | D-03 (transactional ack) |
+| — | Pod dies after commit | Nothing to do: output and acknowledgement are already both durable | D-03 |
+| — | Item reprocessed after a lease expiry | Second output insert is a no-op | D-03 (`ON CONFLICT DO NOTHING` on a `PRIMARY KEY`) |
 
 **The single highest-risk state is step 3–4** (an item claimed by a pod that then dies), and its entire
-mitigation is the reaper plus idempotency. Everything else in the pipeline is durable by construction.
+mitigation is lease expiry plus idempotency. Note what the work-store design removed: the old step 5 — "pod
+dies after writing output but before acknowledging" — is no longer a state the system can occupy, because
+those two writes are one commit ([ADR-20](architecture.md#adr-20-how-is-in-flight-work-protected-without-a-shared-filesystem)).
+Everything else in the pipeline is durable by construction.
 
 ### 4.2 What the controller does and does not contribute
 
 | Concern | Owner |
 | --- | --- |
-| Item durability, claim semantics, idempotency, reaper | **Workload** (D-01…D-04) |
+| Item durability, claim semantics, idempotency, lease recovery | **Workload** (D-01…D-04) |
 | Graceful drain on termination | **Workload** `preStop` + grace period (D-05); controller supplies deletion-cost hints (D-06) |
 | Avoiding *involuntary* eviction of healthy workers | **Controller** — request-based fit math and reserves (FS-11) |
 | Not deleting pods directly | **Controller** — no pod `delete` permission at all |
@@ -558,12 +612,14 @@ Stating the invalidating conditions is part of the design; each is a review item
 
 | If this changes | Consequence |
 | --- | --- |
-| The work store cannot claim atomically and exclusively | **D-02 broken at the foundation** — two pods claim the same item concurrently, and the entire durability argument falls back onto D-03 idempotency ([FS-25](#fs-25-work-store-does-not-provide-the-assumed-claim-semantics)). Verify the primitive; never assume it |
+| The claim stops being database-enforced (e.g. a move back to a filesystem or object store) | **D-02 broken at the foundation** — two pods claim the same item concurrently, and the entire durability argument falls back onto D-03 idempotency ([FS-25](#fs-25-work-store-does-not-provide-the-assumed-claim-semantics)). Verify the primitive; never assume it |
+| Output and acknowledgement stop sharing one transaction | Partial outputs and acknowledged-but-unwritten items become representable again — the dual-write problem the work-store design exists to remove ([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)) |
+| `leaseDuration` drops below the maximum item processing time | Silent duplicate processing on every slow item ([FS-29](#fs-29-lease-expires-while-the-worker-is-still-alive)) |
 | NiFi repositories move to `emptyDir` | D-01 broken: NiFi pod loss loses buffered files |
 | Work is **pushed** to pods (HTTP/Site-to-Site) instead of claimed | D-02 broken: terminating a pod loses its in-flight payload; scale-down becomes lossy |
 | Output writes become non-idempotent (append, or an external side effect such as an email or a non-idempotent API call) | D-03 broken: reprocessing duplicates effects; at-least-once is no longer safe |
-| The reaper is removed or its interval exceeds the SLO | D-04 weakened: crashed-pod items stall until manual intervention |
-| Item processing time can exceed `terminationGracePeriodSeconds` | D-05 broken: A-07 violated; graceful drain truncated, relies on the reaper |
+| Claims are taken without a lease, or leases are never checked | D-04 broken: crashed-pod items stall until manual intervention |
+| Item processing time can exceed `terminationGracePeriodSeconds` | D-05 broken: A-07 violated; graceful drain truncated, relies on lease expiry |
 | Processing pods drop memory limits | FS-11 risk rises: one pod can pressure a node and evict peers |
 
 ---
@@ -620,3 +676,5 @@ case under compound failure is a frozen replica count with loud telemetry, not a
 | [FR-31](requirements.md#review-driven-requirements-v011) external change detection | FS-22, FS-26 |
 | [FR-32](requirements.md#review-driven-requirements-v011) rollout hold | FS-23 |
 | [FR-34](requirements.md#review-driven-requirements-v011) dual staleness check | FS-08 |
+| [FR-36](requirements.md#work-store-requirements-v012)–FR-38 work-store signal | FS-15, FS-28 |
+| [WR-01](requirements.md#work-store-requirements-v012)–WR-04 claim, ack, recovery | FS-12, FS-25, FS-29 |
