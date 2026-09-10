@@ -176,6 +176,22 @@ Explicitly out of scope for v0.1 (the POC). Each is revisited in
 | FR-26 | The controller SHALL support leader election so that only one replica makes decisions | Should |
 | FR-27 | On unrecoverable API failure the controller SHALL take no scaling action and SHALL surface the failure via metrics, logs, and readiness | Must |
 
+### Review-driven requirements (v0.1.1)
+
+Added by the [design review](design-review.md); each closes a specific correctness gap found in the v0.1
+design rather than adding new capability.
+
+| ID | Requirement | Priority | Finding |
+| --- | --- | --- | --- |
+| FR-28 | The controller SHALL exclude pods that have been `Ready` for less than `workload.podWarmupPeriod` from the utilization average, and SHALL report the signal unavailable if no warm Ready pod exists | Must | [DR-05](design-review.md#dr-05-new-pod-warmup-dilutes-the-utilization-average) |
+| FR-29 | The controller SHALL NOT perform a demand-driven scale-down unless all replicas are `Ready` **and** the stabilization window is covered by at least `scaling.scaleDownWindowCoverage` of its expected samples | Must | [DR-03](design-review.md#dr-03-demand-driven-scale-down-can-fire-while-replicas-are-still-starting), [DR-04](design-review.md#dr-04-stabilization-window-gaps-permit-a-blind-scale-down) |
+| FR-30 | The controller SHALL block scale-ups while any pod of the target's current ReplicaSet has been scheduled but not `Ready` for longer than `pending.podStartupTimeout`, and SHALL NOT auto-remediate that state | Must | [DR-06](design-review.md#dr-06-scheduled-but-unhealthy-pods-cause-unbounded-scale-up) |
+| FR-31 | The controller SHALL detect replica changes it did not write, adopt them as the new baseline, reset cooldown and history state, and refuse to act after `scaling.externalChangeTolerance` recurrences | Must | [DR-07](design-review.md#dr-07-external-writers-of-specreplicas-are-undetected) |
+| FR-32 | The controller SHALL take no scaling action while a rollout of the target is in progress | Must | [DR-08](design-review.md#dr-08-rollouts-and-maxsurge-are-unaccounted-for) |
+| FR-33 | The controller SHALL compute fit capacity on every reconcile whose direction is up, **including while hold backoff is armed**, and SHALL reset backoff when fit capacity exceeds the level recorded when it was armed | Must | [DR-01](design-review.md#dr-01-backoff-gate-makes-the-recovery-in-one-interval-claim-unreachable) |
+| FR-34 | The controller SHALL treat a signal as stale if **either** its local receive age **or** its source-reported sample age exceeds `metricsStaleAfter` | Must | [DR-14](design-review.md#dr-14-staleness-measured-only-from-local-receive-time-misses-a-frozen-source) |
+| FR-35 | The controller SHALL compute the utilization ratio and smoothing state in integer units so that decisions are exactly reproducible | Should | [DR-15](design-review.md#dr-15-floating-point-arithmetic-weakens-the-determinism-claim) |
+
 ---
 
 ## 5. Non-functional requirements
@@ -224,8 +240,8 @@ requirements on the POC pipeline, verified by the tests in
 | D-03 | **At-least-once with idempotent output.** A re-processed item produces the same result | Output written to a temporary name and atomically renamed to its final name; the input is deleted only after that rename succeeds |
 | D-04 | **Crash recovery.** An item claimed by a pod that dies is reprocessed | Reaper (a sidecar or CronJob) returns items in `/work/inflight/*` older than `inflightReclaimAfter` to `/work/incoming` |
 | D-05 | **Graceful drain on scale-down.** A terminating pod finishes its current item | `preStop` hook stops claiming new items and waits for the current one; `terminationGracePeriodSeconds` > max item processing time ([A-07](#6-workload-and-environment-assumptions)) |
-| D-06 | **Least-busy-first eviction.** Scale-down prefers idle pods | Pods publish their in-flight count; controller writes `pod-deletion-cost` ([FR-21](#4-functional-requirements)) |
-| D-07 | **Eviction resistance for the pool as a whole** | `PodDisruptionBudget` with `minAvailable: 1`; per-pod resource *limits* set so a busy pod cannot starve a node and trigger node-pressure eviction of its peers |
+| D-06 | **Least-busy-first eviction.** Scale-down prefers idle pods | Pods publish their in-flight count; controller writes `pod-deletion-cost` ([FR-21](#4-functional-requirements)). **Preference, not a guarantee** — the ReplicaSet controller removes any not-Ready pod before considering cost ([DR-11](design-review.md#dr-11-pod-deletion-cost-ordering-was-described-too-loosely)) |
+| D-07 | **Resistance to node-level disruption** | `PodDisruptionBudget` with `minAvailable: 1` — note this constrains the **Eviction API only** (node drain, descheduler, autoscaler consolidation) and has **no effect on scale-down**, which deletes pods directly ([DR-10](design-review.md#dr-10-poddisruptionbudget-does-not-protect-against-scale-down)). Per-pod memory *limits* keep one busy pod from pressuring a node and evicting its peers |
 
 > **The most important protection is D-01 + D-02**: because the queue is durable and pull-based, an
 > over-aggressive or wrong scaling decision degrades *throughput*, never *durability*. Resource-aware
@@ -277,6 +293,7 @@ workload:
   itemsPerReplica: 50           # backlog items one replica is expected to hold
   targetCPUUtilizationPercent: 70   # of the pod's CPU *request*
   metricsStaleAfter: 60s
+  podWarmupPeriod: 60s          # pods Ready for less than this are excluded from the utilization average
   backlogSmoothing:
     mode: ewma                  # none | ewma
     alpha: 0.4
@@ -300,18 +317,21 @@ scaling:
   scaleUpCooldown: 60s
   scaleDownCooldown: 300s
   scaleDownStabilizationWindow: 300s
+  scaleDownWindowCoverage: 0.8  # fraction of expected window samples required before scaling down
   tolerancePercent: 10          # deadband around current replicas
   maxScaleUpStep: 4
   maxScaleDownStep: 1
   allowPartialScaleUp: true
+  externalChangeTolerance: 3    # replica changes by others, per window, before refusing to act
   holdBackoff:
     initial: 30s
     max: 15m
     factor: 2.0
 
 pending:
-  pendingPodTimeout: 120s
+  pendingPodTimeout: 120s       # unschedulable pod -> remediation
   onPendingTimeout: revert      # revert | freeze | none
+  podStartupTimeout: 300s       # scheduled but not Ready -> block scale-ups (no auto-remediation)
 ```
 
 ### Parameter reference
@@ -342,6 +362,10 @@ pending:
 | `scaling.holdBackoff.*` | `30s` / `15m` / `2.0` | Backoff for repeatedly infeasible scale-ups | [FR-18](#4-functional-requirements), [FS-07](failure-scenarios.md#fs-07-repeated-impossible-scale-attempts) |
 | `pending.pendingPodTimeout` | `120s` | How long a pod may stay unschedulable before remediation | [FS-06](failure-scenarios.md#fs-06-newly-created-pod-stays-pending) |
 | `pending.onPendingTimeout` | `revert` | `revert` to last-good replicas, `freeze` scale-ups, or `none` | [FS-06](failure-scenarios.md#fs-06-newly-created-pod-stays-pending) |
+| `workload.podWarmupPeriod` | `60s` | Grace period before a Ready pod counts in the utilization average | [FR-28](#review-driven-requirements-v011) |
+| `scaling.scaleDownWindowCoverage` | `0.8` | Minimum fraction of expected window samples required to scale down | [FR-29](#review-driven-requirements-v011) |
+| `scaling.externalChangeTolerance` | `3` | External replica changes tolerated before `HoldExternalChange` | [FR-31](#review-driven-requirements-v011) |
+| `pending.podStartupTimeout` | `300s` | Scheduled-but-not-Ready duration that blocks scale-ups | [FR-30](#review-driven-requirements-v011) |
 
 ---
 
@@ -360,3 +384,88 @@ pending:
 | **HOLD** | A decision to leave replicas unchanged despite unmet demand, with a reason code |
 | **Backlog** | Count of items waiting to be processed (NiFi queued FlowFiles and/or files in `/work/incoming`) |
 | **Reason code** | Canonical enum labelling every decision ([scaling-algorithm § 2](scaling-algorithm.md#2-decision-outcomes-and-reason-codes)) |
+
+---
+
+## 10. Design Limitations and Assumptions
+
+Added following the [design review](design-review.md). This section is the honest statement of what the first
+POC does and does not promise. It exists because the difference between the three statements below is the
+whole subject of the project, and blurring them is how resource-aware autoscalers over-claim:
+
+| Level | Statement | Status in KubeScaleSense |
+| --- | --- | --- |
+| **L1** | "The cluster has spare resources" | Aggregate and **not a decision input** — exported for humans only |
+| **L2** | "The cluster can *probably* schedule this specific pod" | The estimate the gate uses (`kss_fit_capacity_pods`). Probabilistic by construction |
+| **L3** | "The cluster *actually scheduled* the pod" | Observed fact, produced only by the scheduler; verified after the fact by the watchdogs |
+
+Full analysis: [design-review § 2](design-review.md#2-three-statements-that-are-not-the-same-thing).
+
+### 10.1 What the POC guarantees
+
+Each item is asserted by a named test ([test-plan § 11](test-plan.md#11-traceability-matrix)):
+
+1. **No knowingly-infeasible scale-up.** A scale-up is issued only for a replica delta that the L2 estimate
+   says fits, using requests against allocatable per node. If less fits, the controller scales by that
+   amount or holds.
+2. **No scaling on unknown state.** A missing or stale primary signal, an unsynced cache, or an API failure
+   produces a hold — never a scale-down.
+3. **Bounded action rate.** At most one scale-up per `scaleUpCooldown` and one scale-down per
+   `scaleDownCooldown`, one replica at a time downward, regardless of input.
+4. **Bounded futile retries.** Infeasible scale-ups back off exponentially, and recovery is level-triggered on
+   observed capacity, so an operator adding a node is acted on within one interval.
+5. **Detection and remediation of L2 ≠ L3.** A pod that stays unschedulable past `pendingPodTimeout` is
+   remediated; a pod scheduled but never Ready past `podStartupTimeout` blocks further scale-ups.
+6. **No pod deletion by the controller.** Replica count is the only actuator, so graceful termination,
+   `preStop` drain, and deletion-cost ordering always apply.
+7. **Explainability.** One reason code per reconcile, identical in logs, events, and metrics; every decision
+   reconstructible from a single log line.
+8. **Determinism.** An identical snapshot always produces an identical decision; integer arithmetic and an
+   injected clock make this exact rather than approximate.
+9. **Sole ownership or abstention.** If an HPA or another actor also writes the replica count, the controller
+   refuses to act rather than competing.
+
+### 10.2 What the POC does *not* guarantee
+
+1. **That no pod will ever be Pending.** This is the central limitation. The controller guarantees it will not
+   *knowingly* request an infeasible scale-up; it cannot guarantee the scheduler's answer, because v0.1 models
+   a documented **subset** of predicates ([resource-calculation § 6](resource-calculation.md#6-predicates-modelled-and-predicates-ignored)).
+   Unmodelled cases — topology spread (including scheduler-level default constraints), inter-pod
+   affinity/anti-affinity, volume topology and attach limits, extended resources, `ResourceQuota` and
+   `LimitRange`, and capacity races against other workloads — can all produce a Pending pod despite a passing
+   gate. The design's answer is bounded detection and remediation, not prevention.
+2. **Scheduler-accurate feasibility.** KubeScaleSense is an estimator. It is deliberately pessimistic
+   (reserves, margin, conservative filtering), so it will also sometimes hold when the scheduler *would* have
+   succeeded — including whenever priority/preemption or a cluster autoscaler could have made room.
+3. **Accurate capacity when neighbours under-request.** Fit capacity trusts requests. A node crowded with
+   `BestEffort` or under-requesting pods looks emptier than it behaves, so pods may schedule onto genuinely
+   loaded nodes ([resource-calculation § 4.1](resource-calculation.md#41-known-over-estimation-under-requesting-neighbours)).
+4. **SLO attainment.** Under a real capacity shortfall the backlog grows and latency degrades while the
+   controller behaves correctly. The deliverable in that case is a loud, specific, attributable deficit — not
+   throughput the cluster does not have.
+5. **An optimal replica count.** `itemsPerReplica` is an empirical constant, not a model of service time; the
+   controller aims for "safe and sufficient", not minimal.
+6. **Protection against admission-time rejection.** Quota and `LimitRange` violations are detected reactively,
+   from replicas that never materialise into pods.
+7. **Correctness for heterogeneous pod shapes.** The fit arithmetic assumes one pod template with identical
+   requests ([A-02](#6-workload-and-environment-assumptions)); in-place pod resize, mixed shapes, or a
+   mid-rollout template change are handled conservatively but not modelled precisely.
+8. **Data durability on its own.** Durability is a property of the workload
+   ([§7](#7-data-loss-protection-assumptions)). The controller's contribution is avoiding involuntary eviction
+   and never bypassing graceful termination. If D-01…D-06 do not hold, no scaling policy makes the pipeline
+   safe — and the POC's work store must be verified to actually provide atomic claim semantics
+   ([DR-12](design-review.md#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment)).
+9. **Multi-target fairness, HA beyond active/passive, or hot reconfiguration.** All explicitly deferred
+   ([§3](#3-non-goals)).
+
+### 10.3 Assumptions that must hold for the guarantees to be meaningful
+
+Beyond [A-01…A-07](#6-workload-and-environment-assumptions):
+
+| # | Assumption | If it does not hold |
+| --- | --- | --- |
+| A-08 | Node objects, pod requests, and `allocatable` are truthful and current within one informer round-trip | Fit capacity is wrong in an unbounded direction; the watchdogs become the only defence |
+| A-09 | The cluster runs the default scheduler with no admin-configured **hard** default topology constraints | L2 over-estimates invisibly; only observable as Pending pods |
+| A-10 | No other controller writes the target's replica count in steady state | The controller abstains ([FR-31](#review-driven-requirements-v011)), so scaling stops entirely |
+| A-11 | The node pool is fixed during a decision cycle | A HOLD may be pessimistic where a cluster autoscaler would have added capacity |
+| A-12 | The work store provides atomic, mutually-exclusive item claiming | At-least-once degrades toward duplicate concurrent processing, and D-03 carries the whole durability argument |

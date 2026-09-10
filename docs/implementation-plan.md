@@ -10,6 +10,15 @@ Related documents: [requirements](requirements.md) · [architecture](architectur
 
 **Nothing in this plan has been implemented yet.** The repository currently contains this design set only.
 
+**Post-review status.** The [design review](design-review.md) produced sixteen findings, all folded into the
+design. Three change this plan rather than only the specification:
+
+- **P1** gains the corrected feasibility/backoff ordering ([DR-01](design-review.md#dr-01-backoff-gate-makes-the-recovery-in-one-interval-claim-unreachable)) and integer arithmetic in the engine.
+- **P2** gains a **blocking prerequisite**: the work store must be proven to support atomic, exclusive,
+  cross-node item claiming before the pipeline is built on it ([DR-12](design-review.md#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment)).
+- **P3** gains three guards that are correctness requirements, not polish: the unhealthy-pod guard, external
+  replica-change detection, and the rollout hold.
+
 ---
 
 ## 1. Sequencing principle
@@ -141,7 +150,11 @@ This is the phase where the project's central claim is validated.
 - `internal/scaling`: `Snapshot`, `Decision`, reason codes, and `Decide` implementing
   [scaling-algorithm §§ 3–6](scaling-algorithm.md#3-step-1--compute-desired-replicas). Cooldown/window/backoff
   fields exist in the snapshot and are honoured, but the controller does not yet maintain history across
-  restarts of the loop.
+  restarts of the loop. Feasibility is computed before the up-gates, and `BackoffState` carries
+  `fitCapacityAtArm`, from the outset — retrofitting the ordering later is how
+  [DR-01](design-review.md#dr-01-backoff-gate-makes-the-recovery-in-one-interval-claim-unreachable) happens.
+  Utilization and smoothing arithmetic is integer from the start
+  ([FR-35](requirements.md#review-driven-requirements-v011)).
 - `internal/observability`: full metric set, `/healthz`, `/readyz`, the one-line-per-reconcile decision log.
 - `controller.dryRun` **hard-defaulted to true** for this phase; the actuator is a no-op logger.
 
@@ -169,6 +182,14 @@ scale anything.
 
 **Goal.** A real pipeline whose backlog is a genuine demand signal, and a cluster topology in which resource
 exhaustion is reachable on purpose.
+
+**Blocking prerequisite (resolve before any pipeline work).** Choose and verify the work store, per
+[DR-12](design-review.md#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment):
+either an in-cluster **NFS RWX provisioner** (recommended — POSIX rename stays atomic, so the claim protocol
+is trivially correct) or **MinIO with a conditional-write claim** (`If-None-Match` or a lease object) instead
+of rename. kind's default `local-path-provisioner` is **not** an option: it yields node-local `ReadWriteOnce`
+volumes, so a "shared" PVC silently becomes per-node directories and items become invisible to workers on
+other nodes. DI-08 must pass, on a multi-node cluster, before the rest of P2 proceeds.
 
 **Deliverables**
 
@@ -220,6 +241,11 @@ makes the `itemsPerReplica` measurement clean.
 - Pending-pod watchdog with `revert` / `freeze` / `none`, including the quota signature (replicas not
   materialising into pods) ([FS-06](failure-scenarios.md#fs-06-newly-created-pod-stays-pending),
   [FS-10](failure-scenarios.md#fs-10-namespace-resourcequota-blocks-pod-creation)).
+- **Review-driven guards** — correctness requirements, not polish: the unhealthy-pod guard
+  ([FR-30](requirements.md#review-driven-requirements-v011)), external replica-change detection and adoption
+  ([FR-31](requirements.md#review-driven-requirements-v011)), the rollout hold
+  ([FR-32](requirements.md#review-driven-requirements-v011)), and the settled-replicas plus window-coverage
+  preconditions on scale-down ([FR-29](requirements.md#review-driven-requirements-v011)).
 - `pod-deletion-cost` refresh before scale-down.
 - HPA conflict detection ([FS-16](failure-scenarios.md#fs-16-competing-controller-on-the-same-target)).
 - Kubernetes events with rate limiting ([architecture § 8.2](architecture.md#82-kubernetes-events)).
@@ -227,8 +253,10 @@ makes the `itemsPerReplica` measurement clean.
 
 **Exit criteria**
 
-- `IT-02`, `IT-03`, `IT-04`, `IT-06`, `IT-07`, `IT-08`, `IT-11` pass.
+- `IT-02`, `IT-03`, `IT-04`, `IT-06`, `IT-07`, `IT-08`, `IT-11`, `IT-13`, `IT-14`, `IT-15` pass.
 - `E2E-01`…`E2E-06`, `E2E-08`, `E2E-09`, `E2E-10` pass; `DI-01`, `DI-02`, `DI-03`, `DI-07` pass.
+- `IT-15` specifically demonstrates that a broken image with a rising backlog produces **no** further
+  scale-ups — the DR-06 loop is closed.
 - **The headline assertion:** in `E2E-02` (demand for 8 replicas, room for 2) the controller performs a partial
   scale-up and then holds, and **no pod of the target is ever Pending for more than `pendingPodTimeout`**,
   while the replica deficit is visible in metrics and events throughout.
@@ -317,6 +345,9 @@ Two of these deserve a note because they are the ones most likely to be requeste
 | R-7 | Scope creep toward a production controller | POC never lands | High | Phase gates with test-based exit criteria; P5 exists to absorb good ideas without absorbing schedule | all |
 | R-8 | Metrics cardinality (per-node series) on large clusters | Prometheus load | Low | Per-node metrics toggleable; bounded by cluster size ([resource-calculation § 9](resource-calculation.md#9-complexity-and-performance)) | P4 |
 | R-9 | Docs drift from implementation | Design set becomes misleading | Medium | Link check in CI; P4 documentation reconciliation task; ADRs amended, not rewritten | P4 |
+| R-10 | Work store cannot provide atomic exclusive claiming; a "shared" volume is silently per-node | **S1 in the demo**: items invisible to some workers, indistinguishable from loss | Medium | Blocking P2 prerequisite with a cross-node verification test (DI-08); NFS provisioner recommended ([DR-12](design-review.md#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment)) | P2 |
+| R-11 | A GitOps controller or operator also manages `replicas` | Unbounded oscillation with an external actor | Medium | Detect, adopt, and abstain ([FR-31](requirements.md#review-driven-requirements-v011)); deployment prerequisite to grant field ownership ([A-10](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)) | P3 |
+| R-12 | Performance-motivated refactors reintroduce the DR-01 ordering bug | Backoff silently becomes timer-based; recovery latency grows to 15 min | Medium | UT-25 asserts reset-on-recomputed-capacity; [I-10](design-review.md#5-immutable-phase-1-decisions) marks the ordering immutable | P3, P4 |
 
 R-1 and R-6 are the two that would invalidate the project's claims rather than merely delay it, which is why
 both have a gate rather than only a mitigation: R-1 has the P1 manual validation gate, R-6 has the conservation
@@ -341,9 +372,16 @@ The POC is complete when all of the following are true:
    in the runbook.
 8. **Reproducible by someone else.** `make demo-up` → five scenarios → `make demo-down` on a clean machine.
 9. **Docs consistent with code.** Measured defaults folded back in; changed decisions reflected in their ADRs.
+10. **Review findings closed.** Every `DR-xx` fix has a passing owning test, and the guarantee/non-guarantee
+    statement in [requirements § 10](requirements.md#10-design-limitations-and-assumptions) matches observed
+    behaviour — in particular that the POC claims "never *knowingly* infeasible", not "never Pending".
 
 Deliberately **not** part of done: a CRD, multi-target support, production HA guarantees, or scheduler-grade
 predicate fidelity.
+
+The [immutable Phase 1 decisions](design-review.md#5-immutable-phase-1-decisions) (`I-1`…`I-16`) are the
+constraints all of the above is built on. Changing one during implementation — for convenience, performance, or
+expedience — invalidates parts of this plan and its tests, so it requires an amended ADR first.
 
 ---
 
@@ -372,9 +410,9 @@ Resolve during the phase indicated; each is a genuine fork, not a placeholder.
 | # | Question | Options | Resolve in |
 | --- | --- | --- | --- |
 | Q-1 | Backlog signal: NiFi queued FlowFiles, work-store file count, or both? | NiFi count is one API call and reflects upstream demand earliest; the file count is what processing pods actually consume, and the two diverge while NiFi is writing | P2, once both can be measured side by side |
-| Q-2 | Work store: RWX PVC or MinIO/S3? | PVC is simpler on kind and makes atomic rename trivially correct; object storage is more production-like but rename is a copy, weakening [D-03](requirements.md#7-data-loss-protection-assumptions) | P2 (current lean: RWX PVC for the POC, and say so plainly) |
+| Q-2 | ~~Work store: RWX PVC or MinIO/S3?~~ **Resolved as a blocking prerequisite** | Not a free choice: kind's default provisioner is node-local, and object stores have no atomic rename. Either an NFS RWX provisioner (recommended) or MinIO with conditional-write claims | **Decided before P2 starts**; verified by DI-08 ([DR-12](design-review.md#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment)) |
 | Q-3 | Reaper as a sidecar in each pod, or a cluster-wide CronJob? | Sidecar dies with the pod it would clean up; CronJob has a coarser interval but survives | P2 (current lean: CronJob, for exactly that reason) |
 | Q-4 | Does the utilization signal earn its keep, given the backlog signal? | Keep as a safety net for expensive items ([Example D](scaling-algorithm.md#example-d--expensive-items-caught-by-the-utilization-signal)), or drop it and rely on a measured `itemsPerReplica` | P4, using recorded P3 data on how often it was the binding signal |
-| Q-5 | Should `HoldPendingPods` also block scale-*downs* triggered by a revert? | Blocking makes remediation impossible; allowing means a revert can coincide with a demand-driven scale-down | P3 (current lean: allow, as specified in [scaling-algorithm § 5](scaling-algorithm.md#5-step-3--stability-gates)) |
+| Q-5 | ~~Should `HoldPendingPods` also block scale-*downs* triggered by a revert?~~ **Resolved by review** | Blocking would make remediation impossible | **Decided**: remediation writes bypass the scale-down gates, including the new settled-replicas gate ([DR-03](design-review.md#dr-03-demand-driven-scale-down-can-fire-while-replicas-are-still-starting)) |
 | Q-6 | Is `fitCapacityMarginPods: 1` right, or should the margin scale with cluster size? | A constant is over-cautious on a 3-node cluster and under-cautious on a 200-node one | P4, from observed estimate-vs-reality error rates |
 | Q-7 | Which environment runs E2E in CI: kind on GitHub-hosted runners, or a self-hosted cluster? | Hosted runners are free but slow and memory-constrained; the ballast approach may need tuning to fit | P3 |

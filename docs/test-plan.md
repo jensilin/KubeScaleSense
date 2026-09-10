@@ -88,6 +88,10 @@ Three principles govern what gets tested where:
 | UT-12 | Stale / missing signals | Backlog missing or `age > metricsStaleAfter` → `HoldStaleMetrics` in **both** directions; utilization missing alone → degrade, keep scaling |
 | UT-13 | EWMA smoothing | `α = 0.4` step response; ~87 % of a step within 4 samples; `mode: none` is exactly pass-through |
 | UT-22 | Properties (`testing/quick`, randomized snapshots) | Invariants that must hold for **all** inputs: result ∈ `[min, max]`; `F = 0` ⇒ result ≤ current; scale-down never exceeds `maxScaleDownStep`; stale signals ⇒ result = current; identical snapshot ⇒ identical decision ([NFR-07](requirements.md#5-non-functional-requirements)); exactly one reason code returned |
+| UT-23 | Warmup exclusion | Pods Ready for < `podWarmupPeriod` excluded from the utilization average; signal reported **unavailable** (not zero) when no warm pod exists ([FR-28](requirements.md#review-driven-requirements-v011), [DR-05](design-review.md#dr-05-new-pod-warmup-dilutes-the-utilization-average)) |
+| UT-24 | Scale-down preconditions | `ReadyReplicas < CurrentReplicas` → `HoldReplicasSettling`, including the DR-03 worked case (6 replicas, 2 Ready, 100 % CPU, low backlog **must not** scale down); uncovered window → `HoldStabilizationWindow`, including a window with 3 of 20 samples whose `max()` is low ([FS-27](failure-scenarios.md#fs-27-stabilization-window-gap-after-an-outage)); remediation writes bypass both gates |
+| UT-25 | Backoff under recomputed capacity | With backoff armed, `F > fitCapacityAtArm` resets it and the **same** decision scales up; `F` unchanged keeps `HoldBackoff`; a `ScaleUpPartial` arms rather than resets ([DR-01](design-review.md#dr-01-backoff-gate-makes-the-recovery-in-one-interval-claim-unreachable), [DR-02](design-review.md#dr-02-partial-scale-up-both-arms-and-resets-the-backoff)) |
+| UT-26 | New guard precedence | `HoldRolloutInProgress` and `HoldExternalChange` precede all demand computation; `HoldUnhealthyPods` precedes backoff, cooldown, and the feasibility gate — asserted by a snapshot where *all* of them are true ([FS-23](failure-scenarios.md#fs-23-scale-up-requested-during-a-rollout), [FS-24](failure-scenarios.md#fs-24-scheduled-but-unhealthy-pods)) |
 
 UT-22 is the highest-value test in the suite: the property "when nothing fits, replicas never increase" is the
 project's central safety claim, and a property test asserts it across thousands of generated states rather
@@ -131,6 +135,9 @@ semantics matter — subresources, preconditions, RBAC, events.
 | IT-10 | Metrics-server absent | `metrics.k8s.io` unavailable → backlog-only scaling continues, `MetricsUnavailable` emitted; NiFi absent → `HoldStaleMetrics` ([FS-15](failure-scenarios.md#fs-15-metrics-source-unavailable)) |
 | IT-11 | Deletion cost | Before a scale-down, `pod-deletion-cost` is patched from in-flight counts, lowest on the idlest pod ([FR-21](requirements.md#4-functional-requirements)) |
 | IT-12 | Dry run | `dryRun: true` produces identical reason codes and metrics with **zero** mutating API calls (asserted via a counting round-tripper) |
+| IT-13 | External replica writes | A simulated GitOps loop rewrites `replicas` after each of our writes: first drift is adopted silently-plus-event with history reset, and after `externalChangeTolerance` recurrences the controller stops writing (`HoldExternalChange`). Asserts **no** unbounded write loop ([FS-22](failure-scenarios.md#fs-22-external-actor-changes-the-replica-count)) |
+| IT-14 | Rollout hold | With `generation != observedGeneration`, no write occurs in either direction; scaling resumes within one interval of rollout completion ([FS-23](failure-scenarios.md#fs-23-scale-up-requested-during-a-rollout)) |
+| IT-15 | Unhealthy pods | Pods forced into `ImagePullBackOff` with a rising backlog: after `podStartupTimeout` the controller emits `PodStartupFailure` and issues **no further scale-ups**, even though demand keeps growing. Asserts the DR-06 loop is broken; also asserts no auto-revert ([FS-24](failure-scenarios.md#fs-24-scheduled-but-unhealthy-pods)) |
 
 ---
 
@@ -150,9 +157,17 @@ Run on kind against the real pipeline. Every test ends with the conservation ass
 | DI-05 | Reaper behaviour | Abandon a claim in `/work/inflight` with an old timestamp | Reclaimed after `inflightReclaimAfter`; not reclaimed before (no double-processing of live claims) | D-04 |
 | DI-06 | Node memory pressure | Ballast pod balloons past its request until the kubelet evicts | Evicted worker's items reclaimed; conservation holds; the node's `memory-pressure` taint removes it from the candidate set | [FS-11](failure-scenarios.md#fs-11-node-memory-pressure-evicts-running-workers) |
 | DI-07 | Spike with full scaling churn | 5000 files, scale-up + partial + scale-down all occurring | Conservation holds across every scaling action; no item stalls beyond the reaper interval | [§4 of failure-scenarios](failure-scenarios.md#4-data-loss-analysis) |
+| DI-08 | **Work-store claim primitive** | Two pods on **different nodes** race to claim the same 100 items; then repeat with the reaper active | Every item claimed by exactly one pod; all pods see the same `/work/incoming` contents (proving the store is genuinely shared, not per-node); zero duplicate final outputs | [FS-25](failure-scenarios.md#fs-25-work-store-does-not-provide-the-assumed-claim-semantics), [A-12](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful) |
 
 DI-05's negative half matters as much as the positive: a reaper that reclaims *live* claims causes duplicate
 processing on every long item, which is the classic way this pattern is implemented incorrectly.
+
+**DI-08 runs first and gates the rest.** It validates the storage primitive that D-02 and D-03 are built on;
+until it passes, every other conservation assertion is testing the pipeline on top of an unverified
+foundation. Its cross-node assertion exists specifically to catch the silent failure in
+[FS-25](failure-scenarios.md#fs-25-work-store-does-not-provide-the-assumed-claim-semantics) — a "shared" volume
+that is actually per-node looks healthy in a single-node test and loses items in the multi-node topology the
+fit-capacity demo requires.
 
 ---
 
@@ -350,6 +365,12 @@ flowchart LR
 | [FS-19](failure-scenarios.md#fs-19-misconfiguration) | UT-21 |
 | [FS-20](failure-scenarios.md#fs-20-sustained-overload-beyond-cluster-capacity) | E2E-02 |
 | [FS-21](failure-scenarios.md#fs-21-target-pod-template-changes-mid-flight) | UT-17, IT-02 |
+| [FS-22](failure-scenarios.md#fs-22-external-actor-changes-the-replica-count) | UT-26, IT-13 |
+| [FS-23](failure-scenarios.md#fs-23-scale-up-requested-during-a-rollout) | UT-26, IT-14 |
+| [FS-24](failure-scenarios.md#fs-24-scheduled-but-unhealthy-pods) | UT-26, IT-15 |
+| [FS-25](failure-scenarios.md#fs-25-work-store-does-not-provide-the-assumed-claim-semantics) | DI-08 |
+| [FS-26](failure-scenarios.md#fs-26-leadership-handoff-races-with-an-in-flight-write) | IT-02, IT-09 |
+| [FS-27](failure-scenarios.md#fs-27-stabilization-window-gap-after-an-outage) | UT-24, E2E-07, E2E-11 |
 
 ### Requirements → tests
 
@@ -364,4 +385,6 @@ flowchart LR
 | [NFR-01](requirements.md#5-non-functional-requirements)–NFR-04 performance | PF-01, PF-02, PF-03, E2E-01 |
 | [NFR-05](requirements.md#5-non-functional-requirements)–NFR-08 correctness bias | UT-22, IT-01, E2E-02, E2E-11 |
 | [NFR-09](requirements.md#5-non-functional-requirements)–NFR-10 portability, audit | E2E suite on kind + minikube; IT-04, IT-05 |
-| [D-01](requirements.md#7-data-loss-protection-assumptions)–D-07 data protection | DI-01…DI-07 |
+| [D-01](requirements.md#7-data-loss-protection-assumptions)–D-07 data protection | DI-01…DI-08 |
+| [FR-28](requirements.md#review-driven-requirements-v011)–FR-35 review-driven | UT-23, UT-24, UT-25, UT-26, IT-13, IT-14, IT-15, DI-08 |
+| [§10.1 guarantees](requirements.md#101-what-the-poc-guarantees) | 1 → UT-08/E2E-02 · 2 → UT-12/E2E-07 · 3 → UT-11/E2E-06 · 4 → UT-25/E2E-03 · 5 → IT-07/IT-15/E2E-08 · 6 → IT-11/DI-02 · 7 → IT-04/IT-05 · 8 → UT-22 · 9 → IT-06/IT-13 |

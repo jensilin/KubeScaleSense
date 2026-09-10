@@ -40,6 +40,18 @@ The central design rule: **current CPU utilization is never treated as proof tha
 scheduled.** A pod requesting 2 cores while using 50 m still holds 2 cores of the scheduler's budget, so
 "the cluster looks 60 % idle" and "nothing more can be scheduled" are routinely both true.
 
+Three statements the project keeps strictly apart — conflating them is the failure mode it exists to avoid:
+
+| | Statement | Role |
+| --- | --- | --- |
+| **L1** | "The cluster has spare resources" | Aggregate; **never** a decision input, exported for humans only |
+| **L2** | "The cluster can *probably* schedule this specific pod" | The estimate the scaling gate uses |
+| **L3** | "The cluster *actually scheduled* the pod" | Observed fact; verified after the fact, since only the scheduler can produce it |
+
+The POC therefore guarantees it will never issue a *knowingly* infeasible scale-up — **not** that no pod will
+ever be Pending. Full statement:
+[Design Limitations and Assumptions](docs/requirements.md#10-design-limitations-and-assumptions).
+
 ```mermaid
 flowchart TD
     W["Workload pressure<br/>backlog + utilization"] --> D["Desired replicas"]
@@ -92,6 +104,7 @@ rather than restating it.
 | [docs/failure-scenarios.md](docs/failure-scenarios.md) | 21 failure modes with specified responses, data-loss analysis, interacting failures, alerting | `FS-xx` |
 | [docs/test-plan.md](docs/test-plan.md) | Test strategy and IDs, local kind demo environment, demo narrative, CI gates, traceability matrix | `UT/IT/DI/E2E/PF/SK-xx` |
 | [docs/implementation-plan.md](docs/implementation-plan.md) | Phases P0–P5 with exit criteria, risk register, deferred scope, definition of done, open questions | `P0`–`P5`, `R-x`, `Q-x` |
+| [docs/design-review.md](docs/design-review.md) | Correctness review of the design set: the L1/L2/L3 distinction, 16 findings with fixes, and the decisions that are immutable for Phase 1 | `DR-xx`, `I-x` |
 
 ### Design decisions at a glance
 
@@ -109,6 +122,7 @@ rather than restating it.
 | Pod stuck Pending? | Block further scale-ups immediately; after a timeout, revert / freeze / report | [ADR-13](docs/architecture.md#adr-13-what-happens-if-a-newly-created-pod-stays-pending) |
 | API failures? | Fail-safe is **freeze**: hold replicas, bounded retries, never scale down on unknown state | [ADR-14](docs/architecture.md#adr-14-what-happens-if-kubernetes-api-calls-fail) |
 | Worker crash? | Durability is a workload property: durable buffer, claim-based pull, idempotent output, reaper, graceful drain | [ADR-15](docs/architecture.md#adr-15-how-do-we-protect-data-processing-when-a-worker-pod-crashes) |
+| Someone else edits `replicas`? | Adopt their value as the baseline; abstain entirely if it keeps happening — never compete | [ADR-17](docs/architecture.md#adr-17-how-do-we-handle-other-writers-of-the-replica-count) |
 | Local demo? | `kind` with a tainted control plane and heterogeneous workers, plus ballast pods that commit resources without using them | [ADR-16](docs/architecture.md#adr-16-how-will-this-be-demonstrated-in-a-local-kubernetes-environment) |
 
 ---

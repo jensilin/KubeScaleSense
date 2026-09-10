@@ -60,6 +60,15 @@ Two rules govern every response below, and most of the table is a consequence of
 | [FS-19](#fs-19-misconfiguration) | Bad config or missing pod requests | S2 | Fail fast at startup | UT-21 |
 | [FS-20](#fs-20-sustained-overload-beyond-cluster-capacity) | Arrival rate exceeds any feasible capacity | S3 | Honest HOLD + deficit alert | E2E-02 |
 | [FS-21](#fs-21-target-pod-template-changes-mid-flight) | Requests changed during a rollout | S4 | Re-read template each reconcile | IT-02 |
+| [FS-22](#fs-22-external-actor-changes-the-replica-count) | GitOps/operator/human writes `replicas` | S2 | Adopt baseline; refuse after repeated drift | IT-13 |
+| [FS-23](#fs-23-scale-up-requested-during-a-rollout) | Scale-up during a rollout; surge exceeds the estimate | S2 | `HoldRolloutInProgress` | IT-14 |
+| [FS-24](#fs-24-scheduled-but-unhealthy-pods) | Pods schedule then fail to become Ready | S2 | `HoldUnhealthyPods`, no auto-remediation | IT-15 |
+| [FS-25](#fs-25-work-store-does-not-provide-the-assumed-claim-semantics) | Work store cannot claim atomically | **S1** | Prerequisite, verified by test | DI-08 |
+| [FS-26](#fs-26-leadership-handoff-races-with-an-in-flight-write) | Old and new leader both write | S4 | Precondition rejects the loser; silent baseline adoption | IT-09 |
+| [FS-27](#fs-27-stabilization-window-gap-after-an-outage) | Window nearly empty after an outage | S2 | Coverage requirement blocks scale-down | UT-24 |
+
+Scenarios FS-22 through FS-27 were added by the [design review](design-review.md); FS-22, FS-24, and FS-25
+were genuine omissions rather than refinements.
 
 ---
 
@@ -172,7 +181,11 @@ and makes metrics unable to distinguish one persistent problem from many new one
 
 **Trigger.** Watch desync, metrics-server lag, NiFi slowness, or a controller resume after suspension.
 **Detection.** Every signal carries `sampledAt`; `kss_metric_sample_age_seconds` exceeds `metricsStaleAfter`.
-Nodes with stale `Ready` heartbeats are excluded from the candidate set (C2).
+Nodes with stale `Ready` heartbeats are excluded from the candidate set (C2). Freshness is evaluated against
+**both** the local receive age and the source-reported sample age: receive age alone would let a *frozen*
+metrics-server serving ten-minute-old samples look perfectly fresh, while source timestamps alone would be
+distorted by clock skew ([FR-34](requirements.md#review-driven-requirements-v011),
+[DR-14](design-review.md#dr-14-staleness-measured-only-from-local-receive-time-misses-a-frozen-source)).
 **Behaviour.** `HoldStaleMetrics` — **no action in either direction**. Notably, no scale-down: "no data" must
 never be interpreted as "no work".
 **Data-loss risk.** None with the hold; S2 if a stale-driven scale-down terminated busy pods.
@@ -270,15 +283,26 @@ special-case logic exists for it.
 **Trigger.** Demand falls; a replica is removed while processing an item.
 **Behaviour.** Before writing the lower replica count the controller refreshes
 `controller.kubernetes.io/pod-deletion-cost` from reported in-flight counts, so the ReplicaSet controller
-removes the idlest pod ([scaling-algorithm § 7](scaling-algorithm.md#7-step-5--scale-down-logic)). Termination
+prefers the idlest pod ([scaling-algorithm § 7](scaling-algorithm.md#7-step-5--scale-down-logic)). Termination
 is graceful: `preStop` stops claiming new items and waits for the current one, within a
 `terminationGracePeriodSeconds` larger than the maximum item processing time
 ([A-07](requirements.md#6-workload-and-environment-assumptions), D-05).
 **Data-loss risk.** S1 if the pod were killed abruptly; none with graceful drain, and even a hard kill only
 delays the item (reaper, D-04).
-**Mitigation.** Deletion cost is best-effort (a hint to the ReplicaSet controller), so the graceful-drain path
-is the real guarantee and the reaper is the backstop — three layers, in decreasing order of elegance and
-increasing order of reliability.
+**Mitigation, stated precisely after review.** Two claims were too strong:
+
+- **Deletion cost is a preference within the Ready cohort, not a selector.** The ReplicaSet controller ranks
+  candidates by unassigned, then `Pending` before `Running`, then **not-Ready before Ready**, and only then by
+  deletion cost. A busy pod with a momentary readiness blip is removed before an idle Ready pod regardless of
+  cost, and the mechanism requires the `PodDeletionCost` feature gate (beta, default-on since 1.22)
+  ([DR-11](design-review.md#dr-11-pod-deletion-cost-ordering-was-described-too-loosely)).
+- **A `PodDisruptionBudget` does not apply here at all.** PDBs constrain the Eviction API only; a ReplicaSet
+  scale-down deletes pods directly and ignores them
+  ([DR-10](design-review.md#dr-10-poddisruptionbudget-does-not-protect-against-scale-down)).
+
+So the actual guarantees for in-flight work during scale-down are, in increasing order of reliability:
+`maxScaleDownStep: 1`, graceful drain via `preStop`, and the reaper as the backstop that holds even on a hard
+kill.
 **Test.** DI-02.
 
 ### FS-15: Metrics source unavailable
@@ -371,8 +395,111 @@ Step 3; terminating pods still hold resources
 ([resource-calculation § 4](resource-calculation.md#4-step-3--per-node-free-requestable-resources)), so the
 controller is conservative exactly when the deployment is churning. Writes use `deployments/scale` only, so a
 controller bug cannot rewrite the template.
-**Mitigation.** A scale-up during a rollout may be deferred by lower `F`; acceptable and self-correcting.
+**Mitigation.** A scale-up during a rollout may be deferred by lower `F`; acceptable and self-correcting. Note
+that scaling is held entirely while a rollout is in flight, per [FS-23](#fs-23-scale-up-requested-during-a-rollout).
 **Test.** IT-02.
+
+### FS-22: External actor changes the replica count
+
+**Trigger.** A GitOps controller (Argo CD, Flux) reconciles `replicas` from git, an operator runs
+`kubectl scale`, or another controller writes the `scale` subresource.
+**Detection.** Observed `spec.replicas` differs from `lastWrittenReplicas` and we did not write it.
+**Behaviour.** Adopt the observed value as the new baseline, reset cooldown timers and `desiredHistory`, emit
+`ExternalScaleDetected` once. After more than `scaling.externalChangeTolerance` (3) recurrences inside the
+stabilization window: `HoldExternalChange`, refuse to act
+([ADR-17](architecture.md#adr-17-how-do-we-handle-other-writers-of-the-replica-count)).
+**Why this is S2 and was the review's largest omission.** A GitOps controller reverting every scale-up within
+seconds, against a controller that scales up again each interval, is an *unbounded oscillation loop with an
+external actor* — terminating pods on every cycle and burning API budget indefinitely. It is far more likely in
+practice than the competing HPA that FS-16 covers.
+**Note.** `resourceVersion` preconditions do **not** mitigate this. The external write succeeds and our next
+write is against a fresh version; optimistic concurrency prevents lost updates, not disagreements about intent.
+**Mitigation.** In GitOps-managed environments, ownership of the replica field must be granted to the
+controller (e.g. Argo CD `ignoreDifferences`), exactly as for an HPA — recorded as
+[A-10](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful).
+**Test.** IT-13.
+
+### FS-23: Scale-up requested during a rollout
+
+**Trigger.** A scale-up is decided while the Deployment is rolling out a new pod template.
+**Detection.** `metadata.generation != status.observedGeneration`, or `updatedReplicas != replicas`.
+**Behaviour.** `HoldRolloutInProgress` in **both** directions until the rollout completes.
+**Why.** Fit capacity correctly accounts for the surge and terminating pods that *already exist*, but not for
+the surge that our own scale-up will cause: with `maxSurge: 25 %`, a request for 4 additional replicas
+transiently needs up to 5 pods' worth of resources. The gate approves 4, the Deployment controller asks for 5,
+and the fifth is the pod that goes Pending — an over-estimate created by the controller's own request.
+**Mitigation.** Holding is the cheap correct answer: rollouts are short and operator-initiated. The alternative
+— requiring `F >= Δ_req + surge(Δ_req)` — is more permissive but adds a second, subtler resource calculation
+for a rare window, and was rejected as unnecessary complexity
+([DR-08](design-review.md#dr-08-rollouts-and-maxsurge-are-unaccounted-for)).
+**Test.** IT-14.
+
+### FS-24: Scheduled but unhealthy pods
+
+**Trigger.** Pods schedule successfully and then never become useful: `ImagePullBackOff`,
+`CrashLoopBackOff`, a failing readiness probe, a missing Secret or ConfigMap, a bad configuration.
+**Detection.** A pod of the target's current ReplicaSet with `PodScheduled=True` and not `Ready` for longer
+than `pending.podStartupTimeout` (300 s).
+**Behaviour.** `HoldUnhealthyPods` — block scale-ups, emit `PodStartupFailure`, expose
+`kss_unhealthy_target_pods`. Deliberately **no** auto-remediation.
+**Why this is the worst behavioural bug the review found.** Without this guard the feedback loop runs the wrong
+way: broken pods are scheduled, so their requests are committed and consume real cluster capacity; they process
+nothing, so the backlog grows; the growing backlog raises `desiredBacklog`, so the controller scales up; the new
+pods are equally broken. A resource-aware autoscaler that responds to a bad image tag by consuming the cluster —
+and potentially starving its neighbours — is a worse outcome than the Pending pods this project exists to
+prevent.
+**Why no auto-revert** (unlike [FS-06](#fs-06-newly-created-pod-stays-pending)): these pods are scheduled and
+may recover once an image or Secret is fixed, and removing replicas from a partially-broken pool can remove the
+healthy ones. The controller cannot fix a broken image; the correct action is to stop making the situation more
+expensive and say so loudly.
+**Data-loss risk.** None directly. S2 because processing has effectively stopped while capacity is consumed.
+**Test.** IT-15.
+
+### FS-25: Work store does not provide the assumed claim semantics
+
+**Trigger.** The shared work store cannot support atomic, mutually-exclusive item claiming — the primitive
+[D-02](requirements.md#7-data-loss-protection-assumptions) and
+[D-03](requirements.md#7-data-loss-protection-assumptions) depend on.
+**Two concrete cases in the proposed POC:**
+
+| Store | Failure |
+| --- | --- |
+| RWX PVC on kind | kind ships `local-path-provisioner`, which provides only **node-local `ReadWriteOnce`** volumes. A "shared" PVC silently becomes a per-node directory: items written by NiFi are invisible to workers on other nodes and sit unprocessed. Indistinguishable from data loss during a demo, and directly at odds with the multi-node topology the fit-capacity demo requires |
+| MinIO / S3 | Object stores have **no atomic rename**; "rename" is copy-then-delete. Two pods can both claim the same item, so the claim protocol provides no mutual exclusion and correctness rests entirely on D-03 idempotency |
+
+**Behaviour.** Outside the controller's control and undetectable by it — which is exactly why it is recorded
+as a scenario rather than left as a storage detail.
+**Mitigation.** Resolved as a **blocking prerequisite for P2**, not an open question: either install an
+in-cluster NFS RWX provisioner (POSIX rename is atomic within one NFS server) **or** switch the claim protocol
+to a conditional write (`If-None-Match` on a per-item claim object, or a lease). The POC recommendation is the
+NFS provisioner, keeping the claim protocol trivially correct and the demo focused on scheduling rather than
+storage ([DR-12](design-review.md#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment),
+[A-12](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)).
+**Test.** DI-08 verifies the primitive under concurrent claims rather than assuming it.
+
+### FS-26: Leadership handoff races with an in-flight write
+
+**Trigger.** An outgoing leader has a `scale` write in flight as the incoming leader begins reconciling.
+**Behaviour.** One write wins; the loser's `resourceVersion` precondition fails with `409`, and it re-reads and
+re-decides ([FS-09](#fs-09-kubernetes-api-failure)). The new leader adopts observed `spec.replicas` as its
+baseline **silently** — no `ExternalScaleDetected` event and no drift counter increment — since the previous
+leader's legitimate write would otherwise be misclassified as an external change
+([DR-13](design-review.md#dr-13-leader-handoff-interacts-with-external-change-detection)).
+**Data-loss risk.** None.
+**Test.** IT-09.
+
+### FS-27: Stabilization window gap after an outage
+
+**Trigger.** A metrics or API outage, or a controller restart, leaves `desiredHistory` with few or no samples,
+because reconciles that return before computing demand append nothing.
+**Behaviour.** Scale-down additionally requires the window to be **covered** — at least
+`scaleDownWindowCoverage` (0.8) of `ceil(W / interval)` expected samples, with the oldest at least `W` old.
+Uncovered windows report `HoldStabilizationWindow`.
+**Why.** Without the coverage test, `max()` over a nearly-empty window is trivially low, so the guard is
+satisfied by *missing data* and the controller scales down on the strength of five minutes of no information.
+This is the same error as reading "no backlog data" as "no backlog", re-entering through the history buffer
+([DR-04](design-review.md#dr-04-stabilization-window-gaps-permit-a-blind-scale-down)).
+**Test.** UT-24.
 
 ---
 
@@ -431,6 +558,7 @@ Stating the invalidating conditions is part of the design; each is a review item
 
 | If this changes | Consequence |
 | --- | --- |
+| The work store cannot claim atomically and exclusively | **D-02 broken at the foundation** — two pods claim the same item concurrently, and the entire durability argument falls back onto D-03 idempotency ([FS-25](#fs-25-work-store-does-not-provide-the-assumed-claim-semantics)). Verify the primitive; never assume it |
 | NiFi repositories move to `emptyDir` | D-01 broken: NiFi pod loss loses buffered files |
 | Work is **pushed** to pods (HTTP/Site-to-Site) instead of claimed | D-02 broken: terminating a pod loses its in-flight payload; scale-down becomes lossy |
 | Output writes become non-idempotent (append, or an external side effect such as an email or a non-idempotent API call) | D-03 broken: reprocessing duplicates effects; at-least-once is no longer safe |
@@ -448,7 +576,8 @@ Individually-handled failures can combine; these three combinations are specific
 | --- | --- | --- |
 | Spike (FS-02) + metrics-server down (FS-15) | Utilization signal missing exactly when needed | Backlog-only scaling continues; feasibility gate unchanged; `MetricsUnavailable` event (E2E-07) |
 | Node drain (FS-13) + high demand (FS-02) | Capacity shrinks while demand grows | Candidate set shrinks → `HoldInsufficientResources` with a growing deficit; no attempt to use the drained node (E2E-05) |
-| Controller restart (FS-17) + oscillating demand (FS-18) | History lost; damping state reset | Empty `desiredHistory` blocks scale-down for a full window, so a restart is strictly *more* damped, never less (E2E-11) |
+| Controller restart (FS-17) + oscillating demand (FS-18) | History lost; damping state reset | Empty `desiredHistory` fails the window-coverage test (FS-27), so a restart is strictly *more* damped, never less (E2E-11) |
+| Unhealthy pods (FS-24) + rising backlog (FS-02) | Broken pods hold capacity while demand climbs | `HoldUnhealthyPods` takes precedence over the feasibility gate, so the controller stops adding broken replicas instead of consuming the cluster (IT-15) |
 
 A general property worth noting: because every uncertainty path converges on **hold**, simultaneous failures
 compose safely — the intersection of several "do nothing" responses is still "do nothing". The system's worst
@@ -463,6 +592,8 @@ case under compound failure is a frozen replica count with loud telemetry, not a
 | **Replica deficit** | `kss_desired_replicas − kss_current_replicas > 0` | 5 m | *The* signal to add capacity or raise `maxReplicas` |
 | Insufficient resources | `increase(kss_insufficient_resource_holds_total[15m]) > 0` | — | Chronic shortfall; check blocking dimension |
 | Pending remediation | `increase(kss_pending_pod_remediations_total[1h]) > 0` | — | Fit estimate was wrong: unmodelled predicate or quota (FS-05, FS-10) |
+| Unhealthy pods | `kss_unhealthy_target_pods > 0` | 5 m | Pods scheduled but not becoming Ready; scaling is blocked (FS-24) |
+| External replica writes | `increase(kss_external_scale_changes_total[15m]) > 2` | — | Another actor is managing replicas (FS-22) |
 | Controller stalled | `time() − kss_last_reconcile_timestamp_seconds > 3×interval` | 1 m | Loop wedged or leadership lost |
 | Signals stale | `kss_metric_sample_age_seconds > metricsStaleAfter` | 2 m | Scaling is frozen (FS-08, FS-15) |
 | API errors | `rate(kss_api_errors_total[5m]) > 0.1` | 10 m | RBAC, throttling, or API-server trouble (FS-09) |
@@ -482,5 +613,10 @@ case under compound failure is a frozen replica count with loud telemetry, not a
 | [FR-20](requirements.md#4-functional-requirements) pending watchdog | FS-05, FS-06, FS-10 |
 | [FR-21](requirements.md#4-functional-requirements)/[FR-22](requirements.md#4-functional-requirements) drain safety | FS-14 |
 | [FR-27](requirements.md#4-functional-requirements) API failure | FS-09 |
-| [D-01…D-07](requirements.md#7-data-loss-protection-assumptions) | [§4](#4-data-loss-analysis), FS-11, FS-12, FS-14 |
+| [D-01…D-07](requirements.md#7-data-loss-protection-assumptions) | [§4](#4-data-loss-analysis), FS-11, FS-12, FS-14, FS-25 |
 | [NFR-05](requirements.md#5-non-functional-requirements) conservative bias | FS-04, FS-05, FS-08, [§5](#5-interacting-failures) |
+| [FR-29](requirements.md#review-driven-requirements-v011) settled replicas, covered window | FS-27 |
+| [FR-30](requirements.md#review-driven-requirements-v011) unhealthy-pod guard | FS-24 |
+| [FR-31](requirements.md#review-driven-requirements-v011) external change detection | FS-22, FS-26 |
+| [FR-32](requirements.md#review-driven-requirements-v011) rollout hold | FS-23 |
+| [FR-34](requirements.md#review-driven-requirements-v011) dual staleness check | FS-08 |

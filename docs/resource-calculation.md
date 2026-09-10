@@ -214,6 +214,29 @@ modelled predicates** — identical items need no bin-packing search
 The estimate's error therefore comes only from what is *not* modelled ([§6](#6-predicates-modelled-and-predicates-ignored)),
 which is the honest and bounded claim.
 
+### 5.1 Why greedy counting is safe for identical pods
+
+A fair objection: `kube-scheduler` places pods **online, one at a time, without backtracking**. Could it strand
+capacity that an offline count promised — placing a pod on the "wrong" node and ending up below `F`?
+
+It cannot, for identical pods. `fit(n)` is a floor division of a node's free resources by a **fixed** pod size,
+so placing one pod on any node with `fit(n) >= 1` reduces that node's count by exactly one, and therefore the
+cluster total by exactly one. Example: 900 m free with a 500 m request gives `fit = 1`; after placement 400 m
+remains and `fit = 0` — a decrease of exactly one, with the 400 m remainder having been excluded from the count
+all along. Since every candidate node is interchangeable for an identical pod, no ordering choice among them
+can do better or worse than the count. Any online greedy order therefore achieves `Σ fit(n)`.
+
+Two preconditions are load-bearing:
+
+1. **The pods must be identical** ([A-02](requirements.md#6-workload-and-environment-assumptions)). Mixed pod
+   shapes turn this into bin packing, where online greedy genuinely can strand capacity.
+2. **Nothing else may consume capacity concurrently.** This is what `perNodeReserve*` and
+   `fitCapacityMarginPods` exist for, and why [§8](#8-staleness-and-the-readdecidewrite-race) treats the race
+   as bounded rather than eliminated.
+
+Recorded because the model's exactness is easy to doubt and cheap to justify
+([DR-16](design-review.md#dr-16-greedy-fit-counting-was-under-justified)).
+
 ---
 
 ## 6. Predicates modelled and predicates ignored
@@ -231,7 +254,8 @@ table is the contract, and it is the first thing to consult when a Pending pod a
 | `NodeAffinity` required + `nodeSelector` | **Modelled** | — | — |
 | Node affinity *preferred* | Ignored (by design) | None — ranking only | — |
 | Extended resources, GPUs, hugepages, ephemeral storage | **Not modelled** ([NG-9](requirements.md#3-non-goals)) | Over-estimate → Pending | Watchdog |
-| `PodTopologySpread` | **Not modelled** ([NG-7](requirements.md#3-non-goals)) | Over-estimate → Pending | Watchdog |
+| `PodTopologySpread` from the pod spec | **Not modelled** ([NG-7](requirements.md#3-non-goals)) | Over-estimate → Pending | Watchdog |
+| `PodTopologySpread` **admin defaults** (`defaultConstraints` in scheduler config) | **Not modelled** | Over-estimate → Pending, *even for pods that declare no constraints* | Watchdog + [A-09](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful) |
 | Inter-pod affinity / anti-affinity | **Not modelled** ([NG-7](requirements.md#3-non-goals)) | Over-estimate → Pending | Watchdog |
 | `ResourceQuota` / `LimitRange` | **Not modelled** ([NG-10](requirements.md#3-non-goals)) | Over-estimate → pods never created by the ReplicaSet controller | Watchdog + quota alert |
 | Volume topology / `VolumeBinding` / attach limits | **Not modelled** | Over-estimate → Pending | Watchdog |
@@ -317,6 +341,7 @@ between our read and the scheduler's placement of our new pods, other actors can
 | Our own previous scale-up is still being scheduled | ≤ `pendingPodTimeout` | Assigned-but-Pending pods already count in Step 3; `HoldPendingPods` blocks stacking |
 | Deployment pod template changed mid-flight | one interval | Effective request re-read every reconcile; `resourceVersion` precondition on the write ([FR-05](requirements.md#4-functional-requirements)) |
 | Informer watch silently desynced | until re-list | Periodic informer resync; `kss_metric_sample_age_seconds`; `HoldStaleMetrics` |
+| A source is reachable but **frozen**, serving old samples | unbounded | Freshness uses **both** local receive age and source-reported sample age; either exceeding `metricsStaleAfter` marks the signal stale ([FR-34](requirements.md#review-driven-requirements-v011), [DR-14](design-review.md#dr-14-staleness-measured-only-from-local-receive-time-misses-a-frozen-source)) |
 
 The design accepts the race and bounds its consequences instead of pretending it can be eliminated: reserves
 absorb the common case, the watchdog remediates the rest, and `HoldPendingPods` guarantees errors do not
@@ -332,8 +357,12 @@ compound across reconciles.
   few hundred microseconds of arithmetic — the reason the design can afford a full recomputation every
   reconcile instead of maintaining incremental per-node sums, which would add cache-coherence bugs for no
   measurable gain.
-- Step 4 runs **only on the scale-up path** ([scaling-algorithm § 5](scaling-algorithm.md#5-step-3--stability-gates)),
-  keeping the steady-state loop trivial.
+- Step 4 runs **only when the decision reaches the direction check and the direction is up** — which excludes
+  the steady-state no-op path but deliberately *includes* reconciles that will return `HoldBackoff`, because the
+  backoff reset is level-triggered on capacity ([scaling-algorithm § 5](scaling-algorithm.md#5-step-3--stability-gates),
+  [DR-01](design-review.md#dr-01-backoff-gate-makes-the-recovery-in-one-interval-claim-unreachable)). The
+  earlier formulation "only on the scale-up path, after the gates" was a performance optimization that would
+  have broken recovery.
 - Per-node metrics (`kss_node_free_requestable_cpu_millicores`) are label-per-node; cardinality is bounded by
   cluster size and can be disabled for very large clusters.
 

@@ -56,6 +56,10 @@ codes are treated as a stable API.
 | `HoldStabilizationWindow` | none | Scale-down candidate, but demand was higher inside `W` |
 | `HoldBackoff` | none | Previous scale-up was infeasible; waiting out backoff |
 | `HoldPendingPods` | none | One or more of our pods is unschedulable; never stack another request |
+| `HoldUnhealthyPods` | none | Pods are scheduled but not becoming Ready; more replicas cannot help ([DR-06](design-review.md#dr-06-scheduled-but-unhealthy-pods-cause-unbounded-scale-up)) |
+| `HoldReplicasSettling` | none | Scale-down candidate, but not all replicas are Ready yet ([DR-03](design-review.md#dr-03-demand-driven-scale-down-can-fire-while-replicas-are-still-starting)) |
+| `HoldRolloutInProgress` | none | The target is mid-rollout; surge would invalidate the fit estimate ([DR-08](design-review.md#dr-08-rollouts-and-maxsurge-are-unaccounted-for)) |
+| `HoldExternalChange` | none | Another actor repeatedly writes the replica count ([DR-07](design-review.md#dr-07-external-writers-of-specreplicas-are-undetected)) |
 | `HoldAtMaxReplicas` | none | Demand exceeds `R_max` — a capacity/policy ceiling, distinct from a resource shortfall |
 | `HoldAtMinReplicas` | none | Demand below `R_min` |
 | `HoldScalingConflict` | none | Another controller (HPA) targets this workload ([FR-19](requirements.md#4-functional-requirements)) |
@@ -104,9 +108,21 @@ unexpectedly expensive (very large or complex files). Two deliberate choices:
 - **Relative to the CPU *request*, not the limit or the node.** The request is what the pod is entitled to and
   what the fit math in [resource-calculation](resource-calculation.md) reserves, so the two halves of the
   system speak the same unit.
-- **Averaged over `Ready` pods only.** Including starting pods (near-zero usage while warming up) would drag
-  the average down exactly when a scale-up is in progress, suppressing the next one — a classic
-  self-defeating feedback path.
+- **Averaged over pods that are Ready *and* warm.** Including starting pods (near-zero usage) would drag the
+  average down exactly when a scale-up is in progress, suppressing the next one — a classic self-defeating
+  feedback path. Readiness alone is not enough: a pod that has passed its probe but has not yet claimed work
+  also reports near-zero CPU, so pods Ready for less than `workload.podWarmupPeriod` (60 s) are excluded too
+  ([DR-05](design-review.md#dr-05-new-pod-warmup-dilutes-the-utilization-average); upstream HPA carries two
+  dedicated knobs for the same effect). If no pod is both Ready and warm, the signal is reported
+  **unavailable** rather than fabricated, and the engine decides what that means.
+- **Computed in integer milli-units,** not floating point, so that identical snapshots yield identical
+  decisions at exact boundaries ([NFR-07](requirements.md#5-non-functional-requirements),
+  [DR-15](design-review.md#dr-15-floating-point-arithmetic-weakens-the-determinism-claim)).
+
+Note the asymmetry this creates: `R_ready` in the numerator means the utilization target is computed from a
+*smaller* base while a scale-up settles, which can push `desiredUtilization` below `R_cur`. That is safe on the
+scale-up path but would be dangerous on the scale-down path, which is why [§7](#7-step-5--scale-down-logic)
+requires all replicas to be Ready before a demand-driven scale-down.
 
 Memory utilization is collected and exported but **not** used to raise the desired count in v0.1: for this
 workload high memory usage indicates buffer sizing rather than a throughput deficit, and adding replicas does
@@ -168,31 +184,41 @@ matters: it is what makes the reported reason the *most actionable* one rather t
 | # | Guard | Condition | Reason if matched |
 | --- | --- | --- | --- |
 | G0 | Snapshot valid | Target unreadable / caches unsynced | `ErrorAPIFailure` |
-| G1 | Sole ownership | An HPA targets the same workload | `HoldScalingConflict` |
+| G1 | Sole ownership | An HPA targets the same workload, or external drift exceeded `externalChangeTolerance` | `HoldScalingConflict` / `HoldExternalChange` |
+| G1′ | Rollout quiet | `generation != observedGeneration` or `updatedReplicas != replicas` | `HoldRolloutInProgress` |
 | G2 | Signal freshness | Backlog unavailable, or `age > metricsStaleAfter` | `HoldStaleMetrics` |
 | G3 | Clamp binding | `desiredRaw > R_max` and `R_cur == R_max` | `HoldAtMaxReplicas` |
 | G3′ | Clamp binding | `desiredRaw < R_min` and `R_cur == R_min` | `HoldAtMinReplicas` |
 | G4 | Deadband | Within `T` of `R_cur` | `NoChangeWithinTolerance` |
-| **Scale-up path** | | | |
+| **Scale-up path** (fit capacity `F` is computed before these guards — see below) | | | |
 | G5 | Pending pods | `PendingOurPods > 0` | `HoldPendingPods` |
-| G6 | Backoff | `now < holdBackoff.nextEligible` | `HoldBackoff` |
+| G5′ | Unhealthy pods | A scheduled pod has been not-Ready for > `podStartupTimeout` | `HoldUnhealthyPods` |
+| G6 | Backoff | `now < holdBackoff.nextEligible` **and** `F <= holdBackoff.fitCapacityAtArm` | `HoldBackoff` |
 | G7 | Cooldown | `now − LastScaleUp < C_up` | `HoldCooldown` |
 | G8 | Feasibility | see [§6](#6-step-4--scale-up-logic-and-the-feasibility-gate) | `ScaleUp` / `ScaleUpPartial` / `HoldInsufficientResources` |
 | **Scale-down path** | | | |
-| G9 | Cooldown | `now − LastScaleDown < C_down` | `HoldCooldown` |
-| G10 | Stabilization | `max(desired over W) >= R_cur` | `HoldStabilizationWindow` |
-| G11 | — | otherwise | `ScaleDown` |
+| G9 | Replicas settled | `ReadyReplicas != R_cur` (demand-driven scale-downs only) | `HoldReplicasSettling` |
+| G10 | Cooldown | `now − LastScaleDown < C_down` | `HoldCooldown` |
+| G11 | Stabilization | `max(desired over W) >= R_cur`, **or** the window is not covered | `HoldStabilizationWindow` |
+| G12 | — | otherwise | `ScaleDown` |
 
 Notes on specific orderings:
 
 - **G2 before everything numeric.** Never compute a decision from data known to be stale.
-- **G5/G6 before G7.** If pods are already Pending or a scale-up was just proven infeasible, the cooldown
-  state is irrelevant and reporting it would be misleading.
-- **G5 applies only to the scale-up path.** Scaling *down* while pods are Pending is allowed and often
+- **G5/G5′/G6 before G7.** If pods are already Pending, are failing to start, or a scale-up was just proven
+  infeasible, the cooldown state is irrelevant and reporting it would be misleading.
+- **G5 and G5′ apply only to the scale-up path.** Scaling *down* while pods are Pending is allowed and often
   desirable: it is the mechanism by which a `revert` remediation clears a stuck pod
-  ([ADR-13](architecture.md#adr-13-what-happens-if-a-newly-created-pod-stays-pending)).
-- **Feasibility is evaluated last and only for scale-ups.** It is the only expensive computation (a walk of
-  nodes and pods), so it stays off the steady-state path ([NFR-02](requirements.md#5-non-functional-requirements)).
+  ([ADR-13](architecture.md#adr-13-what-happens-if-a-newly-created-pod-stays-pending)). For the same reason,
+  **G9 exempts watchdog remediation writes**, which must be able to remove a pod that is by definition not
+  Ready.
+- **Fit capacity is computed whenever the direction is up — including while backoff is armed.** This is
+  required for correctness, not performance: the backoff reset is level-triggered on observed capacity
+  ([§9.2](#92-reset-is-level-triggered-on-capacity-not-timer-driven)), so `F` must be evaluated even on a
+  reconcile that will return `HoldBackoff`. Computing it after the backoff gate would make recovery
+  unreachable ([DR-01](design-review.md#dr-01-backoff-gate-makes-the-recovery-in-one-interval-claim-unreachable)).
+  The node walk is skipped only when G0–G4 already settle the decision — which is the true steady-state path,
+  so the [NFR-02](requirements.md#5-non-functional-requirements) budget is unaffected.
 
 ```mermaid
 flowchart TD
@@ -207,9 +233,12 @@ flowchart TD
     G4 -- No --> NT["NoChangeWithinTolerance"]
     G4 -- Yes --> DIR{"Direction?"}
 
-    DIR -- up --> G5{"Our pods Pending?"}
+    DIR -- up --> FIT["Compute fit capacity F<br/>always, before the up-gates"]
+    FIT --> G5{"Our pods Pending?"}
     G5 -- Yes --> HP["HoldPendingPods"]
-    G5 -- No --> G6{"Backoff active?"}
+    G5 -- No --> G5B{"Scheduled pods<br/>not becoming Ready?"}
+    G5B -- Yes --> HU["HoldUnhealthyPods"]
+    G5B -- No --> G6{"Backoff active<br/>and F not increased?"}
     G6 -- Yes --> HB["HoldBackoff"]
     G6 -- No --> G7{"Scale-up cooldown passed?"}
     G7 -- No --> HC1["HoldCooldown"]
@@ -219,17 +248,19 @@ flowchart TD
     G8 -- "0 < F < Δreq, partial allowed" --> PU["ScaleUpPartial"]
     G8 -- "F == 0 or partial disabled" --> HR["HoldInsufficientResources"]
 
-    DIR -- down --> G9{"Scale-down cooldown passed?"}
-    G9 -- No --> HC2["HoldCooldown"]
-    G9 -- Yes --> G10{"max desired over window < current?"}
-    G10 -- No --> HS["HoldStabilizationWindow"]
-    G10 -- Yes --> DN["ScaleDown by maxScaleDownStep"]
+    DIR -- down --> G9{"All replicas Ready?"}
+    G9 -- No --> HRS["HoldReplicasSettling"]
+    G9 -- Yes --> G10{"Scale-down cooldown passed?"}
+    G10 -- No --> HC2["HoldCooldown"]
+    G10 -- Yes --> G11{"Window covered and<br/>max desired over window < current?"}
+    G11 -- No --> HS["HoldStabilizationWindow"]
+    G11 -- Yes --> DN["ScaleDown by maxScaleDownStep"]
 
     classDef act fill:#238636,color:#fff,stroke:#116329
     classDef hold fill:#9e6a03,color:#fff,stroke:#7d4e00
     classDef err fill:#da3633,color:#fff,stroke:#a02622
     class UP,PU,DN act
-    class HR,HB,HC1,HC2,HS,HP,SC,ST hold
+    class HR,HB,HC1,HC2,HS,HP,HU,HRS,SC,ST hold
     class E err
 ```
 
@@ -244,15 +275,15 @@ This is the gate that distinguishes KubeScaleSense from a standard HPA
 Δ_req = target − R_cur                       // already step-limited
 
 if F >= Δ_req:
-    write(R_cur + Δ_req);  reason = ScaleUp;  resetBackoff()
+    write(R_cur + Δ_req);  reason = ScaleUp;  resetBackoff()      // complete scale-up only
 
 else if F > 0 and allowPartialScaleUp:
     write(R_cur + F);      reason = ScaleUpPartial
-    armBackoff(); deficit = Δ_req − F
+    armBackoff(F); deficit = Δ_req − F        // a partial scale-up does NOT reset backoff
 
 else:
     no write;              reason = HoldInsufficientResources
-    armBackoff(); deficit = Δ_req
+    armBackoff(F); deficit = Δ_req
 ```
 
 Properties this gives us:
@@ -265,7 +296,10 @@ Properties this gives us:
 - **The deficit stays visible.** `kss_desired_replicas` continues to report the true desired value while
   `kss_current_replicas` reports reality; the gap is the recommended alert
   ([ADR-09](architecture.md#adr-09-what-happens-when-demand-is-high-but-resources-are-insufficient)).
-- **Success resets backoff**, so a cluster that regains capacity returns to full responsiveness immediately.
+- **Only a *complete* scale-up resets backoff.** A partial scale-up is evidence of a shortfall, not of
+  recovery, so it arms or advances the backoff instead. Treating it as a success would clear the backoff on the
+  same reconcile that armed it, restoring the retry storm backoff exists to prevent
+  ([DR-02](design-review.md#dr-02-partial-scale-up-both-arms-and-resets-the-backoff)).
 
 After a write the controller sets `LastScaleUp = now` and records `lastGoodReplicas = R_cur` (the *pre*-scale
 value), which is the revert target if the new pods turn out to be unschedulable
@@ -276,13 +310,23 @@ value), which is the revert target if the new pods turn out to be unschedulable
 ## 7. Step 5 — Scale-down logic
 
 Scale-down is treated as the more dangerous direction, because removing a pod terminates work in progress.
-Four conditions must all hold:
+Six conditions must all hold:
 
 1. `desiredClamped < R_cur` — both demand signals are low, by the `max()` in [§3.3](#33-combining-the-signals).
 2. The change is outside the deadband ([§4](#4-step-2--direction-deadband-and-step-limits)).
-3. `now − LastScaleDown >= C_down` (300 s, five times the scale-up cooldown).
-4. `max(desired samples over the last W) < R_cur` — no sample inside the 5-minute window wanted the current
+3. `ReadyReplicas == R_cur` — **all replicas have settled.** Otherwise a scale-up still in progress depresses
+   `desiredUtilization` through its `R_ready` numerator and the controller can remove pods it added seconds
+   earlier ([DR-03](design-review.md#dr-03-demand-driven-scale-down-can-fire-while-replicas-are-still-starting)).
+   Watchdog remediation writes are exempt.
+4. `now − LastScaleDown >= C_down` (300 s, five times the scale-up cooldown).
+5. `max(desired samples over the last W) < R_cur` — no sample inside the 5-minute window wanted the current
    count or more.
+6. **The window is covered:** at least `scaleDownWindowCoverage` (0.8) of the `ceil(W / interval)` expected
+   samples are present, and the oldest is at least `W` old. Reconciles that return before computing demand
+   (`HoldStaleMetrics`, `ErrorAPIFailure`) append no sample, so without this condition a five-minute metrics
+   outage would leave a nearly-empty window whose `max()` is trivially low — permitting a scale-down justified
+   by *missing* data ([DR-04](design-review.md#dr-04-stabilization-window-gaps-permit-a-blind-scale-down)).
+   Uncovered windows report `HoldStabilizationWindow`.
 
 Then, and only then:
 
@@ -369,25 +413,31 @@ stateDiagram-v2
     [*] --> Clear
     Clear --> Armed: infeasible scale-up (Hold or Partial)
     Armed --> Armed: still infeasible, interval doubles (30s→60s→…→15m cap)
-    Armed --> Clear: fit capacity increased
-    Armed --> Clear: scale action succeeded
+    Armed --> Clear: F > fitCapacityAtArm
+    Armed --> Clear: complete scale-up succeeded
     Armed --> Clear: desired fell to or below current
     note right of Armed
         Decisions report HoldBackoff.
-        One Warning event per cycle,
-        not one per reconcile.
+        F is still computed every
+        reconcile, so a capacity
+        increase is seen immediately.
     end note
 ```
 
 ```text
-armBackoff():
+armBackoff(F):
     attempts += 1
     interval  = min(initial × factor^(attempts−1), max)     // 30s, 60s, 120s … 15m
-    nextEligible = now + interval
+    nextEligible      = now + interval
+    fitCapacityAtArm  = F            // the capacity level this backoff is a statement about
 
 resetBackoff():
-    attempts = 0; nextEligible = zero
+    attempts = 0; nextEligible = zero; fitCapacityAtArm = −1
 ```
+
+`fitCapacityAtArm` is what makes the reset condition expressible: "capacity increased" is meaningless without
+recording the level it increased *from*. It is stored in the snapshot's `BackoffState`, so the reset remains a
+pure function of the snapshot.
 
 ### 9.2 Reset is level-triggered on capacity, not timer-driven
 
@@ -396,6 +446,11 @@ that when an operator adds a node or a neighbouring workload releases resources,
 milliseconds and the next reconcile (≤ 15 s) acts — the controller does not sit out the remainder of a
 15-minute backoff ([ADR-11](architecture.md#adr-11-how-do-we-avoid-repeatedly-attempting-an-impossible-scale)).
 The backoff exists to suppress *futile retries*, not to delay *recovery*.
+
+This is only true because `F` is recomputed on every scale-up-direction reconcile, **including while backoff is
+armed** ([§5](#5-step-3--stability-gates)). Evaluating feasibility after the backoff gate — the obvious
+performance optimization — would make the reset condition unobservable and silently convert this design into a
+timer-based backoff ([DR-01](design-review.md#dr-01-backoff-gate-makes-the-recovery-in-one-interval-claim-unreachable)).
 
 ### 9.3 What the operator sees
 
@@ -417,9 +472,11 @@ keep the pipeline as fast as the cluster safely allows and make the shortfall **
 
 ```go
 func Decide(s Snapshot, c Config, now time.Time) Decision {
-    // G0–G2: validity and freshness
+    // G0–G2: validity, sole ownership, quiet target, freshness
     if !s.Valid                       { return hold(ErrorAPIFailure) }
     if s.HPAPresent                   { return hold(HoldScalingConflict) }
+    if s.ExternalDrifts > c.ExternalChangeTolerance { return hold(HoldExternalChange) }
+    if s.RolloutInProgress            { return hold(HoldRolloutInProgress) }
     if !s.Backlog.Fresh(c.MetricsStaleAfter, now) { return hold(HoldStaleMetrics) }
 
     // Step 1: demand
@@ -441,8 +498,13 @@ func Decide(s Snapshot, c Config, now time.Time) Decision {
     }
 
     if desiredClamped > s.CurrentReplicas {   // ── scale-up path
+        // s.FitCapacity was computed for this snapshot before Decide was called (see §5).
+        backoffActive := now.Before(s.HoldBackoff.NextEligible) &&
+                         s.FitCapacity <= s.HoldBackoff.FitCapacityAtArm
+
         if s.PendingOurPods > 0                                { return hold(HoldPendingPods) }
-        if now.Before(s.HoldBackoff.NextEligible)              { return hold(HoldBackoff) }
+        if s.UnhealthyPodAge > c.PodStartupTimeout             { return hold(HoldUnhealthyPods) }
+        if backoffActive                                       { return hold(HoldBackoff) }
         if now.Sub(s.LastScaleUp) < c.ScaleUpCooldown          { return hold(HoldCooldown) }
 
         target := min(desiredClamped, s.CurrentReplicas+c.MaxScaleUpStep)
@@ -450,7 +512,7 @@ func Decide(s Snapshot, c Config, now time.Time) Decision {
 
         switch {
         case s.FitCapacity >= delta:
-            return scale(target, ScaleUp, resetBackoff)
+            return scale(target, ScaleUp, resetBackoff)              // complete: reset
         case s.FitCapacity > 0 && c.AllowPartialScaleUp:
             return scale(s.CurrentReplicas+s.FitCapacity, ScaleUpPartial, armBackoff)
         default:
@@ -458,9 +520,11 @@ func Decide(s Snapshot, c Config, now time.Time) Decision {
         }
     }
 
-    // ── scale-down path
+    // ── scale-down path (demand-driven; watchdog remediation bypasses these gates)
+    if s.ReadyReplicas != s.CurrentReplicas                    { return hold(HoldReplicasSettling) }
     if now.Sub(s.LastScaleDown) < c.ScaleDownCooldown          { return hold(HoldCooldown) }
-    if s.MaxDesiredInWindow(c.ScaleDownStabilizationWindow) >= s.CurrentReplicas {
+    if !s.WindowCovered(c.ScaleDownStabilizationWindow, c.Interval, c.ScaleDownWindowCoverage) ||
+        s.MaxDesiredInWindow(c.ScaleDownStabilizationWindow) >= s.CurrentReplicas {
         return hold(HoldStabilizationWindow)
     }
     target := maxOf(desiredClamped, s.CurrentReplicas-c.MaxScaleDownStep, c.MinReplicas)
@@ -520,9 +584,10 @@ Event (Warning): `ScaledUpPartial: 2 -> 4 of 6 desired; fitCapacity 2, blocking 
 backoff: 30s → 60s → 120s → … → 15m
 ```
 
-Then an operator adds a worker node. The node informer fires; the next reconcile computes `F = 8`, which is an
-increase, so backoff resets and the same tick issues `ScaleUp` — recovery latency is one interval, not one
-backoff period ([§9.2](#92-reset-is-level-triggered-on-capacity-not-timer-driven)).
+Then an operator adds a worker node. The node informer fires; the next reconcile computes `F = 8` — which it
+does *despite* the armed backoff — and since `8 > fitCapacityAtArm (0)`, backoff resets and the same tick
+issues `ScaleUp`. Recovery latency is one interval, not one backoff period
+([§9.2](#92-reset-is-level-triggered-on-capacity-not-timer-driven)).
 
 ### Example D — Expensive items caught by the utilization signal
 
@@ -541,10 +606,11 @@ case `max()` exists for.
 ### Example E — Quiet pipeline, gradual scale-down
 
 ```text
-R_cur = 6, backlog 30, U_cpu = 12 %
+R_cur = 6, R_ready = 6, backlog 30, U_cpu = 12 %
 desiredBacklog = 1;  desiredUtil = ceil(6 × 12/70) = 2;  desiredRaw = 2
 deadband: |2−6|/6 = 67 % > 10 %  → act, direction down
-C_down satisfied; max(desired over 300s) = 2 < 6  → ScaleDown
+replicas settled (6 == 6); C_down satisfied
+window covered (20 of 20 samples) and max(desired over 300s) = 2 < 6  → ScaleDown
 target = max(2, 6−1, 1) = 5
 ```
 
@@ -593,3 +659,9 @@ controller does **not** interpret "no backlog data" as "no backlog"
 | [FR-18](requirements.md#4-functional-requirements) backoff | [§9.1](#91-backoff-state-machine) |
 | [FR-21](requirements.md#4-functional-requirements) deletion cost | [§7](#7-step-5--scale-down-logic) |
 | [FR-22](requirements.md#4-functional-requirements) no premature scale-down | [§3.3](#33-combining-the-signals) |
+| [FR-28](requirements.md#review-driven-requirements-v011) warmup exclusion | [§3.2](#32-utilization-derived-target) |
+| [FR-29](requirements.md#review-driven-requirements-v011) settled replicas + covered window | [§7](#7-step-5--scale-down-logic) |
+| [FR-30](requirements.md#review-driven-requirements-v011) unhealthy-pod guard | G5′ in [§5](#5-step-3--stability-gates) |
+| [FR-31](requirements.md#review-driven-requirements-v011) external change detection | G1 in [§5](#5-step-3--stability-gates) |
+| [FR-32](requirements.md#review-driven-requirements-v011) rollout hold | G1′ in [§5](#5-step-3--stability-gates) |
+| [FR-33](requirements.md#review-driven-requirements-v011) feasibility computed under backoff | [§5](#5-step-3--stability-gates), [§9.2](#92-reset-is-level-triggered-on-capacity-not-timer-driven) |

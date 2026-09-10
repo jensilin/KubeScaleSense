@@ -209,15 +209,15 @@ flowchart TD
     DEAD -- No --> NOOP["NO-OP · NoChangeWithinTolerance"]
     DEAD -- Yes --> DIR{"Direction"}
 
-    DIR -- "desired < current" --> DOWNGATES{"Stabilization window<br/>and scale-down cooldown<br/>satisfied?"}
-    DOWNGATES -- No --> HOLDDOWN["HOLD · HoldStabilizationWindow<br/>or HoldCooldown"]
+    DIR -- "desired < current" --> DOWNGATES{"Replicas settled,<br/>cooldown passed, and<br/>window covered?"}
+    DOWNGATES -- No --> HOLDDOWN["HOLD · HoldReplicasSettling /<br/>HoldCooldown / HoldStabilizationWindow"]
     DOWNGATES -- Yes --> DOWN["SCALE DOWN by maxScaleDownStep<br/>after writing pod-deletion-cost"]
 
-    DIR -- "desired > current" --> UPGATES{"Scale-up cooldown,<br/>backoff, and no pending<br/>pods of ours?"}
-    UPGATES -- No --> HOLDUP["HOLD · HoldCooldown /<br/>HoldBackoff / HoldPendingPods"]
+    DIR -- "desired > current" --> FIT["Compute fit capacity<br/>from allocatable minus requested"]
+    FIT --> UPGATES{"No pending or unhealthy pods,<br/>backoff not blocking,<br/>cooldown passed?"}
+    UPGATES -- No --> HOLDUP["HOLD · HoldPendingPods /<br/>HoldUnhealthyPods /<br/>HoldBackoff / HoldCooldown"]
     UPGATES -- Yes --> STEP["Apply maxScaleUpStep<br/>-> requestedDelta"]
-    STEP --> FIT["Compute fit capacity<br/>from allocatable minus requested"]
-    FIT --> FEAS{"fitCapacity >= requestedDelta?"}
+    STEP --> FEAS{"fitCapacity >= requestedDelta?"}
     FEAS -- Yes --> UP["SCALE UP · ScaleUp"]
     FEAS -- "No, fitCapacity > 0<br/>and allowPartialScaleUp" --> PARTIAL["SCALE UP by fitCapacity<br/>ScaleUpPartial + arm backoff"]
     FEAS -- "No, fitCapacity == 0" --> HOLDRES["HOLD · HoldInsufficientResources<br/>arm backoff, emit event"]
@@ -228,9 +228,14 @@ flowchart TD
     class HOLDRES,HOLDUP,HOLDDOWN,HOLDSTALE hold
 ```
 
-Note the ordering choice: **demand is computed before feasibility**, and feasibility is evaluated only on the
-scale-up path. This keeps the expensive node walk off the common no-op path, and it means a HOLD always
-carries a concrete "we wanted N, we can place M" statement rather than an abstract capacity report.
+Note the ordering choice: **demand is computed before feasibility**, and feasibility is evaluated only once the
+direction is known to be up. This keeps the expensive node walk off the common no-op path, and it means a HOLD
+always carries a concrete "we wanted N, we can place M" statement rather than an abstract capacity report.
+
+Critically, feasibility is computed **before** the pending/backoff/cooldown gates rather than after them. The
+backoff reset is level-triggered on observed capacity, so `F` must be evaluated even on reconciles that will
+return `HoldBackoff` — otherwise recovery becomes unobservable and the backoff silently degenerates into a
+timer ([DR-01](design-review.md#dr-01-backoff-gate-makes-the-recovery-in-one-interval-claim-unreachable)).
 
 ### 5.2 One reconcile, end to end
 
@@ -274,10 +279,12 @@ stateDiagram-v2
     Steady --> Ready: tick
 
     Ready --> ScalingUp: feasible scale-up issued
-    ScalingUp --> Ready: new pods Running before pendingPodTimeout
+    ScalingUp --> Ready: new pods Ready before timeouts
     ScalingUp --> PendingStuck: pod Unschedulable > pendingPodTimeout
+    ScalingUp --> Unhealthy: pod scheduled but not Ready > podStartupTimeout
 
     PendingStuck --> Ready: remediation applied (revert / freeze / none)
+    Unhealthy --> Ready: pods became Ready or were removed by an operator
 
     Ready --> ResourceHold: demand > fit capacity
     ResourceHold --> ResourceHold: backoff not expired
@@ -327,14 +334,19 @@ type Snapshot struct {
     FreeCPUMilli    int64        // aggregate over candidate nodes, for reporting
     FreeMemoryBytes int64
 
+    // Target state (owned by controller / read from the Deployment)
+    RolloutInProgress bool        // generation != observedGeneration, or updatedReplicas != replicas
+    ExternalDrifts    int32       // replica changes observed that we did not write
+
     // History (owned by controller)
     LastScaleUp     time.Time
     LastScaleDown   time.Time
-    DesiredHistory  []DesiredSample // for the stabilization window
-    HoldBackoff     BackoffState
+    DesiredHistory  []DesiredSample // for the stabilization window; coverage matters, not just max()
+    HoldBackoff     BackoffState    // includes FitCapacityAtArm for the level-triggered reset
     LastGoodReplicas int32
     PendingOurPods  int32
     OldestPendingAge time.Duration
+    UnhealthyPodAge  time.Duration  // longest scheduled-but-not-Ready duration in the current ReplicaSet
 }
 ```
 
@@ -354,8 +366,9 @@ cluster-scoped resource discovery, and a namespaced `Role` for the target and co
 | `nodes` | core | get, list, watch | Cluster | Allocatable, taints, labels, conditions ([FR-11](requirements.md#4-functional-requirements), [FR-12](requirements.md#4-functional-requirements)) |
 | `pods` | core | get, list, watch | Cluster | Sum requests per node — pods of *other* namespaces consume the same node budget |
 | `nodes`, `pods` | metrics.k8s.io | get, list | Cluster | Utilization signal ([FR-07](requirements.md#4-functional-requirements)) |
-| `deployments` | apps | get, list, watch | Namespace | Read spec/status + pod template for the effective request |
+| `deployments` | apps | get, list, watch | Namespace | Read spec/status + pod template for the effective request; detect rollouts and external replica writes ([FR-31](requirements.md#review-driven-requirements-v011), [FR-32](requirements.md#review-driven-requirements-v011)) |
 | `deployments/scale` | apps | get, update, patch | Namespace | The one mutation that changes replica count ([FR-01](requirements.md#4-functional-requirements)) |
+| `replicasets` | apps | get, list, watch | Namespace | Identify pods of the target's **current** ReplicaSet, so a doomed pod of a superseded ReplicaSet cannot trigger remediation of a healthy one ([DR-09](design-review.md#dr-09-rbac-omits-replicaset-reads-that-the-watchdog-requires)) |
 | `pods` | core | patch | Namespace | `pod-deletion-cost` annotation ([FR-21](requirements.md#4-functional-requirements)) |
 | `horizontalpodautoscalers` | autoscaling | get, list, watch | Namespace | Conflict detection ([FR-19](requirements.md#4-functional-requirements)) |
 | `events` | core / events.k8s.io | create, patch | Namespace | Decision audit trail ([FR-24](requirements.md#4-functional-requirements)) |
@@ -369,6 +382,11 @@ cluster-scoped resource discovery, and a namespaced `Role` for the target and co
 - No write access to nodes: no cordon, no taint, no eviction.
 - No `deployments` `update` — only `deployments/scale`, so a bug cannot rewrite the pod template.
 - No secrets access beyond the single mounted NiFi credential `Secret` (mounted as a file, not read via API).
+- No `events` **read**. A consequence worth stating: the controller cannot quote the ReplicaSet's
+  `FailedCreate` message, so a quota-blocked scale-up is reported as "replicas not materialising into pods"
+  with quota and `LimitRange` named as candidates, rather than as a precise cause
+  ([DR-09](design-review.md#dr-09-rbac-omits-replicaset-reads-that-the-watchdog-requires)). Cluster-wide event
+  reads were judged not worth the permission for a POC.
 
 Pod hardening: non-root, read-only root filesystem, all capabilities dropped, `seccompProfile:
 RuntimeDefault`, no service account token beyond the controller's own.
@@ -399,7 +417,10 @@ RuntimeDefault`, no service account token beyond the controller's own.
 | `kss_insufficient_resource_holds_total` | counter | `dimension` | How often demand exceeded capacity |
 | `kss_hold_backoff_seconds` | gauge | — | Current backoff interval ([FR-18](requirements.md#4-functional-requirements)) |
 | `kss_pending_target_pods` | gauge | — | Pods of ours in Pending |
+| `kss_unhealthy_target_pods` | gauge | — | Pods scheduled but not Ready past `podStartupTimeout` ([FR-30](requirements.md#review-driven-requirements-v011)) |
 | `kss_pending_pod_remediations_total` | counter | `action` | Watchdog interventions ([FS-06](failure-scenarios.md#fs-06-newly-created-pod-stays-pending)) |
+| `kss_external_scale_changes_total` | counter | — | Replica writes by other actors ([FR-31](requirements.md#review-driven-requirements-v011)) |
+| `kss_backoff_fit_capacity_at_arm` | gauge | — | Capacity level the active backoff is a statement about; reset compares `F` against it ([FR-33](requirements.md#review-driven-requirements-v011)) |
 | `kss_api_errors_total` | counter | `resource`, `verb`, `code` | API health ([FS-09](failure-scenarios.md#fs-09-kubernetes-api-failure)) |
 | `kss_leader` | gauge | — | 1 if this replica is leader |
 | `kss_config_info` | gauge | key config values | Correlate behaviour with configuration in the demo |
@@ -415,7 +436,10 @@ On the target `Deployment`, so `kubectl describe deployment file-processor` expl
 | `ScaledDown` | Normal | `6 -> 5 (backlog 30 for 300s, stabilization window satisfied)` |
 | `InsufficientClusterResources` | Warning | `need 4 pods of 500m/512Mi, can place 0; candidate nodes 2/3, blocking cpu; retry in 30s` |
 | `PodPendingTimeout` | Warning | `pod file-processor-x unschedulable for 124s; reverting 6 -> 2` |
+| `PodStartupFailure` | Warning | `2 pods scheduled but not Ready for 312s (ImagePullBackOff); blocking scale-ups` |
 | `ScalingConflict` | Warning | `HPA hpa/file-processor targets the same Deployment; refusing to scale` |
+| `ExternalScaleDetected` | Warning | `replicas changed 6 -> 2 by another actor; adopting as baseline, history reset` |
+| `RolloutInProgress` | Normal | `generation 7 != observedGeneration 6; holding both directions until rollout completes` |
 | `MetricsUnavailable` | Warning | `NiFi backlog source unavailable for 75s; holding` |
 
 Event emission for repeating HOLD states is rate-limited to once per backoff cycle to avoid event spam
@@ -569,6 +593,18 @@ mutation with real side effects (webhooks, quota consumption, noise) and does no
 **Consequences.** KubeScaleSense can be wrong in one direction (thinks a pod fits when it does not, due to
 unmodelled predicates such as topology spread), so the Pending-pod watchdog is mandatory, not optional
 ([ADR-13](#adr-13-what-happens-if-a-newly-created-pod-stays-pending)).
+
+**Review amendments.** Two additions from the [design review](design-review.md):
+
+- Greedy counting is not merely a heuristic here — it is *provably* exact for identical pods, because
+  `fit(n)` is a floor division by a fixed pod size, so placing one pod reduces the cluster total by exactly
+  one and no online scheduler ordering can strand a counted unit. The argument and its two preconditions are
+  recorded in [resource-calculation § 5.1](resource-calculation.md#51-why-greedy-counting-is-safe-for-identical-pods)
+  ([DR-16](design-review.md#dr-16-greedy-fit-counting-was-under-justified)).
+- "No topology constraints in the pod spec" does **not** imply no topology predicate: a cluster admin can
+  configure hard `defaultConstraints` for the `PodTopologySpread` plugin in the scheduler configuration, which
+  applies to pods that declare none. Recorded as assumption
+  [A-09](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful).
 
 ### ADR-07: How do taints and tolerations affect the calculation?
 
@@ -740,6 +776,17 @@ present, which is [NG-2](requirements.md#3-non-goals); `onPendingTimeout: none` 
 **Consequences.** A `revert` can fight a genuinely-transient condition (e.g. a node rebooting), which is why
 the timeout is 120 s rather than seconds, and why reverting arms the backoff instead of retrying immediately.
 
+**Review amendment — the other half of the failure space.** This ADR originally covered only pods that never
+*schedule*. Pods that schedule and then never become *useful* (`ImagePullBackOff`, `CrashLoopBackOff`, failing
+readiness) are worse for a resource-aware controller: they hold committed requests while processing nothing, so
+the backlog grows, the controller scales up again, and it consumes cluster capacity that other workloads need
+— reacting to a broken image by eating the cluster. Any pod of the current ReplicaSet that is scheduled but
+not Ready for longer than `pending.podStartupTimeout` (300 s) therefore blocks scale-ups
+(`HoldUnhealthyPods`), with **no** auto-remediation: these pods may recover, and removing replicas from a
+partially-broken pool can remove the working ones
+([DR-06](design-review.md#dr-06-scheduled-but-unhealthy-pods-cause-unbounded-scale-up),
+[FS-24](failure-scenarios.md#fs-24-scheduled-but-unhealthy-pods)).
+
 ### ADR-14: What happens if Kubernetes API calls fail?
 
 **Decision.** Fail-safe means **freeze**, not guess:
@@ -784,6 +831,19 @@ store; at-least-once with idempotent writes is the standard, cheaper answer. *Co
 drain (query pods, wait, then delete)* — duplicates what `preStop` and graceful termination already do, and
 requires pod-delete permission we deliberately do not hold ([§7](#7-kubernetes-permissions-and-rbac)).
 
+**Review corrections.** Two claims in the original list did not survive review:
+
+- **A `PodDisruptionBudget` does not constrain scale-down.** PDBs are enforced only by the Eviction API
+  (drain, descheduler, autoscaler consolidation); a ReplicaSet scale-down deletes pods directly and ignores
+  them entirely. D-07 is rescoped to node-level disruption, and scale-down safety rests solely on
+  `maxScaleDownStep`, deletion-cost ordering, graceful drain, and the reaper
+  ([DR-10](design-review.md#dr-10-poddisruptionbudget-does-not-protect-against-scale-down)).
+- **`pod-deletion-cost` is a preference within the Ready cohort, not a selector.** The ReplicaSet controller
+  ranks candidates by unassigned, then `Pending` before `Running`, then **not-Ready before Ready**, and only
+  then by deletion cost. A busy pod with a momentary readiness blip is removed before an idle Ready pod
+  regardless of cost ([DR-11](design-review.md#dr-11-pod-deletion-cost-ordering-was-described-too-loosely)).
+  The real guarantee for in-flight work is graceful drain plus the reaper.
+
 ### ADR-16: How will this be demonstrated in a local Kubernetes environment?
 
 **Decision.** A `kind` cluster with one control-plane and three workers, deliberately **small and
@@ -800,6 +860,44 @@ in the cluster" and "no room for a 500 m pod" are compatible statements.
 **Rejected.** *minikube single node* — a one-node cluster cannot demonstrate fragmentation or the taint
 exclusion of the control-plane node; supported but not the reference environment. *A managed cloud cluster* —
 cost, and a cluster autoscaler would silently paper over the very condition being demonstrated.
+
+**Review amendment.** The multi-node topology this ADR requires is in direct tension with the demo pipeline's
+shared work store: kind's default `local-path-provisioner` offers only node-local `ReadWriteOnce` volumes, so
+a "shared" PVC silently becomes per-node directories and items written by NiFi are invisible to workers on
+other nodes. Resolving that is now a blocking prerequisite for P2, not an open question
+([DR-12](design-review.md#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment)).
+
+### ADR-17: How do we handle other writers of the replica count?
+
+**Decision.** Track `lastWrittenReplicas`. When observed `spec.replicas` differs from our last write and we did
+not write it, infer an external change: **adopt the observed value as the new baseline**, reset cooldown timers
+and `desiredHistory`, and emit `ExternalScaleDetected` once. If drift recurs more than
+`scaling.externalChangeTolerance` (3) times within the stabilization window, stop acting entirely
+(`HoldExternalChange`). On startup and on acquiring leadership, the current value is adopted **silently**, with
+no event and no drift increment.
+
+**Rationale.** The [FS-16](failure-scenarios.md#fs-16-competing-controller-on-the-same-target) analysis
+covered a competing HPA and missed the likelier case: a **GitOps controller**. Argo CD or Flux reconciling
+`replicas: 2` from git will revert every scale-up within seconds; a controller that simply scales up again next
+interval produces an oscillation loop with an external actor, terminating pods on every cycle. Manual
+`kubectl scale` and other operators are the same class of conflict.
+
+Worth being explicit about why the existing machinery does not cover this: **`resourceVersion` preconditions do
+not help.** The external write succeeds, we observe the new value, and our next write is against a fresh
+version. Optimistic concurrency prevents *lost updates*; it says nothing about *disagreements over intent*.
+
+Adopting rather than fighting is the level-triggered choice, consistent with the rest of the design: the
+controller's job is to make the replica count appropriate *now*, not to defend a number it wrote earlier.
+Refusing after repeated drift is the same stance as the HPA case, for the same reason — whoever writes last
+wins, so competing has no safe outcome ([I-12](design-review.md#5-immutable-phase-1-decisions)).
+
+**Rejected.** *Fighting (re-asserting our value immediately)* — guarantees oscillation and burns API budget.
+*Ignoring external writes* — our cooldowns and history would describe a replica count that no longer exists.
+*Taking ownership via a field-manager conflict or an admission webhook* — real solutions, but far outside a POC.
+
+**Consequences.** In a GitOps-managed environment KubeScaleSense must be granted ownership of `replicas` (e.g.
+Argo CD `ignoreDifferences` on the replica field), exactly as an HPA must be. That is a deployment
+prerequisite, now recorded as [A-10](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful).
 
 ---
 
