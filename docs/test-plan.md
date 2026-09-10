@@ -1,6 +1,6 @@
 # KubeScaleSense — Test Plan
 
-> Status: **Design (pre-implementation)** · Version: 0.1
+> Status: **Design (pre-implementation)** · Version: 0.2
 > Canonical source for: test strategy, test IDs (`UT-xx`, `IT-xx`, `DI-xx`, `E2E-xx`, `PF-xx`, `SK-xx`), the
 > local demonstration environment, and CI gates.
 
@@ -20,10 +20,10 @@ is assembled correctly and that the single mutation lands.
 
 ```mermaid
 flowchart TD
-    U["Unit · UT-01…UT-22<br/>pure Decide + resource math<br/>ms · no cluster · ≥90% coverage"]
-    I["Integration · IT-01…IT-12<br/>fake clientset + envtest<br/>seconds · no real workload"]
-    D["Data integrity · DI-01…DI-07<br/>kind + real pipeline<br/>minutes · correctness under churn"]
-    E["End-to-end · E2E-01…E2E-11<br/>kind + NiFi + SFTP + generator<br/>minutes · behaviour + demo"]
+    U["Unit · UT-01…UT-26<br/>pure Decide + resource math<br/>ms · no cluster · ≥90% coverage"]
+    I["Integration · IT-01…IT-16<br/>fake clientset + envtest<br/>seconds · no real workload"]
+    D["Data integrity · DI-01…DI-09<br/>kind + real pipeline<br/>minutes · correctness under churn"]
+    E["End-to-end · E2E-01…E2E-11<br/>kind + NiFi + SFTP + normalizer<br/>minutes · behaviour + demo"]
     P["Performance / soak · PF-01…PF-03, SK-01<br/>synthetic scale, long runs"]
 
     U --> I --> D --> E --> P
@@ -38,9 +38,9 @@ Three principles govern what gets tested where:
    armed, 3 of 4 pods fit" in a live cluster is slow and flaky; as a snapshot struct it is five lines.
 2. **Every `FS-xx` scenario has at least one owning test.** The failure analysis is a specification, not prose,
    and [§11](#11-traceability-matrix) is the proof of coverage.
-3. **Data integrity is tested by counting.** Every DI test ends with a conservation assertion: files in =
-   outputs out, with no partial or duplicate final outputs. Behavioural correctness of an autoscaler is
-   arguable; a file count is not.
+3. **Data integrity is tested by counting.** Every DI test ends with a conservation assertion: records in =
+   normalized outputs out, with no partial outputs and no *unintended* duplicates. Behavioural correctness of
+   an autoscaler is arguable; a record count is not.
 
 ---
 
@@ -112,7 +112,7 @@ than the handful an author thought to enumerate.
 | UT-18 | Per-node free resources | `allocatable − requested − reserve`, floored at zero (negative reserve case); pods of other namespaces counted; assigned-but-Pending counted; terminating (with `deletionTimestamp`) counted; `Succeeded`/`Failed` excluded |
 | UT-19 | Fit capacity | Per-node floor then sum (**fragmentation**: 5 nodes × 300 m free, 500 m request → `F = 0`); pod-slot limit binding while CPU is free; `fitCapacityMarginPods` subtraction floored at zero; reproduces the reference example `F = 4` from [resource-calculation § 7](resource-calculation.md#7-worked-example) exactly |
 | UT-20 | Blocking dimension | Correct dimension reported when CPU binds, when memory binds, when pod slots bind, and on ties (documented precedence: cpu → memory → podSlots) |
-| UT-21 | Config validation | `minReplicas > maxReplicas`; `interval < 5s`; `itemsPerReplica ≤ 0`; missing target; pod template without CPU or memory requests; malformed NiFi URL — each produces a specific, non-generic error ([FS-19](failure-scenarios.md#fs-19-misconfiguration)) |
+| UT-21 | Config validation | `minReplicas > maxReplicas`; `interval < 5s`; `itemsPerReplica ≤ 0`; missing target; pod template without CPU or memory requests; `signal.source: http` with an empty or malformed endpoint; `signal.source: synthetic` with an unreadable path — each produces a specific, non-generic error ([FS-19](failure-scenarios.md#fs-19-misconfiguration)) |
 
 ---
 
@@ -132,13 +132,13 @@ semantics matter — subresources, preconditions, RBAC, events.
 | IT-07 | Pending watchdog | Pod forced `Unschedulable`: immediate `HoldPendingPods`; after `pendingPodTimeout`, each `onPendingTimeout` mode behaves as specified (`revert` restores `lastGoodReplicas`, `freeze` blocks scale-ups, `none` reports only); remediation goes through `scale`, never pod deletion ([FS-06](failure-scenarios.md#fs-06-newly-created-pod-stays-pending)) |
 | IT-08 | Quota block | `ResourceQuota` rejects creation: `spec.replicas` rises, `status.replicas` does not, no Pending pod exists; watchdog still triggers on unmaterialised replicas ([FS-10](failure-scenarios.md#fs-10-namespace-resourcequota-blocks-pod-creation)) |
 | IT-09 | Leader election | Only the leader writes; on lease loss the controller stops deciding and exits; the successor starts cooled down with empty history ([FS-17](failure-scenarios.md#fs-17-controller-crash-restart-or-leadership-change)) |
-| IT-10 | Metrics-server absent | `metrics.k8s.io` unavailable → backlog-only scaling continues, `MetricsUnavailable` emitted; NiFi absent → `HoldStaleMetrics` ([FS-15](failure-scenarios.md#fs-15-metrics-source-unavailable)) |
+| IT-10 | Metrics-server absent | `metrics.k8s.io` unavailable → pressure-only scaling continues, `MetricsUnavailable` emitted; signal source absent → `HoldStaleMetrics` ([FS-15](failure-scenarios.md#fs-15-metrics-source-unavailable)) |
 | IT-11 | Deletion cost | Before a scale-down, `pod-deletion-cost` is patched from in-flight counts, lowest on the idlest pod ([FR-21](requirements.md#4-functional-requirements)) |
 | IT-12 | Dry run | `dryRun: true` produces identical reason codes and metrics with **zero** mutating API calls (asserted via a counting round-tripper) |
 | IT-13 | External replica writes | A simulated GitOps loop rewrites `replicas` after each of our writes: first drift is adopted silently-plus-event with history reset, and after `externalChangeTolerance` recurrences the controller stops writing (`HoldExternalChange`). Asserts **no** unbounded write loop ([FS-22](failure-scenarios.md#fs-22-external-actor-changes-the-replica-count)) |
 | IT-14 | Rollout hold | With `generation != observedGeneration`, no write occurs in either direction; scaling resumes within one interval of rollout completion ([FS-23](failure-scenarios.md#fs-23-scale-up-requested-during-a-rollout)) |
 | IT-15 | Unhealthy pods | Pods forced into `ImagePullBackOff` with a rising backlog: after `podStartupTimeout` the controller emits `PodStartupFailure` and issues **no further scale-ups**, even though demand keeps growing. Asserts the DR-06 loop is broken; also asserts no auto-revert ([FS-24](failure-scenarios.md#fs-24-scheduled-but-unhealthy-pods)) |
-| IT-16 | Work-store backlog source | Against a real PostgreSQL instance: the collected backlog equals `pending` + expired-lease rows and **excludes** live claims; a stopped database yields an *unavailable* signal (→ `HoldStaleMetrics`), never zero; a query slower than `workStore.timeout` behaves identically; the controller's role is verified to be **read-only** by asserting that an attempted write fails ([FR-36](requirements.md#work-store-requirements-v012)…[FR-38](requirements.md#work-store-requirements-v012), [FS-28](failure-scenarios.md#fs-28-work-store-unavailable-or-saturated)) |
+| IT-16 | Workload-signal source | Each source implementation satisfies the same contract: `synthetic` replays a scripted series exactly and deterministically; `http` collects queued + in-flight counts from a stub endpoint; a stopped endpoint, a connection refusal, and a response slower than `signal.timeout` each yield an *unavailable* signal (→ `HoldStaleMetrics`), **never zero**; `none` is permanently unavailable. Asserts the sources are interchangeable behind one interface, which is the property [FR-36](requirements.md#workload-signal-requirements-v02) exists to guarantee ([FR-38](requirements.md#workload-signal-requirements-v02), [FS-15](failure-scenarios.md#fs-15-metrics-source-unavailable)) |
 
 ---
 
@@ -146,42 +146,46 @@ semantics matter — subresources, preconditions, RBAC, events.
 
 Run on kind against the real pipeline. Every test ends with the conservation assertion:
 
-> `count(output_records) == count(input items)`, every output identical to the expected normalization, no
-> duplicate `item_key`, and no `work_items` row left in `processing` once the pipeline is idle.
+> Every input record produced exactly one normalized output, each identical to the expected normalization; no
+> record is missing; no output is partial; and NiFi's queues are empty with nothing parked in a failure
+> relationship once the pipeline is idle.
 
-Because the work store is a database, this assertion is a handful of SQL statements against the same instance
-the pipeline uses — the ledger is inherent rather than reconstructed
-([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)).
+The ledger is NiFi's provenance and queue state plus the output sink, counted at the two ends of the pipeline.
+This is a genuine loss compared with the withdrawn work-store design, where the assertion was a single `GROUP
+BY status` against an inherent ledger
+([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)). Counting at the ends
+is a little more work to implement and slightly weaker at localising *where* a record was lost — an accepted
+cost of removing the component.
+
+**A deliberate change in what the suite proves.** In v0.1.2 the DI suite verified a claim protocol. In v0.2
+there is no protocol to verify, so the suite verifies something more directly useful: that **scaling actions
+do not disturb a running pipeline**, and that **replicas convert into throughput**. Duplicates are no longer
+a failure — retry is expected ([FS-29](failure-scenarios.md#fs-29-a-retried-request-is-normalized-twice)) —
+so the assertion is on output *equality*, not on output *uniqueness*.
 
 | ID | Scenario | Method | Asserts | Verifies |
 | --- | --- | --- | --- | --- |
-| DI-01 | Worker killed mid-item | `kubectl delete pod --grace-period=0 --force` during processing | Item reclaimed after lease expiry and reprocessed; conservation holds | [D-04](requirements.md#7-data-loss-protection-assumptions), [FS-12](failure-scenarios.md#fs-12-worker-pod-crashes-mid-item) |
-| DI-02 | Scale-down during processing | Force a scale-down while all replicas are busy | Terminating pod finishes its current item; drain completes inside the grace period; conservation holds | [D-05](requirements.md#7-data-loss-protection-assumptions), [FS-14](failure-scenarios.md#fs-14-scale-down-terminates-a-busy-pod) |
-| DI-03 | Crash-looping replica | One pod configured to exit repeatedly | Other replicas continue; the failing pod's claims are reclaimed on lease expiry; conservation holds | D-04 |
-| DI-04 | Duplicate delivery | Same file injected twice / an item deliberately reprocessed | Exactly one `output_records` row; the second insert is a no-op by `ON CONFLICT` | [D-03](requirements.md#7-data-loss-protection-assumptions) |
-| DI-05 | Lease behaviour | Abandon a claim with an expired lease; separately, hold a **live** claim past a competing claim attempt | Expired claim reclaimed on the next claim query; **live** claim never stolen (no double-processing while a worker is healthy) | D-04, [FS-29](failure-scenarios.md#fs-29-lease-expires-while-the-worker-is-still-alive) |
-| DI-06 | Node memory pressure | Ballast pod balloons past its request until the kubelet evicts | Evicted worker's items reclaimed; conservation holds; the node's `memory-pressure` taint removes it from the candidate set | [FS-11](failure-scenarios.md#fs-11-node-memory-pressure-evicts-running-workers) |
-| DI-07 | Spike with full scaling churn | 5000 files, scale-up + partial + scale-down all occurring | Conservation holds across every scaling action; no item stalls beyond one lease period | [§4 of failure-scenarios](failure-scenarios.md#4-data-loss-analysis) |
-| DI-08 | **Claim exclusivity** | 8 workers spread across **3 nodes** claim continuously from a 5000-item table, with a batch size that guarantees contention | Every item is claimed by exactly one worker at a time (`claimed_by` transitions are never concurrent); no item is skipped; no worker starves; `SKIP LOCKED` produces no lock waits above the query timeout | [FS-25](failure-scenarios.md#fs-25-work-store-does-not-provide-the-assumed-claim-semantics), [WR-01](requirements.md#work-store-requirements-v012) |
-| DI-09 | **Transactional acknowledgement** | `SIGKILL` a worker at three points: after claim/before output, mid-transaction, after commit/before the next claim | Never a partial output; never an acknowledged item without its output row; the item is reclaimed after lease expiry in the first two cases and left `done` in the third; total output rows equal total input items with **zero** duplicates | [FS-12](failure-scenarios.md#fs-12-worker-pod-crashes-mid-item), [FS-29](failure-scenarios.md#fs-29-lease-expires-while-the-worker-is-still-alive), [WR-02](requirements.md#work-store-requirements-v012) |
-| DI-10 | **Store saturation** | Cap `max_connections` low, scale the pool to 12 replicas | Workers back off rather than failing items; no item is lost or double-committed; claim latency and connection saturation are observable, so a growing backlog is distinguishable from an undrainable one | [FS-28](failure-scenarios.md#fs-28-work-store-unavailable-or-saturated), [A-15](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful) |
+| DI-01 | Pod killed mid-request | `kubectl delete pod --grace-period=0 --force` while it is serving | In-flight requests fail; NiFi retries them against surviving pods; conservation holds | [D-02](requirements.md#7-durability-boundary-and-workload-responsibilities), [FS-12](failure-scenarios.md#fs-12-normalizer-pod-crashes-mid-request) |
+| DI-02 | Scale-down during processing | Force a scale-down while all replicas are busy | The terminating pod fails readiness first, so the Service stops routing to it; in-flight requests complete inside the grace period; **zero** failed requests attributable to the scale-down; conservation holds | [D-05](requirements.md#7-durability-boundary-and-workload-responsibilities), [WR-06](requirements.md#workload-signal-requirements-v02), [FS-14](failure-scenarios.md#fs-14-scale-down-terminates-a-busy-pod) |
+| DI-03 | Crash-looping replica | One pod configured to exit repeatedly | Other replicas continue serving; the Service routes around the not-Ready pod; conservation holds | D-02, [FS-24](failure-scenarios.md#fs-24-scheduled-but-unhealthy-pods) |
+| DI-04 | **Idempotent normalization under retry** | Force retries: inject response timeouts shorter than processing time, and re-send an identical record | Every duplicate normalization produces a **byte-identical** result; no partial output; the duplicate rate is visible in metrics rather than silent | [D-03](requirements.md#7-durability-boundary-and-workload-responsibilities), [WR-03](requirements.md#workload-signal-requirements-v02), [FS-29](failure-scenarios.md#fs-29-a-retried-request-is-normalized-twice) |
+| DI-05 | Graceful shutdown boundary | Set request processing time just under, then just over, `terminationGracePeriodSeconds` | Under: drain completes, no failures. Over: requests are cut off, NiFi retries, conservation still holds — and the violation of [A-07](requirements.md#6-workload-and-environment-assumptions) is **observable** rather than silent | D-05, A-07 |
+| DI-06 | Node memory pressure | Ballast pod balloons past its request until the kubelet evicts | The evicted pod's in-flight requests are retried; conservation holds; the node's `memory-pressure` taint removes it from the candidate set | [FS-11](failure-scenarios.md#fs-11-node-memory-pressure-evicts-running-workers) |
+| DI-07 | Spike with full scaling churn | 5000 records, with scale-up, partial scale-up, and scale-down all occurring | Conservation holds across every scaling action; no record is dropped by a scaling transition | [§4 of failure-scenarios](failure-scenarios.md#4-data-loss-analysis) |
+| DI-08 | **Throughput scales with replicas** | Hold NiFi's concurrency above `maxReplicas`, then measure sustained processing rate at 1, 2, 4, and 8 replicas across **3 nodes** under saturating load | Processing rate rises **monotonically and near-linearly** with replica count, within a stated tolerance; per-pod utilization stays roughly constant. **Fails the build if the curve is flat** | [FS-28](failure-scenarios.md#fs-28-adding-replicas-does-not-add-throughput), [A-13](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful), [A-15](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful), [WR-05](requirements.md#workload-signal-requirements-v02) |
+| DI-09 | **Pipeline survives pod loss under load** | `SIGKILL` a random pod every 30 s for 10 minutes during a sustained spike | Every input record still yields its correct output; the failure count matches the retry count; no record is parked in a failure relationship; the controller never scales down during the churn | [FS-12](failure-scenarios.md#fs-12-normalizer-pod-crashes-mid-request), [D-02](requirements.md#7-durability-boundary-and-workload-responsibilities) |
 
-DI-05's negative half matters as much as the positive: reclaiming a *live* claim causes duplicate
-processing on every long item, which is the classic way this pattern is implemented incorrectly.
+**DI-08 runs first and gates the rest, and it is now the most important test in the suite.** It validates the
+one property the v0.2 architecture assumes rather than enforces: that adding replicas adds throughput
+([ADR-21](architecture.md#adr-21-how-does-work-reach-the-normalizer-pods)). If that curve is flat, the
+controller may be flawless and the project still meaningless — every downstream scenario would be measuring
+scaling actions that change nothing. It runs **across three nodes** deliberately, so that a bottleneck masked
+by single-node locality cannot hide.
 
-**DI-08 and DI-09 run first and gate the rest.** They validate the two primitives that D-02, D-03, and D-04
-are built on — exclusive claiming and transactional acknowledgement. Until they pass, every other
-conservation assertion is testing the pipeline on top of an unverified foundation. Both are deliberately
-run **across three nodes**, because the failure they exist to catch
-([FS-25](failure-scenarios.md#fs-25-work-store-does-not-provide-the-assumed-claim-semantics)) is invisible in
-a single-node test.
-
-A note on what these tests are *not*. They do not verify PostgreSQL's implementation of `SKIP LOCKED` — that
-is the database's contract and the reason it was chosen
-([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)). They verify that the
-**application uses it correctly**: right isolation level, claim and ack in the transactions they belong to,
-lease arithmetic consistent with the grace period. Those are the parts that were previously convention and
-are now testable.
+DI-09 replaces the transactional-acknowledgement test it supersedes, and it is weaker on purpose: v0.1.2 could
+assert that a partial output was *unrepresentable*, whereas v0.2 can only assert that retry *recovers* from
+pod loss. That is the durability trade of the simplification, made visible in the test suite rather than
+argued away in prose.
 
 ---
 
@@ -205,8 +209,8 @@ flowchart TB
     subgraph NS["namespace: data-pipeline"]
         SFTP["sftp (atmoz/sftp)"]
         NIFI["nifi-0 (NiFi 2.6.7, StatefulSet, PVCs)"]
-        PG[("postgres-0<br/>work store, 1 RWO PVC")]
-        PROC["file-processor Deployment<br/>500m / 512Mi per pod ← the scaling target"]
+        SVC["normalizer-service (ClusterIP)"]
+        NORM["normalizer Deployment<br/>500m / 512Mi per pod ← the scaling target"]
         GEN["file-generator Job<br/>spike driver"]
     end
 
@@ -215,9 +219,9 @@ flowchart TB
         PROM["prometheus + metrics-server"]
     end
 
-    GEN --> SFTP --> NIFI --> PG --> PROC
-    KSS -->|scale| PROC
-    PG -.->|"backlog: claimable rows"| KSS
+    GEN --> SFTP --> NIFI -->|HTTP| SVC --> NORM
+    KSS -->|scale| NORM
+    NORM -.->|"pressure: queued + in-flight"| KSS
     PROM -.->|utilization| KSS
 
     classDef full fill:#9e6a03,color:#fff,stroke:#7d4e00
@@ -276,19 +280,27 @@ node capacity should never assume it.
 `metrics-server` needs `--kubelet-insecure-tls` on kind. Scripts live in `tests/e2e/`; nothing in the demo
 requires cloud access or a paid service.
 
-Deliberately **not** required, following the [work-store closure](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline):
-no CSI driver, no RWX StorageClass, no NFS server, no object store, no message broker. The work store is one
-PostgreSQL StatefulSet with a single `ReadWriteOnce` PVC from kind's default `local-path` provisioner — which
-is exactly what that provisioner *can* do correctly. One environment prerequisite is easy to miss: NiFi needs
-the PostgreSQL JDBC driver, supplied by an init container that fetches a pinned version into a shared volume;
-`make demo-up` must therefore be able to reach the driver's source, or the driver must be vendored into
-`deploy/demo/`.
+Deliberately **not** required, following the
+[v0.2 simplification](architecture.md#adr-21-how-does-work-reach-the-normalizer-pods): no database, no JDBC
+driver, no CSI driver, no RWX StorageClass, no NFS server, no object store, no message broker. The only
+PersistentVolumes are NiFi's own repositories, served by kind's default `local-path` provisioner — which is
+exactly what that provisioner *can* do correctly, because those volumes are genuinely node-local to a
+single-replica StatefulSet.
+
+Two setup details that are easy to miss and expensive to discover late:
+
+1. **NiFi's `InvokeHTTP` concurrent-task count must exceed `maxReplicas`**, or the demo will show the
+   controller scaling with no effect on throughput
+   ([FS-28](failure-scenarios.md#fs-28-adding-replicas-does-not-add-throughput)). `make demo-up` asserts this
+   against the configured `maxReplicas` and refuses to start if it is wrong.
+2. **NiFi's response timeout must exceed the Normalizer's maximum processing time**, or every slow request is
+   retried while still in flight ([FS-29](failure-scenarios.md#fs-29-a-retried-request-is-normalized-twice)).
 
 ### 7.4 Demo narrative
 
-Five scenarios, run in order, each ending with `kubectl describe deployment file-processor` (events tell the
-story) and a Prometheus/console view of `kss_desired_replicas` vs. `kss_current_replicas` and
-`kss_fit_capacity_pods`:
+Five scenarios, run in order, each ending with `kubectl describe deployment normalizer` (events tell the
+story) and a Prometheus/console view of `kss_desired_replicas` vs. `kss_current_replicas`,
+`kss_fit_capacity_pods`, and `kss_workload_processing_rate`:
 
 | Step | Scenario | Expected reason codes | Point being made |
 | --- | --- | --- | --- |
@@ -296,7 +308,7 @@ story) and a Prometheus/console view of `kss_desired_replicas` vs. `kss_current_
 | 2 | Spike, capacity available (E2E-01) | `ScaleUp` → `HoldCooldown` → `ScaleUp` | Demand-driven scaling works, rate-limited |
 | 3 | Spike, capacity exhausted (E2E-02) | `ScaleUpPartial` then `HoldInsufficientResources`, backoff growing | **The core result: zero Pending pods, loud deficit** |
 | 4 | Capacity restored — delete ballast (E2E-03) | `ScaleUp` within one interval | Level-triggered recovery, not timer-driven |
-| 5 | Drain a worker + kill a busy pod (E2E-05, DI-01) | `HoldInsufficientResources`; conservation assertion passes | Resource awareness and durability under disruption |
+| 5 | Drain a worker node + kill a busy pod (E2E-05, DI-01) | `HoldInsufficientResources`; conservation assertion passes | Resource awareness, and that NiFi's retry absorbs the disruption |
 
 The comparison that makes the value legible: run step 3 against a stock HPA with the same target and show the
 Pending pods it produces. Same demand, same cluster, different outcome — that side-by-side is the deliverable
@@ -317,7 +329,7 @@ invariants, never exact timings.
 | E2E-04 | Fragmentation | Ballast leaves 300 m free on each of 3 nodes; pod needs 500 m | `HoldInsufficientResources` while `kss_free_requestable_cpu_millicores` ≈ 900 m — the two metrics disagree *correctly* ([FS-04](failure-scenarios.md#fs-04-fragmentation-free-resources-exist-but-nothing-fits)) |
 | E2E-05 | Node drain under load | `kubectl drain worker-2` mid-spike | Node leaves the candidate set; `kss_excluded_nodes{exclusion_reason="cordoned"}` = 1; no scale attempt targets it; recovery on uncordon ([FS-13](failure-scenarios.md#fs-13-node-failure-or-drain-removes-workers)) |
 | E2E-06 | Oscillation soak | 60 min sawtooth load across a replica boundary | Scale actions ≤ ⌈duration/`C_up`⌉ up and ≤ ⌈duration/`C_down`⌉ down; no up→down→up within `C_down` ([FS-18](failure-scenarios.md#fs-18-replica-oscillation)) |
-| E2E-07 | Signal outage | Scale NiFi to 0 / block metrics-server mid-spike | `HoldStaleMetrics` after `metricsStaleAfter`; **replica count unchanged** (no scale-down); recovery on restore ([FS-08](failure-scenarios.md#fs-08-stale-resource-or-metric-information), [FS-15](failure-scenarios.md#fs-15-metrics-source-unavailable)) |
+| E2E-07 | Signal outage | Block the signal endpoint / block metrics-server mid-spike | `HoldStaleMetrics` after `metricsStaleAfter`; **replica count unchanged** (no scale-down); recovery on restore ([FS-08](failure-scenarios.md#fs-08-stale-resource-or-metric-information), [FS-15](failure-scenarios.md#fs-15-metrics-source-unavailable)) |
 | E2E-08 | Forced Pending | Add an unsatisfiable `nodeSelector` to the target after a scale-up, or apply a tight quota | Pod Pending → `HoldPendingPods` → remediation at `pendingPodTimeout`; `kss_pending_pod_remediations_total` = 1 ([FS-05](failure-scenarios.md#fs-05-unmodelled-scheduling-predicate-causes-a-wrong-fit-estimate), [FS-06](failure-scenarios.md#fs-06-newly-created-pod-stays-pending)) |
 | E2E-09 | Gradual scale-down | Stop the generator after a spike | `HoldStabilizationWindow` for ≥ `W`, then one `ScaleDown` per `C_down`, one replica at a time, never below `minReplicas`; DI-02 conservation holds throughout |
 | E2E-10 | Max replicas ceiling | `maxReplicas: 4`, demand implies 10 | `HoldAtMaxReplicas` (**not** `HoldInsufficientResources`); `kss_desired_replicas_uncapped` = 10 ([FS-01](failure-scenarios.md#fs-01-workload-spike-exceeds-maxreplicas)) |
@@ -378,7 +390,7 @@ flowchart LR
 | [FS-09](failure-scenarios.md#fs-09-kubernetes-api-failure) | IT-02, IT-03 |
 | [FS-10](failure-scenarios.md#fs-10-namespace-resourcequota-blocks-pod-creation) | IT-08 |
 | [FS-11](failure-scenarios.md#fs-11-node-memory-pressure-evicts-running-workers) | UT-18, DI-06 |
-| [FS-12](failure-scenarios.md#fs-12-worker-pod-crashes-mid-item) | DI-01, DI-03, DI-04, DI-05 |
+| [FS-12](failure-scenarios.md#fs-12-normalizer-pod-crashes-mid-request) | DI-01, DI-03, DI-09 |
 | [FS-13](failure-scenarios.md#fs-13-node-failure-or-drain-removes-workers) | UT-14, E2E-05 |
 | [FS-14](failure-scenarios.md#fs-14-scale-down-terminates-a-busy-pod) | IT-11, DI-02 |
 | [FS-15](failure-scenarios.md#fs-15-metrics-source-unavailable) | UT-12, IT-10, E2E-07 |
@@ -391,11 +403,11 @@ flowchart LR
 | [FS-22](failure-scenarios.md#fs-22-external-actor-changes-the-replica-count) | UT-26, IT-13 |
 | [FS-23](failure-scenarios.md#fs-23-scale-up-requested-during-a-rollout) | UT-26, IT-14 |
 | [FS-24](failure-scenarios.md#fs-24-scheduled-but-unhealthy-pods) | UT-26, IT-15 |
-| [FS-25](failure-scenarios.md#fs-25-work-store-does-not-provide-the-assumed-claim-semantics) | DI-08 |
+| [FS-25](failure-scenarios.md#fs-25-withdrawn-shared-work-store-claim-semantics) | *Withdrawn in v0.2 — no test; there is no shared store to claim from* |
 | [FS-26](failure-scenarios.md#fs-26-leadership-handoff-races-with-an-in-flight-write) | IT-02, IT-09 |
 | [FS-27](failure-scenarios.md#fs-27-stabilization-window-gap-after-an-outage) | UT-24, E2E-07, E2E-11 |
-| [FS-28](failure-scenarios.md#fs-28-work-store-unavailable-or-saturated) | IT-16, DI-10 |
-| [FS-29](failure-scenarios.md#fs-29-lease-expires-while-the-worker-is-still-alive) | DI-05, DI-09 |
+| [FS-28](failure-scenarios.md#fs-28-adding-replicas-does-not-add-throughput) | DI-08 |
+| [FS-29](failure-scenarios.md#fs-29-a-retried-request-is-normalized-twice) | DI-04, DI-05 |
 
 ### Requirements → tests
 
@@ -410,8 +422,8 @@ flowchart LR
 | [NFR-01](requirements.md#5-non-functional-requirements)–NFR-04 performance | PF-01, PF-02, PF-03, E2E-01 |
 | [NFR-05](requirements.md#5-non-functional-requirements)–NFR-08 correctness bias | UT-22, IT-01, E2E-02, E2E-11 |
 | [NFR-09](requirements.md#5-non-functional-requirements)–NFR-10 portability, audit | E2E suite on kind + minikube; IT-04, IT-05 |
-| [D-01](requirements.md#7-data-loss-protection-assumptions)–D-07 data protection | DI-01…DI-10 |
-| [FR-28](requirements.md#review-driven-requirements-v011)–FR-35 review-driven | UT-23, UT-24, UT-25, UT-26, IT-13, IT-14, IT-15, DI-08 |
-| [FR-36](requirements.md#work-store-requirements-v012)–FR-39 work-store signal | IT-16, E2E-07 |
-| [WR-01](requirements.md#work-store-requirements-v012)–WR-07 workload contract | DI-08, DI-09, DI-10, DI-02, DI-05 |
+| [D-01](requirements.md#7-durability-boundary-and-workload-responsibilities)–D-07 durability boundary | DI-01…DI-09 |
+| [FR-28](requirements.md#review-driven-requirements-v011)–FR-35 review-driven | UT-23, UT-24, UT-25, UT-26, IT-13, IT-14, IT-15 |
+| [FR-36](requirements.md#workload-signal-requirements-v02)–FR-39 workload signal | UT-12, IT-16, E2E-07 |
+| [WR-01](requirements.md#workload-signal-requirements-v02)–WR-07 workload contract | DI-02, DI-04, DI-05, DI-08, DI-09 |
 | [§10.1 guarantees](requirements.md#101-what-the-poc-guarantees) | 1 → UT-08/E2E-02 · 2 → UT-12/E2E-07 · 3 → UT-11/E2E-06 · 4 → UT-25/E2E-03 · 5 → IT-07/IT-15/E2E-08 · 6 → IT-11/DI-02 · 7 → IT-04/IT-05 · 8 → UT-22 · 9 → IT-06/IT-13 |

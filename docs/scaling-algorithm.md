@@ -1,6 +1,6 @@
 # KubeScaleSense — Scaling Algorithm
 
-> Status: **Design (pre-implementation)** · Version: 0.1
+> Status: **Design (pre-implementation)** · Version: 0.2
 > Canonical source for: decision outcomes and reason codes, desired-replica computation, guard ordering,
 > scale-up/scale-down logic, cooldown and hysteresis, and insufficient-resource behaviour.
 
@@ -21,8 +21,8 @@ feasibility inputs it consumes are produced by [resource-calculation](resource-c
 | `R_cur` | `Deployment.spec.replicas` | Current replica count |
 | `R_ready` | `Deployment.status.readyReplicas` | Ready replicas (denominator for utilization) |
 | `R_min`, `R_max` | `target.minReplicas`, `target.maxReplicas` | Hard clamp |
-| `B` | NiFi backlog, smoothed | Items waiting to be processed |
-| `IPR` | `workload.itemsPerReplica` | Backlog items one replica is expected to hold |
+| `B` | Workload pressure, smoothed | Outstanding work: items queued plus in flight, as reported by the configured signal source ([FR-36](requirements.md#workload-signal-requirements-v02)) |
+| `IPR` | `workload.itemsPerReplica` | Outstanding items one replica is expected to hold |
 | `U_cpu` | metrics.k8s.io, % of **request** | Mean CPU utilization over Ready pods |
 | `U_target` | `workload.targetCPUUtilizationPercent` | Utilization target |
 | `F` | [resource-calculation § 5](resource-calculation.md#5-step-4--fit-capacity) | Fit capacity: additional target pods placeable now |
@@ -86,15 +86,22 @@ desiredBacklog = ceil(B / IPR)
 ```
 
 The leading indicator ([ADR-02](architecture.md#adr-02-how-should-the-desired-replica-count-be-calculated)).
-Backlog reacts the instant files arrive, whereas CPU only reacts once pods are already saturated. `IPR`
-answers "how many queued items is one replica allowed to be responsible for?" and is derived empirically in
-the Phase 2 load tests, not guessed: run a fixed replica count, find the backlog level at which per-item
-latency reaches the SLO, and divide.
+Pressure reacts the instant work arrives, whereas CPU only reacts once pods are already saturated. `IPR`
+answers "how many outstanding items is one replica allowed to be responsible for?" and is derived empirically
+in the Phase 2 load tests, not guessed: run a fixed replica count, find the pressure level at which
+per-request latency reaches the SLO, and divide.
 
-`B` is the smoothed backlog ([§8.4](#84-signal-smoothing)). If the backlog source is unavailable,
+`B` is the smoothed pressure value ([§8.4](#84-signal-smoothing)). If the signal source is unavailable,
 `desiredBacklog` is *not* treated as zero — the guard in [§5](#5-step-3--stability-gates) rejects the whole
 reconcile with `HoldStaleMetrics` instead. Treating "unknown" as "empty" is how autoscalers scale busy
 systems to the floor during a monitoring outage.
+
+**Where `B` comes from is deliberately not this document's concern.** The engine consumes a count of
+outstanding work through a replaceable source interface — `synthetic`, `http`, or `none`
+([ADR-22](architecture.md#adr-22-where-does-the-workload-pressure-signal-come-from)) — and every rule below
+holds identically whichever is configured. That independence is the reason the v0.2 architecture
+simplification changed nothing in this file's arithmetic: swapping a database query for an HTTP metrics
+scrape alters where the number is read, not what it means.
 
 ### 3.2 Utilization-derived target
 
@@ -110,8 +117,8 @@ unexpectedly expensive (very large or complex files). Two deliberate choices:
   system speak the same unit.
 - **Averaged over pods that are Ready *and* warm.** Including starting pods (near-zero usage) would drag the
   average down exactly when a scale-up is in progress, suppressing the next one — a classic self-defeating
-  feedback path. Readiness alone is not enough: a pod that has passed its probe but has not yet claimed work
-  also reports near-zero CPU, so pods Ready for less than `workload.podWarmupPeriod` (60 s) are excluded too
+  feedback path. Readiness alone is not enough: a pod that has passed its probe but has not yet been sent a
+  request also reports near-zero CPU, so pods Ready for less than `workload.podWarmupPeriod` (60 s) are excluded too
   ([DR-05](design-review.md#dr-05-new-pod-warmup-dilutes-the-utilization-average); upstream HPA carries two
   dedicated knobs for the same effect). If no pod is both Ready and warm, the signal is reported
   **unavailable** rather than fabricated, and the engine decides what that means.
@@ -337,7 +344,7 @@ target = max(desiredClamped, R_cur − S_down, R_min)     // S_down = 1
 Before the write, the controller refreshes `controller.kubernetes.io/pod-deletion-cost` on the target's pods
 from their reported in-flight item counts (lowest cost = removed first), so the ReplicaSet controller drops the
 idlest pod ([FR-21](requirements.md#4-functional-requirements),
-[D-06](requirements.md#7-data-loss-protection-assumptions)). The controller **never deletes pods itself** —
+[D-06](requirements.md#7-durability-boundary-and-workload-responsibilities)). The controller **never deletes pods itself** —
 going through the ReplicaSet controller is what preserves `preStop` drain, `terminationGracePeriodSeconds`,
 and the `PodDisruptionBudget` ([ADR-15](architecture.md#adr-15-how-do-we-protect-data-processing-when-a-worker-pod-crashes)).
 
@@ -378,8 +385,8 @@ of `(timestamp, desiredRaw)` samples held by the controller
 
 ### 8.4 Signal smoothing
 
-Optional EWMA on the raw backlog: `B_t = α·raw_t + (1−α)·B_{t−1}` with `α = 0.4`. Damps single-sample
-artefacts (a NiFi batch commit, a scrape hiccup) without materially delaying a real spike: a step change
+Optional EWMA on the raw pressure value: `B_t = α·raw_t + (1−α)·B_{t−1}` with `α = 0.4`. Damps single-sample
+artefacts (a NiFi batch arriving at once, a scrape hiccup) without materially delaying a real spike: a step change
 reaches ~87 % of its true value within four samples (≈60 s). Both raw and smoothed values are exported
 (`kss_backlog_items`, `kss_backlog_items_smoothed`) so the effect of smoothing is auditable. Set
 `backlogSmoothing.mode: none` to disable, which the unit tests do for determinism.
@@ -620,13 +627,20 @@ One replica per 300 s: 6 → 5 → 4 → 3 → 2, ~20 minutes to converge
 ### Example F — Stale metrics during a spike
 
 ```text
-NiFi API unreachable for 75s > metricsStaleAfter (60s)
+workload-signal source unreachable for 75s > metricsStaleAfter (60s)
 → HoldStaleMetrics; no write in either direction
 ```
 
 Replicas stay where they are, `MetricsUnavailable` is emitted, and `/readyz` reports the degraded source. The
-controller does **not** interpret "no backlog data" as "no backlog"
-([ADR-14](architecture.md#adr-14-what-happens-if-kubernetes-api-calls-fail)).
+controller does **not** interpret "no pressure data" as "no pressure"
+([ADR-14](architecture.md#adr-14-what-happens-if-kubernetes-api-calls-fail),
+[FR-38](requirements.md#workload-signal-requirements-v02)).
+
+Note that when the source is the Normalizer's own `/metrics`, this example and a total Normalizer outage are
+the same observation — the signal and the workload share a failure domain, which
+[FS-15](failure-scenarios.md#fs-15-metrics-source-unavailable) records as a known consequence of the v0.2
+simplification. Freezing is still the right response; diagnosing *why* requires the pod-health signals rather
+than the pressure metric.
 
 ---
 
@@ -634,8 +648,9 @@ controller does **not** interpret "no backlog data" as "no backlog"
 
 | Symptom | Likely cause | Adjustment |
 | --- | --- | --- |
-| Backlog drains too slowly at steady state | `IPR` too high | Lower `itemsPerReplica` (measure per Phase 2 load test) |
-| Replicas grow while CPU stays low | Items are I/O-bound; backlog target dominates | Raise `itemsPerReplica`; consider concurrency inside the pod instead of more pods |
+| Pressure drains too slowly at steady state | `IPR` too high | Lower `itemsPerReplica` (measure per Phase 2 load test) |
+| Replicas grow while CPU stays low | Items are I/O-bound; the pressure target dominates | Raise `itemsPerReplica`; consider concurrency inside the pod instead of more pods |
+| Replicas grow but throughput does not | Not a tuning problem: the caller's concurrency, not the replica count, is the bound | Raise NiFi's `InvokeHTTP` concurrent tasks above `maxReplicas` ([FS-28](failure-scenarios.md#fs-28-adding-replicas-does-not-add-throughput)) |
 | Frequent `ScaleUpPartial` | Cluster is chronically near capacity | Add nodes, or lower `maxReplicas` to make the ceiling explicit and stop the noise |
 | Frequent `HoldCooldown` on scale-up during spikes | `C_up` too long relative to spike shape, or `S_up` too small | Raise `maxScaleUpStep` before lowering `scaleUpCooldown` |
 | Replica count sawtooths | Deadband/window too weak for a noisy signal | Enable/raise EWMA (`alpha` down), raise `scaleDownStabilizationWindow` |

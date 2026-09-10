@@ -1,6 +1,6 @@
 # KubeScaleSense — Failure Scenarios
 
-> Status: **Design (pre-implementation)** · Version: 0.1
+> Status: **Design (pre-implementation)** · Version: 0.2
 > Canonical source for: failure modes (`FS-xx`), the controller's specified response to each, and the
 > data-loss analysis.
 
@@ -50,10 +50,10 @@ Two rules govern every response below, and most of the table is a consequence of
 | [FS-09](#fs-09-kubernetes-api-failure) | API errors, conflicts, throttling | S2 | Freeze, bounded retry, `409` → re-decide | IT-02, IT-03 |
 | [FS-10](#fs-10-namespace-resourcequota-blocks-pod-creation) | Quota rejects pod creation | S2 | Watchdog on unmaterialised replicas | IT-08 |
 | [FS-11](#fs-11-node-memory-pressure-evicts-running-workers) | Node pressure evicts healthy pods | S1 | Prevented by request-based math + reserves | DI-06 |
-| [FS-12](#fs-12-worker-pod-crashes-mid-item) | Pod OOM/panic while processing | S1 | Out of scope for the controller; lease expiry reclaims the item | DI-01, DI-09 |
+| [FS-12](#fs-12-normalizer-pod-crashes-mid-request) | Pod OOM/panic while serving a request | S1 | Out of scope for the controller; NiFi retries the request | DI-01, DI-09 |
 | [FS-13](#fs-13-node-failure-or-drain-removes-workers) | Node lost or drained | S2 | Candidate set shrinks; re-scale if feasible | E2E-05 |
-| [FS-14](#fs-14-scale-down-terminates-a-busy-pod) | Scale-down hits a working pod | S1 | Deletion cost + graceful drain | DI-02 |
-| [FS-15](#fs-15-metrics-source-unavailable) | Work store or metrics-server unreachable | S3 | Degrade or `HoldStaleMetrics` | IT-10, E2E-07 |
+| [FS-14](#fs-14-scale-down-terminates-a-busy-pod) | Scale-down hits a working pod | S1 | Deletion cost + graceful shutdown | DI-02 |
+| [FS-15](#fs-15-metrics-source-unavailable) | Signal source or metrics-server unreachable | S3 | Degrade or `HoldStaleMetrics` | IT-10, E2E-07 |
 | [FS-16](#fs-16-competing-controller-on-the-same-target) | HPA also scaling the target | S2 | `HoldScalingConflict`, refuse to act | IT-06 |
 | [FS-17](#fs-17-controller-crash-restart-or-leadership-change) | Controller dies or loses lease | S3 | Cold start, cooled down, re-derive | IT-09, E2E-11 |
 | [FS-18](#fs-18-replica-oscillation) | Sawtooth demand near a threshold | S4 | Deadband + window + cooldowns | UT-10, E2E-06 |
@@ -63,16 +63,18 @@ Two rules govern every response below, and most of the table is a consequence of
 | [FS-22](#fs-22-external-actor-changes-the-replica-count) | GitOps/operator/human writes `replicas` | S2 | Adopt baseline; refuse after repeated drift | IT-13 |
 | [FS-23](#fs-23-scale-up-requested-during-a-rollout) | Scale-up during a rollout; surge exceeds the estimate | S2 | `HoldRolloutInProgress` | IT-14 |
 | [FS-24](#fs-24-scheduled-but-unhealthy-pods) | Pods schedule then fail to become Ready | S2 | `HoldUnhealthyPods`, no auto-remediation | IT-15 |
-| [FS-25](#fs-25-work-store-does-not-provide-the-assumed-claim-semantics) | Work store cannot claim atomically | **S1** | **Resolved by design change**: database-enforced claiming | DI-08 |
+| [FS-25](#fs-25-withdrawn-shared-work-store-claim-semantics) | *Withdrawn* — shared work store cannot claim atomically | — | No work store exists; retained as history | — |
 | [FS-26](#fs-26-leadership-handoff-races-with-an-in-flight-write) | Old and new leader both write | S4 | Precondition rejects the loser; silent baseline adoption | IT-09 |
 | [FS-27](#fs-27-stabilization-window-gap-after-an-outage) | Window nearly empty after an outage | S2 | Coverage requirement blocks scale-down | UT-24 |
-| [FS-28](#fs-28-work-store-unavailable-or-saturated) | Work store down or throttling claims | S2 | Freeze; distinguish "growing" from "undrainable" | IT-16, DI-10 |
-| [FS-29](#fs-29-lease-expires-while-the-worker-is-still-alive) | Lease expiry during slow processing | S4 | Concurrent reprocessing; one output wins by constraint | DI-09 |
+| [FS-28](#fs-28-adding-replicas-does-not-add-throughput) | Client concurrency, not replicas, bounds throughput | **S3** | Scaling is correct but ineffective; diagnosable, not fixable by the controller | DI-08 |
+| [FS-29](#fs-29-a-retried-request-is-normalized-twice) | Timeout causes a duplicate normalization | S4 | Harmless: normalization is a pure function | DI-04 |
 
-Scenarios FS-22 through FS-27 were added by the [design review](design-review.md); FS-22, FS-24, and FS-25
-were genuine omissions rather than refinements. FS-28 and FS-29 are the two failure modes **introduced** by
-choosing a database work store — recorded deliberately, because a design change that closes one scenario and
-silently opens two others has not been closed honestly.
+Scenarios FS-22 through FS-27 were added by the [design review](design-review.md); FS-22 and FS-24 were
+genuine omissions rather than refinements. FS-28 and FS-29 are the two failure modes **introduced** by the
+v0.2 simplification ([ADR-21](architecture.md#adr-21-how-does-work-reach-the-normalizer-pods)), replacing the
+two introduced by the work store it withdrew. Recording them is deliberate: a simplification that closes two
+scenarios and silently opens two others has not been made honestly. FS-28 is the more important of the pair,
+because it is the one that can make the *demonstration itself* misleading.
 
 ---
 
@@ -84,7 +86,7 @@ silently opens two others has not been closed honestly.
 **Detection.** `desiredRaw > maxReplicas` while `currentReplicas == maxReplicas`.
 **Behaviour.** `HoldAtMaxReplicas`; `kss_desired_replicas_uncapped` shows the true demand so the ceiling's cost
 is measurable.
-**Data-loss risk.** None — the backlog waits durably in NiFi ([D-01](requirements.md#7-data-loss-protection-assumptions)).
+**Data-loss risk.** None — the backlog waits durably in NiFi ([D-01](requirements.md#7-durability-boundary-and-workload-responsibilities)).
 **Mitigation.** Deliberately distinct from `HoldInsufficientResources`: this one is fixed by raising a policy
 limit, not by adding hardware. Conflating them would send an operator to the wrong remedy.
 **Test.** E2E-10.
@@ -183,7 +185,7 @@ and makes metrics unable to distinguish one persistent problem from many new one
 
 ### FS-08: Stale resource or metric information
 
-**Trigger.** Watch desync, metrics-server lag, NiFi slowness, or a controller resume after suspension.
+**Trigger.** Watch desync, metrics-server lag, a slow signal source, or a controller resume after suspension.
 **Detection.** Every signal carries `sampledAt`; `kss_metric_sample_age_seconds` exceeds `metricsStaleAfter`.
 Nodes with stale `Ready` heartbeats are excluded from the candidate set (C2). Freshness is evaluated against
 **both** the local receive age and the source-reported sample age: receive age alone would let a *frozen*
@@ -248,30 +250,34 @@ usage-based autoscaler invites by packing pods onto nodes whose committed reques
   incompressible: CPU overcommit merely throttles, memory overcommit kills.
 - Workload-side: processing pods set memory **limits** close to requests (Guaranteed/Burstable-with-tight-limits)
   so one pod cannot balloon and endanger its neighbours; a `PodDisruptionBudget` protects the pool
-  ([D-07](requirements.md#7-data-loss-protection-assumptions)).
+  ([D-07](requirements.md#7-durability-boundary-and-workload-responsibilities)).
 - If a node does become pressured, the kubelet's `memory-pressure` taint removes it from our candidate set
   automatically ([resource-calculation § 2.1](resource-calculation.md#21-taints-and-tolerations-c4)).
 
 **Residual risk.** Under-requesting neighbours can still pressure a node
 ([resource-calculation § 4.1](resource-calculation.md#41-known-over-estimation-under-requesting-neighbours)).
-Residual loss is then absorbed by [D-04](requirements.md#7-data-loss-protection-assumptions) — an evicted
-pod's claims expire and are reclaimed by the next claim query.
+Residual loss is then absorbed by [D-02](requirements.md#7-durability-boundary-and-workload-responsibilities) —
+the evicted pod's in-flight requests fail and NiFi re-sends them.
 **Test.** DI-06.
 
-### FS-12: Worker pod crashes mid-item
+### FS-12: Normalizer pod crashes mid-request
 
-**Trigger.** OOM kill, panic, SIGKILL, node loss.
+**Trigger.** OOM kill, panic, SIGKILL, node loss, while the pod is serving a normalization request.
 **Behaviour.** Not a controller concern — no autoscaler can prevent it
-([ADR-15](architecture.md#adr-15-how-do-we-protect-data-processing-when-a-worker-pod-crashes)). Correctness
-comes from the workload contract, now expressed in database terms
-([ADR-20](architecture.md#adr-20-how-is-in-flight-work-protected-without-a-shared-filesystem)): the item's row
-is untouched because its transaction never committed, its lease expires, and the next claim query reclaims it.
-Because output and acknowledgement commit **together**, a crash can leave neither a partial output nor an
-acknowledged-but-unwritten item — the two states that made the filesystem design delicate are now
-unrepresentable.
-**Data-loss risk.** S1 without D-01…D-04; none with them. Duplicate processing is possible and harmless by
-[D-03](requirements.md#7-data-loss-protection-assumptions), which is enforced by a `PRIMARY KEY`.
-**Test.** DI-01, DI-04, DI-05, DI-09.
+([ADR-15](architecture.md#adr-15-how-do-we-protect-data-processing-when-a-worker-pod-crashes)). The in-flight
+request fails: the connection drops or times out, NiFi routes the FlowFile to its retry relationship, and it is
+re-sent to a surviving pod ([D-02](requirements.md#7-durability-boundary-and-workload-responsibilities)). The
+pod held nothing durable, so there is nothing to recover — which is the entire point of keeping the scaled
+workload stateless.
+**Data-loss risk.** S1 **if NiFi does not retry**; none if it does. This is the sharpest illustration of the
+responsibility boundary: the controller cannot make this case safe and does not claim to
+([requirements § 7](requirements.md#7-durability-boundary-and-workload-responsibilities)). The dependency is
+recorded as [A-12](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful).
+**What changed, and what it cost.** Under the withdrawn work-store design an item could not be lost even if
+every pod died, because it stayed durably in the store. That protection is gone, traded for the removal of an
+entire component ([ADR-20](architecture.md#adr-20-how-is-in-flight-work-protected-without-a-shared-filesystem)).
+The trade is acceptable **only** because durability is explicitly not this project's claim.
+**Test.** DI-01, DI-04, DI-09.
 
 ### FS-13: Node failure or drain removes workers
 
@@ -280,22 +286,23 @@ unrepresentable.
 **Behaviour.** The ReplicaSet controller recreates the lost pods; KubeScaleSense recomputes `F` against the
 smaller cluster and either replaces capacity elsewhere or reports `HoldInsufficientResources`. Because the
 drained node is excluded, the controller does not attempt to place pods on it.
-**Data-loss risk.** In-flight items on lost pods are reclaimed on lease expiry (D-04).
+**Data-loss risk.** Requests in flight on the lost pods fail and are retried by NiFi (D-02, D-04).
 **Mitigation.** A drain and a capacity shortfall converge on the same well-tested path, which is why no
 special-case logic exists for it.
 **Test.** E2E-05.
 
 ### FS-14: Scale-down terminates a busy pod
 
-**Trigger.** Demand falls; a replica is removed while processing an item.
+**Trigger.** Demand falls; a replica is removed while it is serving requests.
 **Behaviour.** Before writing the lower replica count the controller refreshes
 `controller.kubernetes.io/pod-deletion-cost` from reported in-flight counts, so the ReplicaSet controller
 prefers the idlest pod ([scaling-algorithm § 7](scaling-algorithm.md#7-step-5--scale-down-logic)). Termination
-is graceful: `preStop` stops claiming new items and waits for the current one, within a
-`terminationGracePeriodSeconds` larger than the maximum item processing time
-([A-07](requirements.md#6-workload-and-environment-assumptions), D-05).
-**Data-loss risk.** S1 if the pod were killed abruptly; none with graceful drain, and even a hard kill only
-delays the item by one lease period (D-04).
+is graceful: on `SIGTERM` the pod fails its readiness probe so `normalizer-service` stops routing new requests
+to it, then drains the requests already in flight within a `terminationGracePeriodSeconds` larger than the
+maximum request processing time ([A-07](requirements.md#6-workload-and-environment-assumptions),
+[WR-06](requirements.md#workload-signal-requirements-v02), D-05).
+**Data-loss risk.** S1 if the pod were killed abruptly; none with graceful shutdown, and even a hard kill only
+costs the in-flight requests, which NiFi retries (D-02).
 **Mitigation, stated precisely after review.** Two claims were too strong:
 
 - **Deletion cost is a preference within the Ready cohort, not a selector.** The ReplicaSet controller ranks
@@ -308,24 +315,31 @@ delays the item by one lease period (D-04).
   ([DR-10](design-review.md#dr-10-poddisruptionbudget-does-not-protect-against-scale-down)).
 
 So the actual guarantees for in-flight work during scale-down are, in increasing order of reliability:
-`maxScaleDownStep: 1`, graceful drain via `preStop`, and lease expiry as the backstop that holds even on a
-hard kill.
+`maxScaleDownStep: 1`, graceful shutdown driven by readiness, and NiFi retry as the backstop that holds even
+on a hard kill.
 **Test.** DI-02.
 
 ### FS-15: Metrics source unavailable
 
-**Trigger.** Work store unreachable, refusing connections, or slow past `workStore.timeout`; or
-metrics-server missing.
+**Trigger.** The workload-signal source is unreachable, refusing connections, or slower than
+`workload.signal.timeout`; or metrics-server is missing.
 **Behaviour.**
 
 | Missing source | Response |
 | --- | --- |
-| Backlog (work store) | Required signal → `HoldStaleMetrics` once age > `metricsStaleAfter`; event `MetricsUnavailable`. A query timeout counts as unavailable, never as zero ([FR-38](requirements.md#work-store-requirements-v012)) |
-| Utilization (metrics-server) | Degrade to backlog-only (`desiredUtilization` omitted from the `max()`), emit `MetricsUnavailable`, continue scaling |
+| Pressure (workload-signal source) | Required signal → `HoldStaleMetrics` once age > `metricsStaleAfter`; event `MetricsUnavailable`. A scrape timeout counts as unavailable, **never as zero** ([FR-38](requirements.md#workload-signal-requirements-v02)) |
+| Utilization (metrics-server) | Degrade to pressure-only (`desiredUtilization` omitted from the `max()`), emit `MetricsUnavailable`, continue scaling |
 
-**Rationale for the asymmetry.** The backlog is the primary demand signal and has no substitute; utilization
-is a safety net whose absence merely reduces sensitivity to expensive items. Losing the net is a degradation;
+**Rationale for the asymmetry.** Pressure is the primary demand signal and has no substitute; utilization is a
+safety net whose absence merely reduces sensitivity to expensive items. Losing the net is a degradation;
 losing the primary signal means the controller is blind, and a blind autoscaler must not act.
+
+**A specific trap this design creates.** When the source is the Normalizer's own metrics endpoint, a *total*
+outage of the Normalizer makes the pressure signal unavailable at exactly the moment demand is highest. The
+signal and the workload share a failure domain. The response is still correct — freeze, never scale down — but
+it means an operator cannot rely on the pressure metric to diagnose a Normalizer outage; that is what
+`kss_workload_signal_source_up` and the unhealthy-pod guard ([FS-24](#fs-24-scheduled-but-unhealthy-pods)) are
+for.
 **Test.** IT-10, E2E-07.
 
 ### FS-16: Competing controller on the same target
@@ -371,7 +385,7 @@ correctness pressure on the drain path.
 ### FS-19: Misconfiguration
 
 **Trigger.** `minReplicas > maxReplicas`, `interval` too small, target missing, pod template without resource
-requests, unreachable NiFi URL, `itemsPerReplica: 0`.
+requests, an `http` signal source with an empty or malformed endpoint, `itemsPerReplica: 0`.
 **Behaviour.** Startup validation fails fast with a non-zero exit and a specific message (CR-2). Missing pod
 requests are singled out: without them fit capacity is meaningless
 ([resource-calculation § 3](resource-calculation.md#3-step-2--effective-pod-request-of-the-target-workload)),
@@ -463,70 +477,80 @@ expensive and say so loudly.
 **Data-loss risk.** None directly. S2 because processing has effectively stopped while capacity is consumed.
 **Test.** IT-15.
 
-### FS-25: Work store does not provide the assumed claim semantics
+### FS-25: Withdrawn, shared work-store claim semantics
 
-> **Resolved by design change, not mitigation.** The atomic-rename protocol was abandoned in favour of a
-> PostgreSQL work-item table with `FOR UPDATE SKIP LOCKED`
-> ([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)). This scenario is
-> retained because it records *why* — and because the class of failure it describes reappears the moment
-> anyone reintroduces a shared filesystem or an object store. DI-08 exists to keep the primitive verified.
+> **Withdrawn in v0.2. Retained as history, not as an active scenario.**
+> This scenario described a shared work store that could not support atomic, mutually-exclusive item claiming.
+> The v0.2 architecture has **no work store of any kind**
+> ([ADR-21](architecture.md#adr-21-how-does-work-reach-the-normalizer-pods)), so the failure it describes has
+> no mechanism to occur.
 
-**Trigger.** The shared work store cannot support atomic, mutually-exclusive item claiming — the primitive
-[D-02](requirements.md#7-data-loss-protection-assumptions) and
-[D-03](requirements.md#7-data-loss-protection-assumptions) depend on.
-**Two concrete cases in the *original* POC design:**
+It is kept for one reason: **the class of failure it documents returns the moment anyone reintroduces shared
+state between the pods.** The two concrete cases were:
 
 | Store | Failure |
 | --- | --- |
-| RWX PVC on kind | kind ships `local-path-provisioner`, which provides only **node-local `ReadWriteOnce`** volumes. A "shared" PVC silently becomes a per-node directory: items written by NiFi are invisible to workers on other nodes and sit unprocessed. Indistinguishable from data loss during a demo, and directly at odds with the multi-node topology the fit-capacity demo requires |
-| MinIO / S3 | Object stores have **no atomic rename**; "rename" is copy-then-delete. Two pods can both claim the same item, so the claim protocol provides no mutual exclusion and correctness rests entirely on D-03 idempotency |
+| RWX PVC on kind | kind ships `local-path-provisioner`, which provides only **node-local `ReadWriteOnce`** volumes. A "shared" PVC silently becomes a per-node directory: items written by NiFi are invisible to pods on other nodes and sit unprocessed. Indistinguishable from data loss during a demo, and directly at odds with the multi-node topology the fit-capacity demo requires |
+| MinIO / S3 | Object stores have **no atomic rename**; "rename" is copy-then-delete. Two pods can both claim the same item, so the claim protocol provides no mutual exclusion and correctness rests entirely on idempotency |
 
-**Behaviour.** Outside the controller's control and undetectable by it — which is exactly why it is recorded
-as a scenario rather than left as a storage detail.
-**Resolution.** Neither option was taken. Both were rejected in favour of a primitive the *database* enforces:
-an NFS provisioner would have added a CSI driver and a server pod in exchange for a claim that is only
-probably correct under NFSv3 retransmits and client attribute caching, and object storage would have required
-rebuilding the claim on conditional `PUT` while leaving acknowledgement and output as a dual write. The chosen
-design makes exclusion a property of `SKIP LOCKED` and idempotency a property of a `PRIMARY KEY`
-([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline),
-[A-12](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)).
-**Test.** DI-08 verifies the primitive under concurrent cross-node claims rather than assuming it.
+**Why this history matters to a future reader.** The first instinct when someone proposes "let the pods share
+a volume" is that kind will handle it. It will appear to, and then quietly process a fraction of the data. If
+shared state ever returns to this design, this scenario becomes active again and needs a test that proves the
+primitive across nodes — not an assumption that it holds
+([DR-12](design-review.md#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment)).
 
-### FS-28: Work store unavailable or saturated
+### FS-28: Adding replicas does not add throughput
 
-**Trigger.** The PostgreSQL pod is restarting, its node is gone, connections are exhausted, or queries queue
-behind lock contention.
-**Detection (controller).** The backlog query fails or exceeds `workStore.timeout`; the signal is recorded
-**unavailable**, never zero ([FR-38](requirements.md#work-store-requirements-v012)).
-**Behaviour.** `HoldStaleMetrics` — freeze. The replica count is left exactly as it is: workers whose claims
-are still valid keep processing, and no scale-down removes capacity on the basis of a database outage.
-**Why this is the price of the design.** The work store is a **single point of failure** for the pipeline, and
-in the POC it runs as one instance on a node-local PVC ([A-14](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)).
-That is an accepted POC trade, not an oversight: an HA store would add a replicated database to a project
-whose subject is scheduling. The saturation case is subtler than the outage case — a store slow enough to
-throttle claiming makes the backlog grow for reasons that **more replicas cannot fix**, so the controller
-would scale up into a bottleneck it cannot see ([A-15](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)).
-**Mitigation.** Export claim latency and store connection saturation on the demo dashboard next to the
-backlog, so "the queue is growing" can be distinguished from "the queue cannot be drained". Bounded worker
-connection pools keep a scale-up from exhausting `max_connections` — the specific way this failure would
-otherwise be *caused* by scaling.
-**Data-loss risk.** None: committed rows are durable, and uncommitted work is reclaimed by lease expiry.
-**Test.** IT-16, DI-10.
+**Trigger.** NiFi dispatches fewer concurrent requests than there are Normalizer replicas — the default
+`InvokeHTTP` concurrent-task count is small — or the Normalizer has a hidden shared bottleneck (an external
+dependency, a global lock, a connection cap). The controller scales up correctly and nothing improves.
+**Detection.** The signature is distinctive and worth learning: `kss_current_replicas` rises, fit capacity is
+adequate, **no** pod is Pending or unhealthy, yet `kss_workload_processing_rate` is flat and the pressure
+signal keeps growing. Per-pod CPU utilization *falls* as replicas are added while the queue grows — the
+inverse of the healthy scale-up signature.
+**Behaviour (controller).** None, and this is correct: every decision the controller made was right. It saw
+pressure, confirmed feasibility, and scaled. The bottleneck is on the client side of a push interface, which
+the controller neither observes nor controls.
+**Why this is the price of the v0.2 simplification.** With work *pushed* over HTTP, throughput is
+`min(client concurrency, replica capacity)`. The withdrawn work-store design avoided this by making pods
+*pull*, which is exactly the argument
+[ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline) used to reject HTTP push.
+That argument was sound but disproportionate: the answer is to configure the client's concurrency above
+`maxReplicas` ([A-13](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)),
+not to introduce a database.
+**Why it is S3 and not S4.** It does not corrupt or lose anything, but it can make the **demonstration itself
+misleading**: a graph showing replicas rising while the backlog also rises looks exactly like a controller
+that is not working. Diagnosing this as a client-concurrency problem rather than a controller bug is the
+difference between trusting the project and abandoning it.
+**Mitigation.** NiFi's concurrent-task count is set above `maxReplicas` and asserted during demo setup;
+processing rate and per-pod utilization are plotted beside replica count so a flat throughput curve is
+visible immediately; and **DI-08 fails the build** if throughput does not track replica count
+([A-15](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)).
+**Data-loss risk.** None. Work waits in NiFi's queue, which is durable (D-01).
+**Test.** DI-08.
 
-### FS-29: Lease expires while the worker is still alive
+### FS-29: A retried request is normalized twice
 
-**Trigger.** An item takes longer than `leaseDuration` — a large item, a slow store, or CPU starvation on a
-crowded node.
-**Behaviour.** Another worker legitimately reclaims the item and processes it concurrently. Both may finish;
-only one output survives, because the insert is `ON CONFLICT (item_key) DO NOTHING` against a `PRIMARY KEY`,
-and the losing acknowledgement simply marks an already-`done` row.
-**Data-loss risk.** None. The cost is wasted CPU, which is bounded by `attempts` and visible as a
-reprocessing-rate metric.
-**Mitigation.** `leaseDuration` must exceed both the maximum per-item processing time and
-`terminationGracePeriodSeconds` ([§7](requirements.md#7-data-loss-protection-assumptions)). This is the one
-new tuning constraint the work-store design introduces, and getting it wrong degrades throughput silently —
-hence the explicit metric rather than a comment in a manifest.
-**Test.** DI-05 (negative half), DI-09.
+**Trigger.** A request succeeds on the Normalizer but its response is lost, or it exceeds NiFi's response
+timeout while still being processed. NiFi cannot distinguish "failed" from "succeeded but unacknowledged", so
+it retries.
+**Behaviour.** The record is normalized a second time, possibly on a different pod. Both attempts produce
+**identical output**, because normalization is a pure function of its input
+([D-03](requirements.md#7-durability-boundary-and-workload-responsibilities),
+[WR-03](requirements.md#workload-signal-requirements-v02)).
+**Data-loss risk.** None. The cost is wasted CPU, visible as a gap between
+`kss_workload_request_rate` and the pipeline's record arrival rate.
+**Mitigation.** This is at-least-once delivery, accepted deliberately rather than engineered away: exactly-once
+would require distributed transactions across SFTP, NiFi, and the output sink
+([ADR-15](architecture.md#adr-15-how-do-we-protect-data-processing-when-a-worker-pod-crashes)). The
+requirement it places on the workload is precise and testable — **normalization must be a pure function** —
+and it is the assumption that makes the entire retry-based durability model safe. If the Normalizer ever gains
+a side effect (an email, a counter, a non-idempotent API call), this scenario becomes S1 immediately.
+**Note.** NiFi's response timeout must exceed the maximum normalization time, or *every* slow request is
+retried and the pool does duplicate work under exactly the load where it can least afford to. This is the one
+tuning constraint the v0.2 design introduces — the analogue of the lease-duration constraint the work-store
+design introduced, and cheaper because getting it wrong wastes CPU rather than corrupting a claim.
+**Test.** DI-04.
 
 ### FS-26: Leadership handoff races with an in-flight write
 
@@ -558,16 +582,21 @@ This is the same error as reading "no backlog data" as "no backlog", re-entering
 
 ### 4.1 Where loss could occur, and what prevents it
 
+**Read this section as a boundary statement, not as a controller feature.** KubeScaleSense provides no
+durability ([requirements § 7](requirements.md#7-durability-boundary-and-workload-responsibilities)). What
+follows is the analysis of where the *pipeline* can lose data, so that the claim "a scaling decision cannot
+lose data" can be stated precisely and its dependencies named.
+
 ```mermaid
 flowchart LR
     S["SFTP<br/>source of truth<br/>until fetched"] -->|"1"| N["NiFi repositories<br/>on PersistentVolume"]
-    N -->|"2 PutDatabaseRecord"| Q["work_items<br/>status = pending"]
-    Q -->|"3 claim: SKIP LOCKED + lease"| I["status = processing<br/>claimed_by = pod-x"]
-    I -->|"4 normalize"| TX["one transaction:<br/>INSERT output_records<br/>+ UPDATE status = done"]
-    TX -->|"5 COMMIT"| DONE["Item complete"]
+    N -->|"2 ConvertRecord"| F["FlowFile queue<br/>durable, in NiFi"]
+    F -->|"3 InvokeHTTP"| I["In flight<br/>on a Normalizer pod"]
+    I -->|"4 normalize"| R["2xx response"]
+    R -->|"5 commit"| DONE["FlowFile removed<br/>from the queue"]
 
-    L["Lease expiry,<br/>reclaimed by the next claim"] -.-> Q
-    I -.-> L
+    I -.->|"failure / timeout"| RETRY["NiFi retry relationship"]
+    RETRY -.-> F
 
     classDef risk fill:#da3633,color:#fff,stroke:#a02622
     class I risk
@@ -577,34 +606,40 @@ flowchart LR
 | --- | --- | --- | --- |
 | 1 | Fetch interrupted | File remains on SFTP; re-listed | NiFi commits before deleting the remote file (D-01) |
 | 2 | NiFi pod dies | FlowFile survives in the repository on its PV | D-01 |
-| 3 | Pod dies after claim | Lease expires; the next claim query reclaims the row | D-02, D-04 |
-| 4 | Pod dies mid-processing | Partial work discarded; item reclaimed after lease expiry | D-04 |
-| 5 | Pod dies mid-commit | The transaction rolls back — **no** output row, **no** acknowledgement, so the item is simply reclaimed | D-03 (transactional ack) |
-| — | Pod dies after commit | Nothing to do: output and acknowledgement are already both durable | D-03 |
-| — | Item reprocessed after a lease expiry | Second output insert is a no-op | D-03 (`ON CONFLICT DO NOTHING` on a `PRIMARY KEY`) |
+| 3 | Request refused or the pod is gone | Connection error → retry relationship → re-sent to another pod | D-02 |
+| 4 | Pod dies mid-normalization | In-flight work discarded; the request fails and is re-sent | D-02, D-04 |
+| 5 | Response lost after successful normalization | NiFi cannot tell success from failure, so it re-sends; the record is normalized twice with identical output | D-03 ([FS-29](#fs-29-a-retried-request-is-normalized-twice)) |
+| — | NiFi exhausts its retry limit | **The record is dropped or routed to a failure queue.** This is the pipeline's real data-loss boundary and it belongs to NiFi's flow configuration | Flow design: a failure relationship that parks records rather than discarding them |
 
-**The single highest-risk state is step 3–4** (an item claimed by a pod that then dies), and its entire
-mitigation is lease expiry plus idempotency. Note what the work-store design removed: the old step 5 — "pod
-dies after writing output but before acknowledging" — is no longer a state the system can occupy, because
-those two writes are one commit ([ADR-20](architecture.md#adr-20-how-is-in-flight-work-protected-without-a-shared-filesystem)).
-Everything else in the pipeline is durable by construction.
+**The single highest-risk state is step 3–4** — a request in flight on a pod that dies — and its entire
+mitigation is NiFi retry plus idempotent normalization. Note precisely what the simplification changed here:
+under the withdrawn work-store design, steps 3–5 were protected by a durable row, a lease, and a transaction,
+so the pipeline could survive the loss of *every* pod. Now they are protected by a retry, so the pipeline
+survives the loss of *any* pod but depends on NiFi being alive and configured to retry. That dependency is
+[A-12](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful), and the last row
+of the table is the honest statement of where data can still be lost.
 
 ### 4.2 What the controller does and does not contribute
 
 | Concern | Owner |
 | --- | --- |
-| Item durability, claim semantics, idempotency, lease recovery | **Workload** (D-01…D-04) |
-| Graceful drain on termination | **Workload** `preStop` + grace period (D-05); controller supplies deletion-cost hints (D-06) |
-| Avoiding *involuntary* eviction of healthy workers | **Controller** — request-based fit math and reserves (FS-11) |
+| Input durability, retry, back-pressure, and the failure relationship | **NiFi / workload design** (D-01, D-02) |
+| Idempotent normalization, so a retry is harmless | **Workload** (D-03, [WR-03](requirements.md#workload-signal-requirements-v02)) |
+| Graceful shutdown on termination | **Workload** — readiness-driven drain within the grace period (D-05); controller supplies deletion-cost hints (D-06) |
+| Avoiding *involuntary* eviction of healthy pods | **Controller** — request-based fit math and reserves (FS-11) |
 | Not deleting pods directly | **Controller** — no pod `delete` permission at all |
 | Not scaling down on stale or missing data | **Controller** — FS-08, FS-15 |
 | Not stacking unschedulable requests | **Controller** — `HoldPendingPods`, FS-06 |
 
-The claim this design supports, stated precisely:
+The claim this design supports, stated precisely and no more strongly:
 
 > Given the workload properties D-01…D-07, **no scaling decision — right or wrong — can lose data.** A wrong
-> decision costs throughput, or causes an item to be processed later or twice, which
-> [D-03](requirements.md#7-data-loss-protection-assumptions) renders harmless.
+> decision costs throughput, or causes a record to be normalized later or twice, which
+> [D-03](requirements.md#7-durability-boundary-and-workload-responsibilities) renders harmless.
+
+Note what that sentence does **not** say. It does not say the pipeline cannot lose data — it can, if NiFi
+exhausts its retries or its repositories are lost. It says that *scaling decisions* are not a route to data
+loss. That is the only durability-adjacent claim this project makes, and it is deliberately narrow.
 
 ### 4.3 What would invalidate the claim
 
@@ -612,15 +647,14 @@ Stating the invalidating conditions is part of the design; each is a review item
 
 | If this changes | Consequence |
 | --- | --- |
-| The claim stops being database-enforced (e.g. a move back to a filesystem or object store) | **D-02 broken at the foundation** — two pods claim the same item concurrently, and the entire durability argument falls back onto D-03 idempotency ([FS-25](#fs-25-work-store-does-not-provide-the-assumed-claim-semantics)). Verify the primitive; never assume it |
-| Output and acknowledgement stop sharing one transaction | Partial outputs and acknowledged-but-unwritten items become representable again — the dual-write problem the work-store design exists to remove ([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)) |
-| `leaseDuration` drops below the maximum item processing time | Silent duplicate processing on every slow item ([FS-29](#fs-29-lease-expires-while-the-worker-is-still-alive)) |
+| **NiFi stops retrying failed requests**, or its retry limit is reached and records are discarded | **D-02 broken at the foundation.** This is now the single load-bearing dependency of the whole argument: without retry, every pod crash and every scale-down loses in-flight work, and the controller's decisions *do* become a route to data loss ([FS-12](#fs-12-normalizer-pod-crashes-mid-request)) |
+| Normalization gains a side effect — an email, a counter, an append, a non-idempotent API call | **D-03 broken.** Retry stops being harmless, so at-least-once delivery becomes duplicated real-world effects, and [FS-29](#fs-29-a-retried-request-is-normalized-twice) escalates from S4 to S1 |
+| NiFi's response timeout drops below the maximum normalization time | Every slow request is retried while still being processed: duplicate work under peak load, exactly when the pool can least afford it ([FS-29](#fs-29-a-retried-request-is-normalized-twice)) |
 | NiFi repositories move to `emptyDir` | D-01 broken: NiFi pod loss loses buffered files |
-| Work is **pushed** to pods (HTTP/Site-to-Site) instead of claimed | D-02 broken: terminating a pod loses its in-flight payload; scale-down becomes lossy |
-| Output writes become non-idempotent (append, or an external side effect such as an email or a non-idempotent API call) | D-03 broken: reprocessing duplicates effects; at-least-once is no longer safe |
-| Claims are taken without a lease, or leases are never checked | D-04 broken: crashed-pod items stall until manual intervention |
-| Item processing time can exceed `terminationGracePeriodSeconds` | D-05 broken: A-07 violated; graceful drain truncated, relies on lease expiry |
-| Processing pods drop memory limits | FS-11 risk rises: one pod can pressure a node and evict peers |
+| The Normalizer becomes **stateful** — an in-memory queue that survives readiness, a local cache of unsent results, a per-pod file | D-04 broken: pod loss now destroys work that no retry will recover, and the "nothing durable inside the scaled workload" premise fails |
+| Shared state returns between the pods (RWX volume, object store, shared cache) | [FS-25](#fs-25-withdrawn-shared-work-store-claim-semantics) reactivates, and the claim-semantics problem it documents must be re-verified rather than assumed |
+| Request processing time can exceed `terminationGracePeriodSeconds` | D-05 broken: A-07 violated; graceful shutdown is truncated and drops in-flight requests, relying entirely on retry |
+| Normalizer pods drop memory limits | FS-11 risk rises: one pod can pressure a node and evict peers |
 
 ---
 
@@ -649,6 +683,7 @@ case under compound failure is a frozen replica count with loud telemetry, not a
 | Insufficient resources | `increase(kss_insufficient_resource_holds_total[15m]) > 0` | — | Chronic shortfall; check blocking dimension |
 | Pending remediation | `increase(kss_pending_pod_remediations_total[1h]) > 0` | — | Fit estimate was wrong: unmodelled predicate or quota (FS-05, FS-10) |
 | Unhealthy pods | `kss_unhealthy_target_pods > 0` | 5 m | Pods scheduled but not becoming Ready; scaling is blocked (FS-24) |
+| **Scaling without effect** | `kss_current_replicas` rising while `rate(kss_workload_processing_rate[10m]) ≈ 0` and no pod is Pending | 10 m | Throughput is bounded by client concurrency, not replicas — the controller is correct and ineffective (FS-28) |
 | External replica writes | `increase(kss_external_scale_changes_total[15m]) > 2` | — | Another actor is managing replicas (FS-22) |
 | Controller stalled | `time() − kss_last_reconcile_timestamp_seconds > 3×interval` | 1 m | Loop wedged or leadership lost |
 | Signals stale | `kss_metric_sample_age_seconds > metricsStaleAfter` | 2 m | Scaling is frozen (FS-08, FS-15) |
@@ -669,12 +704,13 @@ case under compound failure is a frozen replica count with loud telemetry, not a
 | [FR-20](requirements.md#4-functional-requirements) pending watchdog | FS-05, FS-06, FS-10 |
 | [FR-21](requirements.md#4-functional-requirements)/[FR-22](requirements.md#4-functional-requirements) drain safety | FS-14 |
 | [FR-27](requirements.md#4-functional-requirements) API failure | FS-09 |
-| [D-01…D-07](requirements.md#7-data-loss-protection-assumptions) | [§4](#4-data-loss-analysis), FS-11, FS-12, FS-14, FS-25 |
+| [D-01…D-07](requirements.md#7-durability-boundary-and-workload-responsibilities) | [§4](#4-data-loss-analysis), FS-11, FS-12, FS-14, FS-29 |
 | [NFR-05](requirements.md#5-non-functional-requirements) conservative bias | FS-04, FS-05, FS-08, [§5](#5-interacting-failures) |
 | [FR-29](requirements.md#review-driven-requirements-v011) settled replicas, covered window | FS-27 |
 | [FR-30](requirements.md#review-driven-requirements-v011) unhealthy-pod guard | FS-24 |
 | [FR-31](requirements.md#review-driven-requirements-v011) external change detection | FS-22, FS-26 |
 | [FR-32](requirements.md#review-driven-requirements-v011) rollout hold | FS-23 |
 | [FR-34](requirements.md#review-driven-requirements-v011) dual staleness check | FS-08 |
-| [FR-36](requirements.md#work-store-requirements-v012)–FR-38 work-store signal | FS-15, FS-28 |
-| [WR-01](requirements.md#work-store-requirements-v012)–WR-04 claim, ack, recovery | FS-12, FS-25, FS-29 |
+| [FR-36](requirements.md#workload-signal-requirements-v02)–FR-39 workload-signal source | FS-15 |
+| [WR-01](requirements.md#workload-signal-requirements-v02)–WR-05 stateless, idempotent, horizontally scalable | FS-12, FS-28, FS-29 |
+| [WR-06](requirements.md#workload-signal-requirements-v02) graceful shutdown | FS-14 |

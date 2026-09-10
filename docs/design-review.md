@@ -14,12 +14,41 @@ critical — one of them makes a headline claim in the current design *unreachab
 the demo pipeline's data-safety claim unimplementable on the proposed environment. All fixes have been folded
 into the design set; this document records the reasoning and the resulting limits.
 
+> **Read this document as history plus current status.** It reviews the v0.1 design set, and the findings are
+> preserved as written. Where a later architecture revision changed how a finding was closed, that is recorded
+> in a status update rather than by editing the original analysis — a review whose findings are silently
+> rewritten to match the current design is worthless as a record of why the design is what it is.
+
 > **Status update (v0.1.2).** All sixteen findings are closed. [DR-12](#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment)
 > was the last one requiring an architectural decision rather than a specification fix, and it is now resolved
 > by replacing the shared-filesystem work store with a PostgreSQL work-item table
 > ([ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)). The settled
 > architecture is [architecture § 11](architecture.md#11-phase-1-architecture-baseline); **no Phase 1 blockers
 > remain**.
+
+> **Status update (v0.2) — one finding closed a second time, differently.**
+> Fifteen of the sixteen findings are unaffected by the v0.2 architecture simplification, because they concern
+> the *decision engine*: guard ordering, hysteresis, staleness, external writers, rollouts, watchdogs,
+> arithmetic. None of that logic depends on where work is stored, which is the clearest evidence that the
+> review's substance was aimed at the right layer.
+>
+> The exception is **DR-12**. Its v0.1.2 closure — a PostgreSQL work-item table — has been **withdrawn**, and
+> the finding is now closed by removing the work store rather than replacing it: NiFi posts each record to
+> `normalizer-service` over HTTP, and the Normalizer pods hold nothing
+> ([ADR-21](architecture.md#adr-21-how-does-work-reach-the-normalizer-pods),
+> [ADR-22](architecture.md#adr-22-where-does-the-workload-pressure-signal-come-from)).
+>
+> **This does not invalidate DR-12; it vindicates it.** The finding's actual content was *"the data-safety
+> argument rests on an unimplementable primitive"* — and that is still exactly right. v0.1.2 answered it by
+> making the primitive implementable. v0.2 answers it by no longer making a data-safety argument the
+> controller was never entitled to make: durability belongs to NiFi's retry and the Normalizer's idempotency,
+> and [requirements § 7](requirements.md#7-durability-boundary-and-workload-responsibilities) now says so
+> plainly. Both closures are recorded below, in order, because the second is only defensible in light of the
+> first.
+>
+> Three immutable decisions are superseded as a consequence — [`I-17`](#5-immutable-phase-1-decisions),
+> `I-18`, and `I-19`, all three of which described the work store. They are marked rather than deleted, and
+> `I-20`…`I-22` replace them. Everything else in [§5](#5-immutable-phase-1-decisions) stands unchanged.
 
 The most important conceptual correction is [§2](#2-three-statements-that-are-not-the-same-thing): the design
 was, in places, sliding between three different statements about cluster capacity that are not equivalent.
@@ -40,7 +69,7 @@ Stated first, so the findings can be read as refinements rather than a rewrite.
 | **Taint semantics** | Correctly scoped: `NoSchedule`/`NoExecute` are hard, `PreferNoSchedule` is not, and the kubelet pressure taints are handled for free by the same code path — a genuinely elegant consequence |
 | **Fail-safe = freeze** | Right choice, consistently applied. "Never scale down on unknown state" is the correct invariant |
 | **Purity of the decision engine** | The `Snapshot → Decision` boundary is what makes this design testable at all, and the property test (UT-22) is the right instrument for the core safety claim |
-| **Durability as a workload property** | Correct framing. An autoscaler cannot make a lossy pipeline safe, and the design says so instead of over-claiming |
+| **Durability as a workload property** | Correct framing. An autoscaler cannot make a lossy pipeline safe, and the design says so instead of over-claiming. **This is the one row v0.2 strengthened rather than kept:** the v0.1/v0.1.2 design stated the principle and then partly contradicted it by shipping a work store, and [requirements § 7](requirements.md#7-durability-boundary-and-workload-responsibilities) now draws the boundary where the review put it |
 
 ---
 
@@ -252,7 +281,7 @@ operator at quota and `LimitRange` as candidates.
 
 **Severity: High.** A stated data-protection mechanism does not apply to the case it was listed under.
 
-[D-07](requirements.md#7-data-loss-protection-assumptions) presented a PDB as protection for the processing
+[D-07](requirements.md#7-durability-boundary-and-workload-responsibilities) presented a PDB as protection for the processing
 pool, in a list about scale-down and termination safety. PDBs are enforced **only by the Eviction API** — node
 drains, the descheduler, cluster-autoscaler node consolidation. A ReplicaSet scale-down deletes pods directly
 and is entirely unaffected by any PDB, no matter how strict. An implementer trusting D-07 would believe
@@ -260,8 +289,13 @@ scale-down was bounded by `minAvailable` when it is not.
 
 **Fix (applied).** D-07 is rescoped to what a PDB actually does — protecting the pool during node-level
 disruption ([FS-13](failure-scenarios.md#fs-13-node-failure-or-drain-removes-workers)) — and scale-down safety
-is attributed solely to its real mechanisms: `maxScaleDownStep`, deletion-cost ordering, graceful drain
-(`preStop` + grace period), and lease-based reclaim as backstop.
+is attributed solely to its real mechanisms: `maxScaleDownStep`, deletion-cost ordering, and graceful drain
+(readiness withdrawal + grace period).
+
+> **v0.2 note.** The original fix listed "lease-based reclaim" as the backstop. With the work store gone, the
+> backstop is NiFi re-sending the failed request — a weaker mechanism, and still the only one that holds under
+> a hard kill ([FS-14](failure-scenarios.md#fs-14-scale-down-terminates-a-busy-pod)). The finding itself is
+> unaffected: a PDB did not protect scale-down then and does not now.
 
 ### DR-11: `pod-deletion-cost` ordering was described too loosely
 
@@ -275,14 +309,15 @@ brief readiness blip. It also requires the `PodDeletionCost` feature gate (beta,
 
 **Fix (applied).** Documented precisely, and the ordering restated so the real guarantee is clear: deletion
 cost is a preference among healthy pods, while the actual safety guarantee for in-flight work is graceful
-drain plus lease-based reclaim. This does not change the design, only what it promises.
+drain plus a retry backstop — `preStop`/lease-based reclaim in v0.1.2, readiness-driven drain plus NiFi retry
+in v0.2. This does not change the design, only what it promises.
 
 ### DR-12: The POC work store cannot provide the claimed semantics on the proposed environment
 
 **Severity: Critical.** The data-safety argument rests on an unimplementable primitive.
 
-[D-02](requirements.md#7-data-loss-protection-assumptions) and
-[D-03](requirements.md#7-data-loss-protection-assumptions) depend on **atomic rename** in a store shared by all
+[D-02](requirements.md#7-durability-boundary-and-workload-responsibilities) and
+[D-03](requirements.md#7-durability-boundary-and-workload-responsibilities) depend on **atomic rename** in a store shared by all
 processing pods. Both proposed options break that:
 
 - **RWX PVC on kind.** kind ships `local-path-provisioner`, which provides node-local `ReadWriteOnce`
@@ -311,7 +346,7 @@ Why that is the stronger answer, and not merely a different one:
 - **The dual-write problem disappears.** Because the output insert and the acknowledgement are one commit, a
   partial output and an acknowledged-but-unwritten item become *unrepresentable*. Every other candidate — NFS,
   object storage, and message brokers alike — splits ack from output across two systems.
-- **Idempotency is enforced by a `PRIMARY KEY`**, so [D-03](requirements.md#7-data-loss-protection-assumptions)
+- **Idempotency is enforced by a `PRIMARY KEY`**, so [D-03](requirements.md#7-durability-boundary-and-workload-responsibilities)
   is provable instead of aspirational.
 - **The reaper disappears entirely**: lease expiry is handled inside the claim query, which also dissolved
   [Q-3](implementation-plan.md#8-open-questions).
@@ -322,11 +357,50 @@ The change also closed [Q-1](implementation-plan.md#8-open-questions): with work
 backlog signal is the store's claimable count, which deletes the NiFi REST client and its credentials from the
 controller ([ADR-19](architecture.md#adr-19-where-does-the-backlog-signal-come-from)).
 
-Two new failure modes were *introduced* and are recorded rather than glossed over: the store is a single point
-of failure and can saturate ([FS-28](failure-scenarios.md#fs-28-work-store-unavailable-or-saturated)), and a
-lease that expires while its worker is alive causes duplicate processing — wasted CPU, never wrong output
-([FS-29](failure-scenarios.md#fs-29-lease-expires-while-the-worker-is-still-alive)). Verified by DI-08
-(exclusive claiming), DI-09 (transactional ack under `SIGKILL`), and DI-10 (saturation), all gating P2.
+Two new failure modes were *introduced* and recorded rather than glossed over: the store is a single point of
+failure and can saturate, and a lease that expires while its worker is alive causes duplicate processing —
+wasted CPU, never wrong output. Verified by DI-08 (exclusive claiming), DI-09 (transactional ack under
+`SIGKILL`), and DI-10 (saturation), all gating P2.
+
+#### Re-closed (v0.2) — the work store was removed instead
+
+**The v0.1.2 closure above is withdrawn.** Its reasoning was correct and its answer was disproportionate. Read
+back, the tell is in its own final paragraph: closing DR-12 required *introducing* two new failure modes, one
+of which made a database the single point of failure of a project about Kubernetes scaling. That is a high
+price for a guarantee — no item can be lost even if every pod dies — that the project's own
+[non-goals](requirements.md#3-non-goals) never asked for.
+
+v0.2 closes DR-12 by deleting the disputed component. NiFi posts each record to `normalizer-service` over
+HTTP; the Service delivers it to exactly one pod; the pod holds nothing and returns a result
+([ADR-21](architecture.md#adr-21-how-does-work-reach-the-normalizer-pods)).
+
+| DR-12's original problem | v0.1.2 answer | v0.2 answer |
+| --- | --- | --- |
+| Atomic rename is unavailable on kind's `local-path` and absent from object stores | Replace the primitive: `FOR UPDATE SKIP LOCKED` in PostgreSQL | **Remove the requirement.** Nothing renames anything, because nothing is shared |
+| Two pods can claim the same item | Database-enforced exclusion under a lease | No claiming exists; the Service assigns each request to one pod |
+| Dual write of output and acknowledgement | One transaction | No acknowledgement exists; the HTTP response *is* the acknowledgement |
+| Pods on different nodes see different data | Single shared store | Pods share no data at all, so divergence is unrepresentable |
+| Durability of in-flight work | Item stays durably in the store through any pod failure | **Not claimed.** NiFi retries the failed request ([A-12](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)) |
+
+**What was genuinely lost, stated plainly.** Under v0.1.2 an item survived the death of every processing pod.
+Under v0.2 it survives only if NiFi retries. That is a real reduction in strength, and it is acceptable for
+exactly one reason: the project's subject is whether a scaling decision is *resource-feasible*, and neither
+answer to DR-12 changes a single line of that calculation. Paying for a durability guarantee with a database
+that the scaling logic never reads was buying the wrong thing.
+
+**What replaced the verification.** DI-08 and DI-09 were the gates on the withdrawn claim protocol. They have
+been repurposed rather than dropped, to the two failure modes v0.2 introduces in place of the two v0.1.2
+introduced: DI-08 now proves that **throughput actually scales with replicas**
+([FS-28](failure-scenarios.md#fs-28-adding-replicas-does-not-add-throughput)) and DI-09 that the **pipeline
+survives pod loss under sustained load** ([FS-12](failure-scenarios.md#fs-12-normalizer-pod-crashes-mid-request)),
+with DI-04 covering duplicate normalization under retry
+([FS-29](failure-scenarios.md#fs-29-a-retried-request-is-normalized-twice)). DI-08 keeps the gating role that
+the claim-exclusivity test held: in both architectures, P2 is blocked on the one property whose absence would
+make every downstream demonstration meaningless.
+
+[FS-25](failure-scenarios.md#fs-25-withdrawn-shared-work-store-claim-semantics) retains the original
+atomic-rename analysis as history, and reactivates automatically if shared state ever returns between the
+pods.
 
 ### DR-13: Leader handoff interacts with external-change detection
 
@@ -419,7 +493,7 @@ capacity concurrently — which is exactly what `perNodeReserve*` and `fitCapaci
 | 11 | Target Deployment already changing replicas | Was the largest single omission: DR-07 (external writers) and DR-08 (rollouts) |
 | 12 | Pod startup failures | Was entirely absent and is the worst behavioural bug found: DR-06 |
 | 13 | Insufficient-resource scenarios | Well designed; partial scale-up, HOLD, backoff, and deficit alerting are the right set once DR-01/DR-02 are fixed |
-| 14 | Data-loss scenarios | Framing correct, but the POC's primitive was unimplementable (DR-12, now closed by a database-enforced claim) and one protection was misattributed (DR-10) |
+| 14 | Data-loss scenarios | Framing correct, but the POC's primitive was unimplementable (DR-12) and one protection was misattributed (DR-10). Closed twice: by a database-enforced claim in v0.1.2, then by removing the store and stating durability as a workload responsibility in v0.2. The residual claim is narrower and defensible — *scaling actions do not destroy work* — with NiFi retry as its single load-bearing dependency ([failure-scenarios § 4](failure-scenarios.md#4-data-loss-analysis)) |
 | 15 | Deterministic and testable | Structurally excellent; DR-15 (float math) and DR-04 (history as engine input) were the only real threats |
 
 ---
@@ -439,18 +513,28 @@ convenience.
 | I-5 | The decision engine is a **pure function** `Decide(Snapshot, Config, now)`; all state and clock readings enter through the snapshot | [P-2](architecture.md#2-architectural-principles) |
 | I-6 | Exactly **one reason code** per reconcile, identical across logs, events, and metric labels | [scaling-algorithm § 2](scaling-algorithm.md#2-decision-outcomes-and-reason-codes) |
 | I-7 | Uncertainty ⇒ **freeze**. Never scale on stale/missing primary signals; never scale down on unknown state | [ADR-14](architecture.md#adr-14-what-happens-if-kubernetes-api-calls-fail) |
-| I-8 | Demand is `max(backlog target, utilization target)`; either may raise, both must be low to lower | [ADR-02](architecture.md#adr-02-how-should-the-desired-replica-count-be-calculated) |
+| I-8 | Demand is `max(pressure target, utilization target)`; either may raise, both must be low to lower | [ADR-02](architecture.md#adr-02-how-should-the-desired-replica-count-be-calculated) |
 | I-9 | Scale-down is **strictly** more damped than scale-up: longer cooldown, `max()` over a covered window, one replica per step | [scaling-algorithm § 8](scaling-algorithm.md#8-hysteresis-and-oscillation-control) |
 | I-10 | Backoff reset is **level-triggered on observed capacity**, never timer-based; only a complete scale-up resets it | [DR-01](#dr-01-backoff-gate-makes-the-recovery-in-one-interval-claim-unreachable), [DR-02](#dr-02-partial-scale-up-both-arms-and-resets-the-backoff) |
 | I-11 | The controller **never deletes pods** and holds no pod-delete permission; replica count is the only actuator | [architecture § 7](architecture.md#7-kubernetes-permissions-and-rbac) |
 | I-12 | KubeScaleSense must be the **sole writer** of the target's replica count; competing writers cause refusal, not competition | [ADR-17](architecture.md#adr-17-how-do-we-handle-other-writers-of-the-replica-count) |
 | I-13 | L2 is verified against L3: **the Pending and unhealthy-pod watchdogs are correctness requirements**, not operational extras | [§2](#2-three-statements-that-are-not-the-same-thing), [ADR-13](architecture.md#adr-13-what-happens-if-a-newly-created-pod-stays-pending) |
-| I-14 | Durability is a **workload** property (D-01…D-06); the controller's contribution is avoiding involuntary eviction and never bypassing graceful termination | [ADR-15](architecture.md#adr-15-how-do-we-protect-data-processing-when-a-worker-pod-crashes) |
+| I-14 | Durability is a **workload** property (D-01…D-07); the controller's contribution is avoiding involuntary eviction and never bypassing graceful termination | [ADR-15](architecture.md#adr-15-how-do-we-protect-data-processing-when-a-worker-pod-crashes), [requirements § 7](requirements.md#7-durability-boundary-and-workload-responsibilities) |
 | I-15 | One target `Deployment`, one controller, config from a ConfigMap. No CRD, no multi-target, no scheduler simulation in Phase 1 | [requirements § 3](requirements.md#3-non-goals) |
 | I-16 | The estimator models a **documented subset** of predicates; the subset is a published contract, and additions require a test proving the new predicate's effect | [resource-calculation § 6](resource-calculation.md#6-predicates-modelled-and-predicates-ignored) |
-| I-17 | The work store is a **PostgreSQL work-item table**; claiming is `FOR UPDATE SKIP LOCKED` under a lease, and output plus acknowledgement commit in **one transaction**. No shared filesystem, no atomic-rename claim | [ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline) |
-| I-18 | Workers are **pull-based**, so replica count is the throughput knob | [ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline), [A-13](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful) |
-| I-19 | The backlog signal is the work store's **claimable count**, read over a **read-only** connection; NiFi's queue depth is observability only | [ADR-19](architecture.md#adr-19-where-does-the-backlog-signal-come-from) |
+| ~~I-17~~ | ~~The work store is a **PostgreSQL work-item table**; claiming is `FOR UPDATE SKIP LOCKED` under a lease, and output plus acknowledgement commit in **one transaction**~~ · **SUPERSEDED by I-20 (v0.2)** | [ADR-18](architecture.md#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline) *(superseded)* |
+| ~~I-18~~ | ~~Workers are **pull-based**, so replica count is the throughput knob~~ · **SUPERSEDED by I-21 (v0.2)** — the conclusion survives, the mechanism does not: replica count is still the throughput knob, but work is **pushed** to pods, so throughput is additionally bounded by the caller's concurrency | [ADR-21](architecture.md#adr-21-how-does-work-reach-the-normalizer-pods), [A-13](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful) |
+| ~~I-19~~ | ~~The backlog signal is the work store's **claimable count**, read over a **read-only** connection~~ · **SUPERSEDED by I-22 (v0.2)** | [ADR-19](architecture.md#adr-19-where-does-the-backlog-signal-come-from) *(superseded)* |
+| I-20 | Work reaches the pods as an **HTTP request through a ClusterIP Service**. No durable work store, message broker, shared filesystem, or object storage is part of the architecture, and the Normalizer pods **share no state** | [ADR-21](architecture.md#adr-21-how-does-work-reach-the-normalizer-pods), [WR-01](requirements.md#workload-signal-requirements-v02) |
+| I-21 | Delivery is **at-least-once and normalization is idempotent**; the HTTP response is the only acknowledgement, and retry is the client's responsibility | [D-02](requirements.md#7-durability-boundary-and-workload-responsibilities)…[D-03](requirements.md#7-durability-boundary-and-workload-responsibilities), [A-12](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful) |
+| I-22 | The workload-pressure signal comes from a **replaceable source interface** (`synthetic`, `http`, `none`) and is **read-only telemetry**; the controller never writes to, acknowledges, or mutates the workload's data path, and an unavailable signal is never read as zero | [ADR-22](architecture.md#adr-22-where-does-the-workload-pressure-signal-come-from), [FR-36](requirements.md#workload-signal-requirements-v02)…[FR-38](requirements.md#workload-signal-requirements-v02) |
+
+**Why these three were the ones that moved.** I-1…I-16 constrain how the controller *decides*; I-17…I-19
+constrained how the workload *stored and fetched work*. That the v0.2 simplification touched the second group
+and left the first untouched is the strongest available evidence that the two concerns were separated
+correctly in the first place — and, read the other way, that I-17…I-19 never belonged in the same list as the
+decision-engine invariants. I-20…I-22 are deliberately narrower: they constrain the *interface* between
+controller and workload, not the workload's internals.
 
 Full statement of what the POC does and does not guarantee:
 [requirements § 10](requirements.md#10-design-limitations-and-assumptions). The settled architecture these

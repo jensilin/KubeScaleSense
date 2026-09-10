@@ -1,8 +1,8 @@
 # KubeScaleSense — Resource Calculation
 
-> Status: **Design (pre-implementation)** · Version: 0.1
+> Status: **Design (pre-implementation)** · Version: 0.2
 > Canonical source for: candidate node filtering, effective pod request, free requestable resources, fit
-> capacity, and the exact set of scheduling predicates modelled in v0.1.
+> capacity, and the exact set of scheduling predicates modelled in Phase 1.
 
 Related documents: [requirements](requirements.md) · [architecture](architecture.md) ·
 [scaling-algorithm](scaling-algorithm.md) · [failure-scenarios](failure-scenarios.md) ·
@@ -12,6 +12,14 @@ Implemented by `internal/resources` ([architecture § 4.4](architecture.md#44-re
 which contains **no policy**: it answers only "how many more pods of this exact shape can the cluster place
 right now?" The decision about whether to use that capacity belongs to
 [scaling-algorithm](scaling-algorithm.md).
+
+**Unchanged by the v0.2 architecture simplification, and necessarily so.** This document asks a question about
+the Kubernetes scheduler and a pod template. It does not know or care what the pods do, how work reaches them,
+or where the demand signal comes from — so removing the work store
+([ADR-21](architecture.md#adr-21-how-does-work-reach-the-normalizer-pods)) changed nothing here beyond the
+name of the target Deployment. That the project's central calculation survived a substantial architecture
+revision untouched is the intended consequence of the `Snapshot → Decision` boundary
+([P-2](architecture.md#2-architectural-principles)).
 
 ---
 
@@ -320,7 +328,7 @@ removed capacity that a simple division would have promised.
 
 ### 7.3 Feeding the decision
 
-With `R_cur = 2` and a backlog of 400 items, the engine wants `Δ_req = 4` after step limiting
+With `R_cur = 2` and workload pressure of 400 outstanding items, the engine wants `Δ_req = 4` after step limiting
 ([scaling-algorithm § 11, Example A](scaling-algorithm.md#example-a--spike-fully-feasible)): `F = 4 ≥ 4`, so
 `ScaleUp` to 6. Had `w-2` been busier (`F = 2`), the same demand would have produced `ScaleUpPartial` to 4
 plus an armed backoff (Example B). Had all three nodes been full (`F = 0`), `HoldInsufficientResources`

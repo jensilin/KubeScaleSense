@@ -1,6 +1,6 @@
 # KubeScaleSense — System Architecture
 
-> Status: **Design (pre-implementation)** · Version: 0.1
+> Status: **Design (pre-implementation)** · Version: 0.2
 > Canonical source for: system architecture, component responsibilities, RBAC, observability contract,
 > and the architecture decision records (`ADR-xx`) that answer the project's critical design questions.
 
@@ -12,18 +12,18 @@ Related documents: [requirements](requirements.md) · [scaling-algorithm](scalin
 
 ## 1. Context
 
-KubeScaleSense is a Go control-loop that sizes one processing `Deployment` from two independent inputs:
-**workload demand** and **cluster schedulability**. The file-processing pipeline is the demonstration
-workload; the controller is the deliverable.
+KubeScaleSense is a Go control-loop that sizes one **Normalizer** `Deployment` from two independent inputs:
+**workload demand** and **cluster schedulability**. The data pipeline is the demonstration workload; the
+controller is the deliverable.
 
 ```mermaid
 flowchart LR
-    SFTP["SFTP server<br/>file drop"] --> NIFI["NiFi 2.6.7<br/>ingest + durable buffer"]
-    NIFI -->|PutDatabaseRecord| WORK["Durable work store<br/>PostgreSQL work_items"]
-    WORK -->|"claim: FOR UPDATE SKIP LOCKED"| POOL["Processing pods<br/>Deployment: file-processor"]
-    POOL -->|"output + ack, one transaction"| OUT["Normalized data<br/>output_records"]
+    SFTP["SFTP server<br/>file drop"] --> NIFI["NiFi 2.6.7<br/>ingest + durable buffer + retry"]
+    NIFI -->|"HTTP: raw data"| SVC["normalizer-service<br/>ClusterIP"]
+    SVC --> POOL["Normalizer pods<br/>Deployment: normalizer"]
+    POOL --> OUT["Normalized data"]
 
-    WORK -. "backlog: pending item count" .-> KSS
+    POOL -. "pressure: queued + in-flight" .-> KSS
     POOL -. "CPU / memory usage" .-> KSS
     K8S["Kubernetes API<br/>nodes, pods, deployment"] -. "capacity + commitments" .-> KSS
 
@@ -34,14 +34,17 @@ flowchart LR
     class KSS ctrl
 ```
 
-Scope boundary, per [NG-1](requirements.md#3-non-goals): the controller scales **the processing pool only**.
-NiFi is fixed-size and treated as a durable buffer. If NiFi later becomes the bottleneck, that is a separate
-target workload with its own policy — not a change to this algorithm.
+Scope boundary, per [NG-1](requirements.md#3-non-goals): the controller scales **the Normalizer Deployment
+only**. NiFi is fixed-size and owns ingestion durability and retry. If NiFi later becomes the bottleneck, that
+is a separate target workload with its own policy — not a change to this algorithm.
 
-The work store is a **PostgreSQL work-item table**, not a shared filesystem. That choice, and the reasons the
-original shared-filesystem design was abandoned, are recorded in
-[ADR-18](#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline); the final settled architecture is
-[§11](#11-phase-1-architecture-baseline).
+There is **no durable work store, message broker, shared filesystem, or object store** between NiFi and the
+Normalizer. Work arrives as an HTTP request through a Kubernetes `Service`, which is the simplest interface
+that still demonstrates resource-aware scaling
+([ADR-21](#adr-21-how-does-work-reach-the-normalizer-pods)). Durability is NiFi's responsibility and is
+explicitly **not** claimed by this controller
+([requirements § 7](requirements.md#7-durability-boundary-and-workload-responsibilities)). The settled
+architecture is [§11](#11-phase-1-architecture-baseline).
 
 ---
 
@@ -66,7 +69,7 @@ flowchart TB
     subgraph EXT["Cluster / external systems"]
         API["Kubernetes API server"]
         MS["metrics.k8s.io<br/>metrics-server"]
-        WSTORE["Work store (PostgreSQL)<br/>read-only backlog query"]
+        SIG["Workload-signal source<br/>synthetic | http scrape"]
     end
 
     subgraph KSS["KubeScaleSense controller process"]
@@ -76,7 +79,7 @@ flowchart TB
             direction LR
             KUBE["kubernetes<br/>informers + typed clients"]
             RES["resources<br/>schedulability + fit capacity"]
-            MET["metrics<br/>backlog + utilization"]
+            MET["metrics<br/>pressure + utilization"]
         end
         SNAP["Snapshot<br/>immutable decision input"]
         ENGINE["scaling<br/>pure decision engine"]
@@ -86,7 +89,7 @@ flowchart TB
 
     API --> KUBE
     MS --> MET
-    WSTORE --> MET
+    SIG --> MET
     KUBE --> RES
     KUBE --> MET
     CFG --> ENGINE
@@ -121,15 +124,25 @@ internal/
   config/                       # schema, defaults, validation, env overrides
   kubernetes/                   # clients, informers, scale writes, event recorder
   resources/                    # node filtering, free-resource math, fit capacity
-  metrics/                      # NiFi backlog, pod utilization, staleness
+  metrics/                      # workload-pressure sources, pod utilization, staleness
   scaling/                      # Snapshot, Decision, reason codes, pure Decide()
   controller/                   # reconcile loop, actuator, pending-pod watchdog, backoff state
   observability/                # Prometheus registry, health handlers, structured logging
+cmd/
+  normalizer/                   # the demonstration workload: a small stateless HTTP app (Phase 2)
+internal/normalizer/            # normalization handler, in-flight accounting, metrics endpoint
 config/                         # kubescalesense.yaml (defaults, examples)
-deploy/                         # manifests: RBAC, Deployment, ConfigMap, demo pipeline (Phase 2+)
+deploy/
+  kubescalesense/               # RBAC, Deployment, ConfigMap for the controller
+  normalizer/                   # Deployment, normalizer-service, PDB for the workload
+  demo/                         # SFTP, NiFi, ballast, load generator (Phase 2+)
 tests/                          # integration + e2e harness, scenario scripts
 docs/                           # this design set
 ```
+
+The Normalizer lives in this repository so the whole POC runs locally with one `make demo-up`, but it is a
+**separate application** with no shared code with the controller beyond the Go module — the controller must
+never gain compile-time knowledge of the workload it scales.
 
 ### 4.1 Config (`internal/config`)
 
@@ -157,21 +170,30 @@ Produces the demand half of the snapshot:
 
 | Signal | Source | Notes |
 | --- | --- | --- |
-| `backlogItems` | `SELECT count(*) FROM work_items WHERE status = 'pending' OR (status = 'processing' AND lease_expires_at < now())` on the work store, over a read-only connection | Primary demand signal — **claimable work**, which is the quantity replicas actually consume ([ADR-19](#adr-19-where-does-the-backlog-signal-come-from)). Optional EWMA smoothing ([scaling-algorithm § 8.4](scaling-algorithm.md#84-signal-smoothing)) |
-| `inFlightItems` | `SELECT count(*) FROM work_items WHERE status = 'processing' AND lease_expires_at >= now()` | Reported only. Makes "the pool is busy but the queue is empty" visible, and is the natural source for `pod-deletion-cost` input |
-| `backlogGrowthRate` | Difference of consecutive backlog samples per second | Phase 3 input for predictive scaling; recorded from Phase 1 for offline analysis |
-| `podCPUUsage`, `podMemoryUsage` | `PodMetrics` from `metrics.k8s.io/v1beta1` for the target's pods | Averaged over **Ready** pods only; starting pods would drag the average down and suppress scale-up |
+| `pressureItems` | The configured `WorkloadSignal` source: `synthetic` (a scripted series) or `http` (scraped from the Normalizer's metrics endpoint) | Primary demand signal — **outstanding work**: queued plus in-flight requests. Optional EWMA smoothing ([scaling-algorithm § 8.4](scaling-algorithm.md#84-signal-smoothing)) |
+| `inFlightRequests` | Same source; the Normalizer's own in-flight counter, summed over pods | Reported, and the natural input for `pod-deletion-cost`. Makes "the pool is busy but nothing is queued" visible |
+| `requestRate`, `processingRate`, `processingLatency` | Same source | **Observability only** in v0.2 ([FR-39](requirements.md#workload-signal-requirements-v02)); recorded from Phase 1 so a latency- or arrival-rate-driven demand model can be derived from data instead of guessed |
+| `podCPUUsage`, `podMemoryUsage` | `PodMetrics` from `metrics.k8s.io/v1beta1` for the target's pods | Averaged over **Ready and warm** pods only; starting pods would drag the average down and suppress scale-up |
 | `readyReplicas`, `currentReplicas` | Target `Deployment` status/spec | `readyReplicas` is the denominator for utilization |
 | `sampleAge` | Newest sample timestamp vs. now | Drives `HoldStaleMetrics` ([FR-09](requirements.md#4-functional-requirements)) |
 
-Each source is behind an interface (`BacklogSource`, `UtilizationSource`) with a fake for tests. A source
+Each source is behind an interface (`WorkloadSignal`, `UtilizationSource`) with a fake for tests. A source
 failure is recorded as `unavailable` in the snapshot rather than aborting the reconcile — the engine decides
 what a missing signal means (usually: no scale-up, never a scale-down).
 
-The backlog source is a **single `count(*)` over one indexed predicate**, executed with a query timeout, a
-connection pool capped at 2, and `default_transaction_read_only` on its role. It is deliberately the smallest
-possible dependency on the work store: the controller knows the table's *shape*, never its contents, and holds
-no credentials that could mutate work ([FR-37](requirements.md#work-store-requirements-v012)).
+**The signal source is deliberately replaceable, and that is a design requirement rather than a convenience**
+([FR-36](requirements.md#workload-signal-requirements-v02),
+[ADR-22](#adr-22-where-does-the-workload-pressure-signal-come-from)). The controller's subject is the scaling
+decision; where the number comes from is the workload's business. Consequences worth stating:
+
+- The first implementation may use the **synthetic** source, so P1 can be built and demonstrated before the
+  pipeline exists. A scripted pressure series also makes the decision engine's behaviour reproducible in a way
+  a live pipeline never is.
+- The controller holds **no workload credentials** and issues **no writes** to the data path — the signal is
+  read-only telemetry over in-cluster HTTP
+  ([FR-37](requirements.md#workload-signal-requirements-v02)).
+- Swapping in a queue depth, a broker's backlog, or a Prometheus query later changes one implementation of one
+  interface and nothing else.
 
 ### 4.4 Resource discovery (`internal/resources`)
 
@@ -256,7 +278,7 @@ sequenceDiagram
     participant T as Ticker
     participant C as controller
     participant M as metrics
-    participant N as NiFi API
+    participant N as signal source
     participant R as resources
     participant I as informer cache
     participant E as scaling.Decide
@@ -264,9 +286,9 @@ sequenceDiagram
 
     T->>C: tick (interval 15s)
     C->>M: CollectDemand()
-    M->>N: GET queued FlowFile counts
+    M->>N: read outstanding work (queued + in-flight)
     M->>I: PodMetrics + Deployment status
-    M-->>C: backlog=400, avgCPU=88%, age=6s
+    M-->>C: pressure=400, avgCPU=88%, age=6s
     C->>R: Feasibility(podTemplate)
     R->>I: list Nodes + all Pods (cache)
     R-->>C: candidateNodes=2, fitCapacity=4, blocked=cpu
@@ -274,7 +296,7 @@ sequenceDiagram
     E-->>C: ScaleUp to 6 (delta 4, feasible)
     C->>K: update scale (replicas=6, resourceVersion precondition)
     K-->>C: 200 OK
-    C->>K: Event: ScaledUp 2 -> 6, backlog 400, fit 4
+    C->>K: Event: ScaledUp 2 -> 6, pressure 400, fit 4
     C->>C: lastScaleUpTime=now; reset holdBackoff
 ```
 
@@ -389,10 +411,12 @@ cluster-scoped resource discovery, and a namespaced `Role` for the target and co
 
 - No `delete` on pods. Scale-down goes through the ReplicaSet controller so that PDBs, graceful termination,
   and `preStop` hooks apply. Direct pod deletion would bypass exactly the protections
-  [D-05](requirements.md#7-data-loss-protection-assumptions) depends on.
+  [D-05](requirements.md#7-durability-boundary-and-workload-responsibilities) depends on.
 - No write access to nodes: no cordon, no taint, no eviction.
 - No `deployments` `update` — only `deployments/scale`, so a bug cannot rewrite the pod template.
-- No secrets access beyond the single mounted NiFi credential `Secret` (mounted as a file, not read via API).
+- **No `secrets` access at all.** The v0.2 signal design needs no workload credentials: pressure is read from
+  the Normalizer's metrics endpoint over in-cluster HTTP, or generated synthetically
+  ([FR-37](requirements.md#workload-signal-requirements-v02)).
 - No `events` **read**. A consequence worth stating: the controller cannot quote the ReplicaSet's
   `FailedCreate` message, so a quota-blocked scale-up is reported as "replicas not materialising into pods"
   with quota and `LimitRange` named as candidates, rather than as a precise cause
@@ -416,8 +440,12 @@ RuntimeDefault`, no service account token beyond the controller's own.
 | `kss_scale_actions_total` | counter | `direction`, `outcome` | Actual mutations vs. conflicts/errors |
 | `kss_current_replicas` / `kss_desired_replicas` | gauge | — | Divergence between the two is the "unmet demand" signal |
 | `kss_desired_replicas_uncapped` | gauge | — | Desired before clamp/step, exposes `maxReplicas` saturation |
-| `kss_backlog_items` | gauge | `source` | Demand input, raw |
+| `kss_backlog_items` | gauge | `source` | Demand input, raw: outstanding work items from the configured signal source |
 | `kss_backlog_items_smoothed` | gauge | — | What the engine actually used |
+| `kss_workload_in_flight_requests` | gauge | — | Requests being served now; input to `pod-deletion-cost` |
+| `kss_workload_request_rate` / `kss_workload_processing_rate` | gauge | — | Arrivals and completions per second. **Observability only** in v0.2 ([FR-39](requirements.md#workload-signal-requirements-v02)) |
+| `kss_workload_processing_latency_seconds` | gauge | `quantile` | Per-request latency; recorded now so a latency-driven demand model can be derived from data later |
+| `kss_workload_signal_source_up` | gauge | `source` | 1 when the configured source answered the last collection — distinguishes "no work" from "no answer" |
 | `kss_avg_cpu_utilization_percent` / `kss_avg_memory_utilization_percent` | gauge | — | Demand input, relative to request |
 | `kss_metric_sample_age_seconds` | gauge | `signal` | Staleness watch ([FR-09](requirements.md#4-functional-requirements)) |
 | `kss_fit_capacity_pods` | gauge | — | **The headline resource-awareness metric** |
@@ -438,20 +466,20 @@ RuntimeDefault`, no service account token beyond the controller's own.
 
 ### 8.2 Kubernetes Events
 
-On the target `Deployment`, so `kubectl describe deployment file-processor` explains the pipeline's behaviour:
+On the target `Deployment`, so `kubectl describe deployment normalizer` explains the pipeline's behaviour:
 
 | Reason | Type | Example message |
 | --- | --- | --- |
-| `ScaledUp` | Normal | `2 -> 6 (backlog 400, itemsPerReplica 50, fitCapacity 4)` |
+| `ScaledUp` | Normal | `2 -> 6 (pressure 400, itemsPerReplica 50, fitCapacity 4)` |
 | `ScaledUpPartial` | Warning | `2 -> 4 of 6 desired; fitCapacity 2, blocking dimension cpu` |
-| `ScaledDown` | Normal | `6 -> 5 (backlog 30 for 300s, stabilization window satisfied)` |
+| `ScaledDown` | Normal | `6 -> 5 (pressure 30 for 300s, stabilization window satisfied)` |
 | `InsufficientClusterResources` | Warning | `need 4 pods of 500m/512Mi, can place 0; candidate nodes 2/3, blocking cpu; retry in 30s` |
-| `PodPendingTimeout` | Warning | `pod file-processor-x unschedulable for 124s; reverting 6 -> 2` |
+| `PodPendingTimeout` | Warning | `pod normalizer-x unschedulable for 124s; reverting 6 -> 2` |
 | `PodStartupFailure` | Warning | `2 pods scheduled but not Ready for 312s (ImagePullBackOff); blocking scale-ups` |
-| `ScalingConflict` | Warning | `HPA hpa/file-processor targets the same Deployment; refusing to scale` |
+| `ScalingConflict` | Warning | `HPA hpa/normalizer targets the same Deployment; refusing to scale` |
 | `ExternalScaleDetected` | Warning | `replicas changed 6 -> 2 by another actor; adopting as baseline, history reset` |
 | `RolloutInProgress` | Normal | `generation 7 != observedGeneration 6; holding both directions until rollout completes` |
-| `MetricsUnavailable` | Warning | `NiFi backlog source unavailable for 75s; holding` |
+| `MetricsUnavailable` | Warning | `workload signal source unavailable for 75s; holding` |
 
 Event emission for repeating HOLD states is rate-limited to once per backoff cycle to avoid event spam
 ([FR-24](requirements.md#4-functional-requirements)).
@@ -482,10 +510,11 @@ alternatives, consequences.
 
 ### ADR-01: What exactly is being scaled?
 
-**Decision.** One `Deployment` of stateless processing pods (`data-pipeline/file-processor`), via its `scale`
-subresource. Not NiFi, not nodes, not pod size, not the SFTP server.
+**Decision.** One `Deployment` of stateless **Normalizer** pods (`data-pipeline/normalizer`), via its `scale`
+subresource. Not NiFi, not nodes, not pod size, not the SFTP server, and not the `Service` in front of the
+pods.
 
-**Rationale.** The processing pool is the only pipeline component that is stateless per item
+**Rationale.** The Normalizer is the only pipeline component that is stateless per request
 ([A-01](requirements.md#6-workload-and-environment-assumptions)), horizontally scalable, and the actual
 bottleneck under a file spike. NiFi 2.6.7 holds flow state and repositories; adding/removing NiFi nodes
 requires cluster-coordinator participation and flow rebalancing, which is a different problem with a
@@ -496,8 +525,9 @@ different risk profile.
 bottleneck. *Job/Queue-per-item (a Job per file)* — a clean model, but it moves the problem to Job admission
 and loses the "resource-aware replica count" thesis this project exists to explore.
 
-**Consequences.** Replica count is the single actuation knob. The controller needs no knowledge of item
-identity, which is why an incorrect decision can only affect throughput ([§7 of requirements](requirements.md#7-data-loss-protection-assumptions)).
+**Consequences.** Replica count is the single actuation knob. The controller needs no knowledge of request
+identity or content, which is why an incorrect decision can only affect throughput
+([requirements § 7](requirements.md#7-durability-boundary-and-workload-responsibilities)).
 
 ### ADR-02: How should the desired replica count be calculated?
 
@@ -511,11 +541,17 @@ desiredRaw        = max(desiredBacklog, desiredUtilization)
 
 then clamp to `[minReplicas, maxReplicas]`, apply the tolerance deadband, then apply step limits.
 
-**Rationale.** Backlog is the *leading* indicator: it rises the instant files arrive, before CPU responds, and
-it is what the pipeline's latency SLO is actually about. Utilization is the *trailing* safety net: it catches
-the case where items are unexpectedly expensive (large or complex files) so the per-replica assumption in
+**Rationale.** Workload pressure — outstanding work, queued plus in-flight — is the *leading* indicator: it
+rises the instant requests arrive faster than they complete, before CPU responds, and it is what the
+pipeline's latency SLO is actually about. Utilization is the *trailing* safety net: it catches the case where
+items are unexpectedly expensive (large or complex records) so the per-replica assumption in
 `itemsPerReplica` is wrong. `max()` means either signal can *ask* for capacity but both must be low to permit
 a scale-down — which is the conservative direction ([FR-22](requirements.md#4-functional-requirements)).
+
+Request rate, processing rate, and latency are collected but are **not** decision inputs in v0.2
+([FR-39](requirements.md#workload-signal-requirements-v02)). They are recorded so that the drain-time model
+below can be derived from measurements rather than assumed — the same discipline applied to
+`itemsPerReplica`.
 
 **Rejected.** *Utilization only (HPA-equivalent)* — reacts after latency has already grown, and a queue that
 is backed up while pods idle on I/O reads as "not busy". *Backlog only* — mis-sized `itemsPerReplica` becomes
@@ -822,47 +858,59 @@ idle"* — would scale a busy pipeline to `minReplicas` precisely during an outa
 
 ### ADR-15: How do we protect data processing when a worker pod crashes?
 
-**Decision.** Durability lives in the workload design, not the controller. Required properties are
-[D-01…D-07](requirements.md#7-data-loss-protection-assumptions): NiFi's durable repositories, a claim-based
-(pull) work store, output and acknowledgement in one transaction, lease expiry for hard crashes,
-graceful drain via `preStop` + generous `terminationGracePeriodSeconds`, `pod-deletion-cost` so scale-down
-removes idle pods first, and a `PodDisruptionBudget`. The mechanisms implementing each property are specified
-in [ADR-20](#adr-20-how-is-in-flight-work-protected-without-a-shared-filesystem). The controller's contributions are narrow and
-deliberate: it never deletes pods directly, it writes deletion costs, and it avoids the resource exhaustion
-that causes *involuntary* eviction of healthy workers.
+**Decision.** Durability lives in the workload design, **not in the controller**, and KubeScaleSense makes no
+durability claim of its own. Required properties are
+[D-01…D-07](requirements.md#7-durability-boundary-and-workload-responsibilities): NiFi's durable
+repositories, **NiFi retry** on a failed or timed-out normalization request, **idempotent normalization** so a
+retry is harmless, graceful shutdown that drains in-flight requests inside
+`terminationGracePeriodSeconds`, `pod-deletion-cost` so scale-down removes idle pods first, and a
+`PodDisruptionBudget` for node-level disruption. The controller's contributions are narrow and deliberate: it
+never deletes pods directly, it writes deletion costs, and it avoids the resource exhaustion that causes
+*involuntary* eviction of healthy pods.
 
 **Rationale.** A pod can die at any instant for reasons no autoscaler controls — OOM, node failure, spot
 reclaim, `kubectl delete`. Any design where a scaling decision can lose data is broken independently of the
-autoscaler. Making the queue durable and pull-based reduces the blast radius of *every* wrong decision to
-"an item is processed later, possibly twice" — which [D-03](requirements.md#7-data-loss-protection-assumptions)
-makes harmless. This is why the project's data-loss claim is phrased as an assumption set on the pipeline and
-verified by [test-plan § 6](test-plan.md#6-data-integrity-scenarios), rather than as a controller feature.
+autoscaler. The answer here is to hold **nothing durable inside the scaled workload**: a Normalizer pod owns
+no state, so losing one costs an in-flight request, which NiFi re-sends. That reduces the blast radius of
+*every* wrong decision to "a request is served later, possibly twice" — which
+[D-03](requirements.md#7-durability-boundary-and-workload-responsibilities) makes harmless because
+normalization is a pure function of its input.
 
-**Rejected.** *Exactly-once processing* — needs distributed transactions across SFTP, NiFi, and the output
-store; at-least-once with idempotent writes is the standard, cheaper answer. *Controller-orchestrated
-drain (query pods, wait, then delete)* — duplicates what `preStop` and graceful termination already do, and
-requires pod-delete permission we deliberately do not hold ([§7](#7-kubernetes-permissions-and-rbac)).
+This is also why the durability claim is phrased as an assumption set on the pipeline and verified by
+[test-plan § 6](test-plan.md#6-data-integrity-scenarios), rather than as a controller feature. The
+distinction is not pedantry: a project that claims durability it does not implement will be trusted in
+exactly the situation where it fails.
+
+**Rejected.** *A durable work store between NiFi and the pods* (the v0.1 answer — PostgreSQL with claim/ack
+semantics) — it did provide stronger in-flight guarantees, but it bought them with a database, a schema, a
+claim protocol, a JDBC driver, and a lease-tuning constraint, none of which are the subject of this project
+([ADR-21](#adr-21-how-does-work-reach-the-normalizer-pods)). *Exactly-once processing* — needs distributed
+transactions across SFTP, NiFi, and the output sink; at-least-once with idempotent processing is the standard,
+cheaper answer. *Controller-orchestrated drain (query pods, wait, then delete)* — duplicates what graceful
+termination already does, and requires pod-delete permission we deliberately do not hold
+([§7](#7-kubernetes-permissions-and-rbac)).
 
 **Review corrections.** Two claims in the original list did not survive review:
 
 - **A `PodDisruptionBudget` does not constrain scale-down.** PDBs are enforced only by the Eviction API
   (drain, descheduler, autoscaler consolidation); a ReplicaSet scale-down deletes pods directly and ignores
   them entirely. D-07 is rescoped to node-level disruption, and scale-down safety rests solely on
-  `maxScaleDownStep`, deletion-cost ordering, graceful drain, and lease-based reclaim
+  `maxScaleDownStep`, deletion-cost ordering, graceful shutdown, and NiFi retry
   ([DR-10](design-review.md#dr-10-poddisruptionbudget-does-not-protect-against-scale-down)).
 - **`pod-deletion-cost` is a preference within the Ready cohort, not a selector.** The ReplicaSet controller
   ranks candidates by unassigned, then `Pending` before `Running`, then **not-Ready before Ready**, and only
   then by deletion cost. A busy pod with a momentary readiness blip is removed before an idle Ready pod
   regardless of cost ([DR-11](design-review.md#dr-11-pod-deletion-cost-ordering-was-described-too-loosely)).
-  The real guarantee for in-flight work is graceful drain plus lease-based reclaim.
+  The real guarantee for in-flight work is graceful shutdown plus NiFi retry.
 
 ### ADR-16: How will this be demonstrated in a local Kubernetes environment?
 
 **Decision.** A `kind` cluster with one control-plane and three workers, deliberately **small and
 heterogeneous** so resource exhaustion is reachable on a laptop, plus `metrics-server`, a single-node NiFi
-2.6.7 StatefulSet, an `atmoz/sftp` server, a PostgreSQL work store, and a file generator. Five scripted scenarios
-(happy-path spike, insufficient resources, capacity restored, node cordon, pod crash) drive the demo; full
-setup and expected outputs in [test-plan § 7](test-plan.md#7-local-demonstration-environment).
+2.6.7 StatefulSet, an `atmoz/sftp` server, the `normalizer` Deployment behind `normalizer-service`, and a file
+generator. Five scripted scenarios (happy-path spike, insufficient resources, capacity restored, node cordon,
+pod crash) drive the demo; full setup and expected outputs in
+[test-plan § 7](test-plan.md#7-local-demonstration-environment).
 
 **Rationale.** The interesting behaviour — HOLD instead of Pending — only appears in a cluster that can run
 out of room. Constraining worker sizes makes that a two-command demo instead of a cloud-scale exercise. Node
@@ -873,11 +921,14 @@ in the cluster" and "no room for a 500 m pod" are compatible statements.
 exclusion of the control-plane node; supported but not the reference environment. *A managed cloud cluster* —
 cost, and a cluster autoscaler would silently paper over the very condition being demonstrated.
 
-**Review amendment.** The multi-node topology this ADR requires is in direct tension with the demo pipeline's
-shared work store: kind's default `local-path-provisioner` offers only node-local `ReadWriteOnce` volumes, so
-a "shared" PVC silently becomes per-node directories and items written by NiFi are invisible to workers on
-other nodes. Resolving that is now a blocking prerequisite for P2, not an open question
+**Review amendment, then simplification.** The multi-node topology this ADR requires was in direct tension
+with the v0.1 pipeline's *shared* work store: kind's default `local-path-provisioner` offers only node-local
+`ReadWriteOnce` volumes, so a "shared" PVC silently became per-node directories
 ([DR-12](design-review.md#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment)).
+That tension is **gone**, because the pipeline no longer has shared state to place: work reaches the pods as
+an HTTP request through a `Service`, which is node-agnostic by construction
+([ADR-21](#adr-21-how-does-work-reach-the-normalizer-pods)). The demo now needs no PVC other than NiFi's own,
+no CSI driver, and no RWX StorageClass.
 
 ### ADR-17: How do we handle other writers of the replica count?
 
@@ -913,64 +964,37 @@ prerequisite, now recorded as [A-10](requirements.md#103-assumptions-that-must-h
 
 ### ADR-18: What is the durable work store for the POC pipeline?
 
-**Decision.** A **PostgreSQL work-item table**. Items are claimed with `SELECT … FOR UPDATE SKIP LOCKED`,
-held under a **lease**, and acknowledged in the **same transaction** that writes the normalized output. The
-shared-filesystem design and its atomic-rename claim protocol are **abandoned**, not repaired.
+> **Status: SUPERSEDED (v0.2) by [ADR-21](#adr-21-how-does-work-reach-the-normalizer-pods).**
+> The decision below was correct for the question it was asked. The question itself has been withdrawn: the
+> POC no longer has a durable work store, because it no longer needs one.
+>
+> **Why it was withdrawn.** This ADR optimised for in-flight durability inside the scaled workload — exclusive
+> claiming, transactional acknowledgement, lease-based crash recovery. Those are real properties, but buying
+> them cost a database, a schema, a claim protocol, a JDBC driver for NiFi, a lease-duration tuning
+> constraint, and a single point of failure — none of which is the subject of this project. KubeScaleSense
+> exists to decide *whether the cluster can safely accommodate more pods*, and none of that machinery
+> contributes to that question. The simplification deletes the entire component and delegates durability to
+> NiFi, which already implements it
+> ([requirements § 7](requirements.md#7-durability-boundary-and-workload-responsibilities)).
+>
+> **What was kept.** The comparison below is retained deliberately, because it records *why* a shared
+> filesystem and an object store were rejected — and that reasoning still applies to anyone who proposes
+> reintroducing one. What is **not** retained is the schema, the SQL, and the operational detail; those
+> described a component that no longer exists.
 
-```sql
-CREATE TABLE work_items (
-    id               bigserial PRIMARY KEY,
-    source_file      text        NOT NULL,
-    item_key         text        NOT NULL UNIQUE,   -- idempotency key from NiFi
-    payload          jsonb       NOT NULL,
-    status           text        NOT NULL DEFAULT 'pending',   -- pending|processing|done|failed
-    attempts         int         NOT NULL DEFAULT 0,
-    claimed_by       text,
-    lease_expires_at timestamptz,
-    created_at       timestamptz NOT NULL DEFAULT now(),
-    completed_at     timestamptz
-);
-CREATE INDEX work_items_claimable ON work_items (status, lease_expires_at) WHERE status <> 'done';
+**Decision (withdrawn).** A **PostgreSQL work-item table**. Items were to be claimed with
+`SELECT … FOR UPDATE SKIP LOCKED`, held under a **lease**, and acknowledged in the **same transaction** that
+writes the normalized output. The shared-filesystem design and its atomic-rename claim protocol were
+abandoned rather than repaired.
 
-CREATE TABLE output_records (
-    item_key    text PRIMARY KEY,              -- the idempotency constraint, enforced by the database
-    normalized  jsonb       NOT NULL,
-    written_at  timestamptz NOT NULL DEFAULT now(),
-    written_by  text        NOT NULL
-);
-```
+The schema, the `SKIP LOCKED` claim query, and the transactional-acknowledgement statement that this ADR
+specified have been removed rather than preserved, because a reader finding executable DDL in the current
+architecture document would reasonably conclude it describes something to build.
 
-The claim, which also reclaims abandoned leases, so there is no separate reaper process:
+**Rationale (as recorded at the time).** Ranked against the alternatives on the criteria that mattered for the
+v0.1 pipeline:
 
-```sql
-UPDATE work_items SET
-    status = 'processing', claimed_by = $1,
-    lease_expires_at = now() + $2::interval, attempts = attempts + 1
-WHERE id IN (
-    SELECT id FROM work_items
-    WHERE status = 'pending'
-       OR (status = 'processing' AND lease_expires_at < now())
-    ORDER BY id
-    FOR UPDATE SKIP LOCKED
-    LIMIT $3
-)
-RETURNING id, item_key, payload;
-```
-
-And the acknowledgement, which is why duplicate *output* is impossible even though duplicate *processing* is
-possible:
-
-```sql
-BEGIN;
-  INSERT INTO output_records (item_key, normalized, written_by)
-  VALUES ($1, $2, $3) ON CONFLICT (item_key) DO NOTHING;
-  UPDATE work_items SET status = 'done', completed_at = now() WHERE id = $4;
-COMMIT;
-```
-
-**Rationale.** Ranked against the alternatives on the criteria that matter for *this* project:
-
-| | Shared RWX filesystem (NFS) | Object storage (MinIO/S3) | Message queue (RabbitMQ/Redis) | **PostgreSQL (chosen)** |
+| | Shared RWX filesystem (NFS) | Object storage (MinIO/S3) | Message queue (RabbitMQ/Redis) | **PostgreSQL (chosen at the time)** |
 | --- | --- | --- | --- | --- |
 | Works on kind/minikube | Needs a CSI driver + NFS server pod | Yes, one Deployment | Yes, one Deployment | **Yes, one Deployment** |
 | Atomic claim | `rename()` — atomic server-side, but weakened by NFSv3 retransmit/DRC and client attribute caching | **No.** "Rename" is copy+delete; needs conditional `PUT` (`If-None-Match`) or a lease service | Native (`basic.get`+ack, `XREADGROUP`) | **`FOR UPDATE SKIP LOCKED` — the textbook primitive, provably exclusive** |
@@ -992,7 +1016,7 @@ Three considerations decided it:
 2. **Transactional ack removes the dual-write problem.** Because the output and the acknowledgement are one
    commit, a pod that dies mid-item leaves *no* partial output and *no* lost item. Every other option splits
    ack from output across two systems, which is precisely where at-least-once pipelines leak. This is the
-   single largest simplification in the pipeline design, and it makes [D-03](requirements.md#7-data-loss-protection-assumptions)
+   single largest simplification in the pipeline design, and it makes [D-03](requirements.md#7-durability-boundary-and-workload-responsibilities)
    provable instead of aspirational.
 3. **The demand signal gets better, not just cheaper.** `count(*) WHERE claimable` is exactly the quantity a
    replica consumes, which is what `itemsPerReplica` is defined against
@@ -1016,81 +1040,204 @@ Three considerations decided it:
   suite is built on (`input = output`, no duplicates, no partials) become cross-system reconciliation instead
   of one query. A broker is the better answer at production throughput and the worse answer for a
   demonstration whose deliverable is a *provable* count.
-- **NiFi pushing to workers over HTTP (no work store at all).** Superficially the simplest option — zero new
-  components, and NiFi's FlowFile repository already provides durability and retry. Rejected because it is
-  **push, not pull**: throughput would then be governed by NiFi's configured concurrent-task count rather
-  than by the replica count, so adding replicas would not demonstrably add throughput. That destroys the
-  causal chain the whole project exists to show (backlog → scale-up → drain). Pull-based workers are what make
-  the replica count the throughput knob, and this is now a stated assumption
-  ([A-13](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)).
+- **NiFi pushing to pods over HTTP (no work store at all).** Superficially the simplest option — zero new
+  components, and NiFi's FlowFile repository already provides durability and retry. Rejected **at the time**
+  because it is *push, not pull*: throughput is then governed by NiFi's configured concurrent-task count as
+  well as by the replica count, so adding replicas might not demonstrably add throughput, weakening the causal
+  chain the project exists to show (pressure → scale-up → drain).
 
-**Consequences.**
+  **This rejection was reversed in v0.2** ([ADR-21](#adr-21-how-does-work-reach-the-normalizer-pods)). The
+  concern was legitimate but was answered disproportionately: the fix for "the client may not send enough
+  concurrent requests" is to *configure the client's concurrency above the replica ceiling*, not to introduce
+  a database. The concern is now carried honestly as a stated assumption
+  ([A-13](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)), a named
+  failure mode ([FS-28](failure-scenarios.md#fs-28-adding-replicas-does-not-add-throughput)), and a test that
+  proves throughput actually tracks replica count
+  ([DI-08](test-plan.md#6-data-integrity-scenarios)) rather than by architecture that assumes it.
 
-- The work store is a **single point of failure** for the pipeline, and on kind its PVC is node-local — if that
-  node dies, the demo's data is gone. Acceptable and stated ([A-14](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful),
-  [FS-28](failure-scenarios.md#fs-28-work-store-unavailable-or-saturated)); the controller's response is a
-  freeze, not a scale-down.
-- Payloads are bounded (`≤ 256 KiB` per item, enforced by a `CHECK`). NiFi splits files into records, so a
-  large file becomes many items — which is *better* for the autoscaling demo, since backlog then scales with
-  data volume rather than with file count.
-- NiFi needs the PostgreSQL JDBC driver, which its image does not bundle: an init container fetches a pinned
-  driver into a shared volume referenced by the `DBCPConnectionPool`. A small, well-trodden P2 task, called out
-  because it is the kind of detail that costs an afternoon if discovered late.
-- Duplicate *processing* remains possible when a lease expires while its worker is alive but slow. Wasted CPU,
-  never wrong output ([FS-29](failure-scenarios.md#fs-29-lease-expires-while-the-worker-is-still-alive)).
+**Consequences (as recorded, now historical).** The work store would have been a single point of failure with
+a node-local PVC on kind; payloads would have needed a size bound; NiFi would have needed a pinned JDBC driver
+supplied by an init container; and duplicate processing would have remained possible whenever a lease expired
+while its worker was alive but slow. Every one of these costs disappeared with the component. That the
+withdrawal removed four consequences and added one assumption is the clearest evidence the trade was wrong for
+this project's scope.
 
 ### ADR-19: Where does the backlog signal come from?
 
-**Decision.** The primary demand signal is the **count of claimable rows in the work store**, not NiFi's
-queued-FlowFile count. NiFi's REST API is removed from the controller entirely.
+> **Status: SUPERSEDED (v0.2) by [ADR-22](#adr-22-where-does-the-workload-pressure-signal-come-from).**
+> This ADR answered "which of two concrete systems do we query?" — the work store or NiFi's REST API. With the
+> work store withdrawn ([ADR-18](#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)), the answer it
+> gave no longer exists.
+>
+> **Why the replacement is differently shaped, not just differently valued.** The mistake preserved here is
+> worth naming: this ADR bound the controller to a *specific* backlog technology, which is why withdrawing the
+> work store invalidated the demand signal as collateral damage. ADR-22 makes the source an interface with a
+> synthetic default, so the controller can no longer be invalidated by a workload decision at all.
 
-**Rationale.** This follows from [ADR-18](#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline) rather
-than being an independent choice: once NiFi lands records into the work store on arrival, its internal queue
-drains to near zero and no longer represents outstanding work. Continuing to read it would mean scaling on a
-number that is structurally almost always zero.
+**Decision (withdrawn).** The primary demand signal was to be the **count of claimable rows in the work
+store**, not NiFi's queued-FlowFile count, and NiFi's REST API was removed from the controller entirely.
 
-The replacement is strictly better on three counts. It measures **claimable work**, which is the quantity
-`itemsPerReplica` is defined against, so the conversion factor becomes measurable rather than notional. It
-**deletes a dependency**: no NiFi REST client, no API credentials `Secret`, no TLS trust configuration, no
-NiFi-version coupling — and with it, an entire class of failure modes. And it is **one indexed query** against
-a system the controller already needs for nothing else, executed read-only.
+**Rationale (as recorded).** It followed from
+[ADR-18](#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline) rather than being an independent choice:
+once NiFi lands records into a work store on arrival, its internal queue drains to near zero and no longer
+represents outstanding work, so reading it would mean scaling on a structurally-zero number.
 
-**Rejected.** *Keeping NiFi as the signal* — measures the wrong queue, as above. *Summing both* — the two
-count different things at different pipeline stages, so their sum has no meaning and their `max()` would be
-dominated by whichever is noisier. *Counting files on disk* — that was the shared-filesystem design.
-
-**Consequences.** The controller sees work only once NiFi has **landed** it. A NiFi ingest slow enough to be
-the bottleneck therefore hides demand from the controller, which will under-provision until the work lands.
-This is correct behaviour — unlanded work is neither durable nor claimable, so provisioning replicas for it
-would be speculation — but it is a real limitation, recorded in
-[requirements § 10.2](requirements.md#102-what-the-poc-does-not-guarantee) and monitored by exporting NiFi's
-queue depth to the dashboard *without* feeding it into the decision. It also resolves
-[Q-1](implementation-plan.md#8-open-questions).
+**What survived into v0.2.** Two conclusions are still in force. *Summing two different queues is meaningless*
+— they count different things at different pipeline stages, so a sum has no defensible unit and a `max()`
+would be dominated by whichever is noisier. And *the controller holds no workload credentials*: whatever the
+source, it is read-only telemetry ([FR-37](requirements.md#workload-signal-requirements-v02)). The limitation
+this ADR identified also survives in a new form: the controller still cannot see a spike that is still
+buffered inside NiFi ([requirements § 10.2](requirements.md#102-what-the-poc-does-not-guarantee)).
 
 ### ADR-20: How is in-flight work protected without a shared filesystem?
 
-**Decision.** Keep the three-layer model from [ADR-15](#adr-15-how-do-we-protect-data-processing-when-a-worker-pod-crashes),
-but implement each layer with a database mechanism instead of a filesystem convention:
+> **Status: SUPERSEDED (v0.2) by [ADR-15](#adr-15-how-do-we-protect-data-processing-when-a-worker-pod-crashes)
+> and [ADR-21](#adr-21-how-does-work-reach-the-normalizer-pods).**
+> This ADR mapped a durability layer model onto database mechanisms. With no work store, there is no claim, no
+> lease, no acknowledgement, and no reaper to map.
+>
+> **The substitution it performed, one step further.** v0.1 replaced filesystem conventions with database
+> guarantees. v0.2 removes the layer entirely: in-flight work is protected by *not existing inside the scaled
+> workload*. A Normalizer pod holds nothing durable, so pod loss costs one request, which NiFi re-sends.
 
-| Layer | Was (filesystem) | Now (work store) |
+| Layer | v0.1 (filesystem) | v0.1.2 (work store) | **v0.2 (no work store)** |
+| --- | --- | --- | --- |
+| Claim | Atomic rename into `inflight/<pod>/` | `FOR UPDATE SKIP LOCKED` + lease | **None.** The `Service` load-balances a request to one pod; there is nothing to claim |
+| Crash recovery | Reaper returns stale entries | Expired leases reclaimed by the next claim | **NiFi retry** — the request fails and is re-sent ([D-02](requirements.md#7-durability-boundary-and-workload-responsibilities)) |
+| Idempotent output | Temp file + rename | `INSERT … ON CONFLICT DO NOTHING` | **Normalization is a pure function** of its input, so a retry is harmless by construction ([D-03](requirements.md#7-durability-boundary-and-workload-responsibilities)) |
+| Acknowledgement | Delete input after rename | Same transaction as the output | **The HTTP response.** Success or failure is the acknowledgement |
+| Graceful drain | `preStop` stops claiming | Unchanged | Fail readiness, drain in-flight requests, then exit ([D-05](requirements.md#7-durability-boundary-and-workload-responsibilities)) |
+| In-flight count for `pod-deletion-cost` | Count `inflight/` directory | Report claimed-and-unfinished | Report in-flight HTTP requests ([WR-07](requirements.md#workload-signal-requirements-v02)) |
+
+**What this trade actually costs, stated plainly.** v0.1.2 was genuinely stronger on one axis: a claimed item
+could not be lost even if *every* pod died, because the item stayed durably in the store. Under v0.2 a request
+in flight when a pod dies is lost **unless NiFi retries it** — so durability now depends on a component this
+project does not own. That is an acceptable trade only because durability is explicitly not this project's
+subject or claim ([requirements § 7](requirements.md#7-durability-boundary-and-workload-responsibilities)),
+and it is recorded as assumption [A-12](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)
+rather than buried.
+
+**Consequences.** [Q-3](implementation-plan.md#8-open-questions) (reaper as sidecar or CronJob) stays
+dissolved, and the cleanup CronJob that v0.1.2 still needed for pruning `done` rows disappears with the table.
+
+### ADR-21: How does work reach the Normalizer pods?
+
+**Decision.** NiFi sends each unit of work as an **HTTP request** to `normalizer-service`, a ClusterIP
+`Service` that load-balances across the Normalizer pods. The Normalizer normalizes the payload and returns or
+writes the result. There is **no durable work store, message broker, shared filesystem, or object storage**
+between NiFi and the pods.
+
+```mermaid
+flowchart LR
+    NIFI["NiFi 2.6.7<br/>InvokeHTTP · retry · back-pressure"] -->|"HTTP POST: raw data"| SVC["normalizer-service<br/>ClusterIP"]
+    SVC --> P1["Normalizer pod 1"]
+    SVC --> P2["Normalizer pod 2"]
+    SVC --> P3["Normalizer pod 3"]
+    P1 --> OUT["Normalized data"]
+    P2 --> OUT
+    P3 --> OUT
+
+    KSS["KubeScaleSense"] -->|"scale subresource"| SVC
+
+    classDef ctrl fill:#1f6feb,color:#fff,stroke:#0b3d91,stroke-width:2px
+    class KSS ctrl
+```
+
+**Rationale.** The project's subject is a single question: *can the cluster safely accommodate more pods of
+this shape, and should it?* Everything in the pipeline exists only to produce a credible demand signal and a
+credible scaling target. Judged against that purpose, a durable work store was **infrastructure spent on a
+problem the project is not about** — it made the pipeline more defensible and the demonstration no more
+convincing, while adding a database, a schema, a claim protocol, a driver dependency, a tuning constraint, and
+a single point of failure.
+
+An HTTP `Service` is the minimum viable interface that still exhibits every property the demonstration needs:
+
+| Property the demo needs | How the HTTP design provides it |
+| --- | --- |
+| A scaling target with identical, well-defined pod requests | One `Deployment`, one pod template ([A-02](requirements.md#6-workload-and-environment-assumptions)) |
+| Stateless, interchangeable replicas | Any pod can serve any request ([WR-01](requirements.md#workload-signal-requirements-v02)) |
+| Load spread across replicas without coordination | `Service` / kube-proxy load-balancing — no claim protocol needed |
+| A demand signal that rises under load | Queued + in-flight requests, reported by the pods themselves ([ADR-22](#adr-22-where-does-the-workload-pressure-signal-come-from)) |
+| Tolerance of pod loss | Request fails → NiFi retries ([D-02](requirements.md#7-durability-boundary-and-workload-responsibilities)) |
+| Zero new infrastructure | A `Service` is already there; NiFi's `InvokeHTTP` is a standard processor |
+
+**Rejected.**
+
+- **A durable work store (PostgreSQL, the v0.1.2 decision).** Rejected as disproportionate, not as incorrect —
+  the full comparison is retained in [ADR-18](#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline).
+- **Message broker (RabbitMQ / Kafka / Redis Streams).** Native claim, ack, and queue depth, but payloads do
+  not belong in a broker, so a blob store returns and the component count rises.
+- **Shared filesystem (RWX PVC / NFS).** Unavailable by default on kind, and the claim primitive it needs is
+  weaker than it appears ([DR-12](design-review.md#dr-12-the-poc-work-store-cannot-provide-the-claimed-semantics-on-the-proposed-environment)).
+- **Object storage (MinIO / S3).** No atomic rename, so the claim protocol must be rebuilt on conditional
+  writes. Retained as a P5 option *only* if payload size ever forces it
+  ([§10](#10-evolution-to-a-production-controller)).
+- **NiFi writing files for the pods to poll.** Reintroduces shared state and the node-locality problem in
+  exchange for nothing.
+
+**Consequences — the one that matters.** Because work is **pushed**, throughput is bounded by NiFi's
+concurrency *as well as* by replica count. If NiFi dispatches 4 concurrent requests to 8 replicas, half the
+pool idles and the controller's scale-up changes nothing. This is the single real cost of the simplification,
+and it is handled by making it explicit rather than by design:
+
+- Stated as [A-13](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful): NiFi's
+  concurrent-task count must exceed `maxReplicas`.
+- Recorded as [FS-28](failure-scenarios.md#fs-28-adding-replicas-does-not-add-throughput), with the diagnosis
+  that distinguishes it from a capacity shortfall.
+- **Proven by [DI-08](test-plan.md#6-data-integrity-scenarios)**, which measures throughput against replica
+  count and fails if the curve is flat. The property v0.1 tried to guarantee architecturally is now asserted
+  by a test, which is the cheaper and more honest instrument.
+
+Two further consequences: the pipeline has no queue of its own, so **NiFi's queue is the buffer** and its
+back-pressure configuration is the pipeline's real overflow behaviour
+([FS-20](failure-scenarios.md#fs-20-sustained-overload-beyond-cluster-capacity)); and a request in flight when
+a pod dies depends on NiFi retry, per
+[ADR-20](#adr-20-how-is-in-flight-work-protected-without-a-shared-filesystem).
+
+### ADR-22: Where does the workload-pressure signal come from?
+
+**Decision.** From a **replaceable source behind one interface**, not from a named technology. v0.2 defines
+three implementations, selected by `workload.signal.source`:
+
+| Source | Produces | Purpose |
 | --- | --- | --- |
-| Claim | Atomic rename into `inflight/<pod>/` | `FOR UPDATE SKIP LOCKED` + lease |
-| Crash recovery | Reaper returns stale `inflight/` entries | Expired leases are reclaimed by the next claim query — **no reaper process** |
-| Idempotent output | Temp file + rename to final name | `INSERT … ON CONFLICT (item_key) DO NOTHING` |
-| Acknowledgement | Delete input after output rename | Same transaction as the output insert |
-| Graceful drain | `preStop` stops claiming, finishes current item | Unchanged |
-| In-flight count for `pod-deletion-cost` | Pod counts its `inflight/` directory | Pod reports its own claimed-and-unfinished count |
+| `synthetic` (default for P1) | A scripted pressure series from a file or ConfigMap | Build and demonstrate the controller before the pipeline exists; make engine behaviour exactly reproducible |
+| `http` | Outstanding requests scraped from the Normalizer's own metrics endpoint | The real signal for the demo pipeline |
+| `none` | Signal permanently unavailable | Assert the fail-safe path: utilization-only, never a scale-down |
 
-**Rationale.** The *shape* of the durability argument survived review; only its primitive was broken. Keeping
-the layer structure means [D-01…D-07](requirements.md#7-data-loss-protection-assumptions),
-[FS-12](failure-scenarios.md#fs-12-worker-pod-crashes-mid-item), and the data-integrity suite keep their
-identities and their tests — this is an implementation substitution, not a redesign. Two layers get strictly
-stronger (claim and idempotency become database-enforced) and one disappears (the reaper), which is the
-clearest evidence the new primitive is the better fit.
+The primary signal is **outstanding work** — queued plus in-flight requests — because that is the quantity
+`itemsPerReplica` is defined against. Request rate, processing rate, and latency are collected and exported
+but are **not** decision inputs in v0.2 ([FR-39](requirements.md#workload-signal-requirements-v02)).
 
-**Consequences.** [Q-3](implementation-plan.md#8-open-questions) (reaper as sidecar or CronJob) dissolves —
-there is no reaper. A CronJob remains only for **cleanup** of `done` rows and for exporting a stuck-item
-metric, neither of which is on the correctness path.
+**Rationale.** Three reasons, in order of importance:
+
+1. **The controller must not be invalidated by a workload decision.** This is the lesson of
+   [ADR-19](#adr-19-where-does-the-backlog-signal-come-from): binding the demand signal to a specific store
+   meant that removing the store also broke the signal. An interface makes the workload's storage choices
+   irrelevant to the controller, which is where that coupling belonged all along.
+2. **A synthetic source is a feature, not a stub.** An autoscaler's decision logic is a function of a number
+   over time. Being able to *script* that number is how the interesting cases — a spike, a plateau, a sawtooth,
+   a signal that goes silent — become deterministic tests instead of timing-dependent pipeline runs. It also
+   decouples P1 from P2 entirely.
+3. **It is honest about what the POC has measured.** Deriving demand from arrival rate and service time is a
+   better model ([ADR-02](#adr-02-how-should-the-desired-replica-count-be-calculated)), but it needs a measured
+   service-time distribution that does not exist yet. Collecting those signals now, without deciding on them,
+   is what makes the Phase 3 model derivable from data rather than guessed.
+
+**Rejected.** *A specific queue, database, or broker as the sole source* — the coupling that ADR-19 got wrong.
+*Prometheus as a required dependency* — a reasonable production source and a Phase 4 implementation of this
+same interface, but requiring a monitoring stack to make a scaling decision is a heavy dependency for a POC.
+*Deriving pressure from CPU utilization alone* — that is the HPA, and conflating demand with utilization is the
+error [ADR-05](#adr-05-capacity-allocatable-or-requested) exists to avoid.
+
+**Consequences.** The `http` source depends on the Normalizer exposing its own in-flight and queued counts
+([WR-07](requirements.md#workload-signal-requirements-v02)) — a small, natural requirement on a workload that
+wants to be autoscaled. A source failure is `unavailable`, never zero
+([FR-38](requirements.md#workload-signal-requirements-v02),
+[FS-15](failure-scenarios.md#fs-15-metrics-source-unavailable)). And because the default source is synthetic,
+**a demo can lie**: the pressure series is whatever the operator scripted, so any published result must state
+which source produced it. [E2E](test-plan.md#8-end-to-end-scenarios) scenarios therefore run against the
+`http` source, and the synthetic source is confined to unit and integration levels.
 
 ---
 
@@ -1104,7 +1251,9 @@ The POC is intentionally small; each step below is additive and none invalidates
 | Framework | client-go + informers | controller-runtime, once a CRD justifies the scheme/manager machinery |
 | Predicate fidelity | CPU, memory, pod slots, taints, nodeSelector, required node affinity | Add topology spread and hostname anti-affinity; optionally the scheduler framework in-process ([ADR-06](#adr-06-how-do-we-determine-whether-n-additional-pods-are-likely-schedulable)) |
 | Quota | Reactive via Pending watchdog | Proactive `ResourceQuota`/`LimitRange` modelling ([NG-10](requirements.md#3-non-goals)) |
-| Demand model | Backlog + CPU utilization | Drain-time/queueing model using measured service time; SLO-driven target latency |
+| Demand model | Workload pressure + CPU utilization | Drain-time/queueing model using measured service time and arrival rate; SLO-driven target latency |
+| Signal source | `synthetic` or a scrape of the workload's own metrics | Prometheus query, or a queue/broker depth — another implementation of the same interface ([ADR-22](#adr-22-where-does-the-workload-pressure-signal-come-from)) |
+| Workload interface | HTTP request through a `Service` | A durable queue if the workload genuinely needs one; large payloads via the claim-check pattern, references in the request and bytes in object storage ([ADR-21](#adr-21-how-does-work-reach-the-normalizer-pods)) |
 | Capacity shortfall | HOLD + alert | Cooperate with cluster autoscaler: express demand as a pending-capacity signal, then trust it to add nodes |
 | Multi-tenancy | Single namespace | Per-namespace policies, fair-share arbitration between competing workloads |
 | State | In-memory | Status subresource for decision history, so restarts and dashboards share one source of truth |
@@ -1118,9 +1267,11 @@ The POC is intentionally small; each step below is additive and none invalidates
 > here is decided; nothing here is a placeholder. Changing an item requires an amended ADR *before* code, not
 > a commit that quietly diverges.
 >
-> Established by: the [design review](design-review.md) (16 findings, `DR-01`…`DR-16`) and the work-store
-> closure in [ADR-18](#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)…[ADR-20](#adr-20-how-is-in-flight-work-protected-without-a-shared-filesystem).
-> Immutable decisions: [`I-1`…`I-16`](design-review.md#5-immutable-phase-1-decisions).
+> Established by: the [design review](design-review.md) (16 findings, `DR-01`…`DR-16`) and the v0.2
+> simplification in [ADR-21](#adr-21-how-does-work-reach-the-normalizer-pods) and
+> [ADR-22](#adr-22-where-does-the-workload-pressure-signal-come-from), which withdrew
+> [ADR-18](#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline)…[ADR-20](#adr-20-how-is-in-flight-work-protected-without-a-shared-filesystem).
+> Immutable decisions: [`I-1`…`I-19`](design-review.md#5-immutable-phase-1-decisions).
 
 ### 11.1 Deployment topology
 
@@ -1129,10 +1280,10 @@ flowchart TB
     subgraph N1["namespace: data-pipeline"]
         SFTP["sftp<br/>atmoz/sftp · Deployment"]
         NIFI["nifi-0<br/>NiFi 2.6.7 · StatefulSet<br/>repositories on PVCs"]
-        PG[("postgres-0<br/>PostgreSQL 16 · StatefulSet<br/>1 RWO PVC")]
-        PROC["file-processor · Deployment<br/>500m / 512Mi requests<br/>THE SCALING TARGET"]
-        CLEAN["work-store-cleanup<br/>CronJob · done-row pruning"]
+        SVC["normalizer-service<br/>ClusterIP"]
+        NORM["normalizer · Deployment<br/>500m / 512Mi requests<br/>THE SCALING TARGET"]
         GEN["file-generator<br/>Job · spike driver"]
+        BAL["ballast<br/>Deployment · capacity shaping"]
     end
 
     subgraph N2["namespace: kubescalesense"]
@@ -1145,45 +1296,50 @@ flowchart TB
 
     GEN --> SFTP
     SFTP -->|ListSFTP / FetchSFTP| NIFI
-    NIFI -->|PutDatabaseRecord| PG
-    PG <-->|"claim / ack"| PROC
-    CLEAN --> PG
-    PG -.->|"read-only backlog count"| KSS
+    NIFI -->|"InvokeHTTP: raw data"| SVC
+    SVC --> NORM
+    NORM -.->|"pressure: queued + in-flight"| KSS
     MS -.->|"pod CPU / memory"| KSS
-    KSS -->|"scale subresource"| PROC
+    KSS -->|"scale subresource"| NORM
 
     classDef ctrl fill:#1f6feb,color:#fff,stroke:#0b3d91,stroke-width:2px
-    classDef store fill:#6e40c9,color:#fff,stroke:#4c2889
+    classDef target fill:#238636,color:#fff,stroke:#116329
     class KSS ctrl
-    class PG store
+    class NORM target
 ```
 
-Six workloads plus the controller, on a 4-node kind cluster (1 tainted control-plane + 3 workers). No CSI
-driver, no RWX StorageClass, no message broker, no object store, no cloud dependency.
+Five workloads plus the controller, on a 4-node kind cluster (1 tainted control-plane + 3 workers). **No
+database, no message broker, no object store, no shared filesystem, no CSI driver, no RWX StorageClass, no
+cloud dependency.** The only PersistentVolumes in the demo are NiFi's own repositories, which is the one place
+durability is actually required.
 
 ### 11.2 Component inventory and contracts
 
 | Component | Role | Contract it must honour |
 | --- | --- | --- |
-| SFTP server | File drop target | Files are only deleted by NiFi after commit ([D-01](requirements.md#7-data-loss-protection-assumptions)) |
-| NiFi 2.6.7 | Durable ingest buffer; file → records | Repositories on PVCs; `PutDatabaseRecord` into `work_items`; `item_key` is a deterministic idempotency key; PostgreSQL JDBC driver supplied by an init container with a pinned version |
-| PostgreSQL work store | Durable queue + output store + audit ledger | Schema per [ADR-18](#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline); `item_key` unique on both tables; payload `≤ 256 KiB` by `CHECK`; two roles — read/write for workers and NiFi, **read-only** for the controller |
-| `file-processor` | Pull-based worker; the scaling target | Claim via `FOR UPDATE SKIP LOCKED` + lease; output insert and ack in **one transaction**; `preStop` stops claiming and finishes the current item; publishes its in-flight count; identical pod template across all replicas ([A-02](requirements.md#6-workload-and-environment-assumptions)) |
-| KubeScaleSense | Resource-aware scaling decisions | One reason code per reconcile; writes only `spec.replicas` and `pod-deletion-cost`; never deletes pods; holds no write credentials to the work store |
-| Cleanup CronJob | Prunes `done` rows; exports stuck-item count | **Off** the correctness path — its failure must never affect claiming or acking |
+| SFTP server | File drop target | Files are only deleted by NiFi after the flow commits ([D-01](requirements.md#7-durability-boundary-and-workload-responsibilities)) |
+| NiFi 2.6.7 | Durable ingest buffer; file → records → HTTP requests | Repositories on PVCs; `ListSFTP → FetchSFTP → ConvertRecord → InvokeHTTP`; **retry** on non-2xx and timeout with bounded back-off ([D-02](requirements.md#7-durability-boundary-and-workload-responsibilities)); concurrent-task count **greater than `maxReplicas`** ([A-13](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)) |
+| `normalizer-service` | ClusterIP `Service` in front of the pods | Load-balances across **Ready** pods only, so a draining pod stops receiving traffic |
+| `normalizer` | Small stateless HTTP app; **the scaling target** | Stateless per request; normalization is a pure function of input ([WR-03](requirements.md#workload-signal-requirements-v02)); explicit CPU/memory requests, identical across replicas ([A-02](requirements.md#6-workload-and-environment-assumptions)); on `SIGTERM` fail readiness, drain in-flight, exit; publish queued/in-flight counts and latency |
+| KubeScaleSense | Resource-aware scaling decisions | One reason code per reconcile; writes only `spec.replicas` and `pod-deletion-cost`; never deletes pods; **no credentials of any kind** into the workload's data path |
 | `file-generator` / `ballast` | Demand and capacity shaping for scenarios | Deterministic and repeatable; ballast consumes requests but no CPU |
 
 ### 11.3 Data flow, stated precisely
 
 1. `file-generator` writes files to SFTP.
-2. NiFi `ListSFTP → FetchSFTP → ConvertRecord → PutDatabaseRecord` inserts one `work_items` row per record,
-   `status = 'pending'`, and removes the source file only after the insert commits.
-3. Each worker loop iteration claims up to `batchSize` rows (`FOR UPDATE SKIP LOCKED`, lease set), normalizes
-   each item, then commits `INSERT output_records … ON CONFLICT DO NOTHING` together with
-   `UPDATE work_items SET status='done'`.
-4. A worker that dies loses nothing: its rows' leases expire and the next claim query reclaims them.
-5. KubeScaleSense samples the claimable count and pod utilization, computes demand, computes fit capacity,
-   and writes at most one replica change per reconcile.
+2. NiFi `ListSFTP → FetchSFTP → ConvertRecord` splits each file into records and removes the source file only
+   after the flow commits to its repository.
+3. NiFi `InvokeHTTP` posts each record to `normalizer-service`, which routes it to one Ready Normalizer pod.
+4. The pod normalizes the payload and returns the result. A non-2xx response or a timeout sends the FlowFile to
+   NiFi's retry relationship, where it is re-sent after a back-off.
+5. A pod that dies fails its in-flight requests, which NiFi retries against the remaining pods. Nothing durable
+   is lost, because nothing durable lives in the pod.
+6. KubeScaleSense samples the pressure signal and pod utilization, computes demand, computes fit capacity, and
+   writes at most one replica change per reconcile.
+
+Note step 4: **the HTTP response is the acknowledgement.** That is the entire correctness protocol, and it
+replaces a claim, a lease, a transaction, and a reaper
+([ADR-20](#adr-20-how-is-in-flight-work-protected-without-a-shared-filesystem)).
 
 ### 11.4 The three-level capacity discipline
 
@@ -1201,16 +1357,21 @@ ever Pending.
 
 | # | Assumption | Where violated behaviour is documented |
 | --- | --- | --- |
-| A-01…A-07 | Original workload/environment assumptions (identical pod template, declared requests, grace period > item time, …) | [requirements § 6](requirements.md#6-workload-and-environment-assumptions) |
-| A-08…A-12 | Truthful node data, no hard default topology constraints, sole replica writer, fixed node pool, atomic claiming | [requirements § 10.3](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful) |
-| A-13 | **Workers pull.** Throughput is a function of replica count, not of an upstream dispatcher's concurrency setting | [ADR-18](#adr-18-what-is-the-durable-work-store-for-the-poc-pipeline) |
-| A-14 | **The work store is a single point of failure** with node-local storage on kind; its loss stops the pipeline and freezes scaling | [FS-28](failure-scenarios.md#fs-28-work-store-unavailable-or-saturated) |
-| A-15 | **The work store is not the bottleneck.** A single PostgreSQL instance comfortably serves ≤ 12 workers at POC item rates; if it saturates, the backlog signal becomes a measure of database contention rather than of demand | [FS-28](failure-scenarios.md#fs-28-work-store-unavailable-or-saturated) |
-| A-16 | **Items are small and uniform enough** for `itemsPerReplica` to be meaningful (`≤ 256 KiB`, comparable CPU cost) | [R-2](implementation-plan.md#6-risk-register) |
+| A-01…A-07 | Original workload/environment assumptions (stateless per request, identical pod template, declared requests, grace period > request time, …) | [requirements § 6](requirements.md#6-workload-and-environment-assumptions) |
+| A-08…A-11 | Truthful node data, no hard default topology constraints, sole replica writer, fixed node pool | [requirements § 10.3](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful) |
+| A-12 | **NiFi retries failed requests and normalization is idempotent.** The whole durability argument rests on this pair | [requirements § 7](requirements.md#7-durability-boundary-and-workload-responsibilities) |
+| A-13 | **NiFi's request concurrency exceeds `maxReplicas`.** Work is pushed, so the client's concurrency bounds throughput alongside replica count | [ADR-21](#adr-21-how-does-work-reach-the-normalizer-pods), [FS-28](failure-scenarios.md#fs-28-adding-replicas-does-not-add-throughput) |
+| A-14 | **The pressure signal measures outstanding work**, not instantaneous arrivals | [ADR-22](#adr-22-where-does-the-workload-pressure-signal-come-from) |
+| A-15 | **The Normalizer has no hidden shared bottleneck** that would stop replicas converting into throughput | [FS-28](failure-scenarios.md#fs-28-adding-replicas-does-not-add-throughput) |
+| A-16 | **Items are of comparable CPU cost**, so `itemsPerReplica` is meaningful | [R-2](implementation-plan.md#5-risk-register) |
 
 ### 11.6 Explicitly out of scope for Phase 1
 
 CRD; multi-target; scale-to-zero; topology-spread and anti-affinity modelling; quota modelling; hot config
-reload; work-store HA or replication; object-storage payloads (claim-check); message brokers; predictive
-scaling; cooperation with the cluster autoscaler. Each has a documented pick-up trigger in
-[implementation-plan § 7](implementation-plan.md#7-deferred-scope).
+reload; **any durable work store, message broker, object storage, or shared filesystem**; predictive scaling;
+cooperation with the cluster autoscaler. Each has a documented pick-up trigger in
+[implementation-plan § 7](implementation-plan.md#7-deferred-scope-and-when-to-pick-it-up).
+
+The storage-shaped items are listed together deliberately. They were in scope in v0.1.2 and were removed as
+disproportionate ([ADR-21](#adr-21-how-does-work-reach-the-normalizer-pods)); reintroducing one is a change to
+the project's scope, not an implementation detail, and needs a new ADR before code.
