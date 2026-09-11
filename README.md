@@ -6,9 +6,36 @@ KubeScaleSense scales a normalization workload according to incoming demand **wh
 the Kubernetes cluster can actually schedule the additional pods** — preventing the Pending pods, resource
 exhaustion, and processing interruptions that follow from scaling blindly.
 
-> **Status: design phase.** This repository currently contains the engineering design only. No controller
-> code, manifests, or cluster resources have been created yet. See
+> **Status: P0 — Foundation implemented. It does not autoscale anything yet.**
+>
+> | | State |
+> | --- | --- |
+> | **Implemented** | Go module and package layout; configuration schema, defaults, `KSS_*` overrides, and startup validation that refuses unsafe input; structured logging; signal handling and graceful shutdown; build, test, lint, and docs-link checks; container image; skeleton manifests |
+> | **Not implemented** | [P1](docs/implementation-plan.md#p1--observation-dry-run-only) cluster observation and fit-capacity estimation · [P2](docs/implementation-plan.md#p2--demonstration-workload) Normalizer, NiFi, and the demo pipeline · [P3](docs/implementation-plan.md#p3--actuation-and-stability) actuation — **no replica count is ever written today** · [P4](docs/implementation-plan.md#p4--hardening-and-operability-poc-complete) hardening |
+>
+> The P0 binary makes **no Kubernetes API calls at all**: it loads its configuration, logs what it would be
+> configured to do, and waits for a shutdown signal. The RBAC in
+> [`deploy/kubescalesense/`](deploy/kubescalesense/) therefore grants nothing yet, and each deferred
+> permission is listed with the phase that introduces it. See
 > [docs/implementation-plan.md](docs/implementation-plan.md) for the phased build plan.
+
+## Quick start
+
+Requires Go ≥ 1.24. Nothing here contacts a cluster.
+
+```sh
+make build                    # compile into bin/
+make test                     # unit tests, race detector, coverage
+make lint                     # gofmt, go vet, golangci-lint
+make docs-check               # every internal docs link and anchor resolves
+
+# Show the effective configuration surface and validate a config file.
+./bin/kubescalesense -print-env
+./bin/kubescalesense -config config/kubescalesense.yaml -validate
+```
+
+`make demo-up` and `make demo-down` exist but deliberately fail until
+[P2](docs/implementation-plan.md#p2--demonstration-workload) builds the pipeline they would start.
 
 ---
 
@@ -152,29 +179,32 @@ rather than restating it.
 
 ---
 
-## Planned repository layout
+## Repository layout
 
-Created during [P0–P3](docs/implementation-plan.md#3-phase-details); nothing below exists yet.
+Filled in across [P0–P3](docs/implementation-plan.md#3-phase-details). The package boundaries are fixed in P0
+so that later phases add code rather than move it; the packages marked *(stub)* hold a package comment stating
+the phase that implements them and nothing else.
 
 ```text
 cmd/
-  kubescalesense/       # controller entrypoint: config, wiring, leader election
-  normalizer/           # the demo workload: a small stateless HTTP server
+  kubescalesense/       # controller entrypoint: config, logging, lifecycle
+  normalizer/           # (P2) the demo workload: a small stateless HTTP server
 internal/
-  config/               # schema, defaults, validation
-  kubernetes/           # clients, informers, scale writes, events
-  resources/            # node filtering, free-resource math, fit capacity
-  metrics/              # workload-signal sources, pod utilization, staleness
-  scaling/              # pure decision engine: Snapshot -> Decision
-  controller/           # reconcile loop, actuator, pending watchdog
-  observability/        # Prometheus metrics, health, logging
-  normalizer/           # normalization logic, in-flight accounting, drain
-config/                 # kubescalesense.yaml
+  config/               # schema, defaults, KSS_* overrides, validation
+  kubernetes/           # (stub, P1) clients, informers, scale writes, events
+  resources/            # (stub, P1) node filtering, free-resource math, fit capacity
+  metrics/              # (stub, P1) workload-signal sources, pod utilization, staleness
+  scaling/              # (stub, P1) pure decision engine: Snapshot -> Decision
+  controller/           # (stub, P1) reconcile loop, actuator, pending watchdog
+  observability/        # (stub, P1) Prometheus metrics, health, logging
+  normalizer/           # (P2) normalization logic, in-flight accounting, drain
+config/                 # kubescalesense.yaml — the documented defaults
 deploy/
   kubescalesense/       # RBAC, ConfigMap, controller Deployment
-  normalizer/           # Normalizer Deployment + normalizer-service
-  demo/                 # SFTP, NiFi, file generator, ballast
-tests/                  # integration + e2e harness, kind config, scenarios
+  normalizer/           # (P2) Normalizer Deployment + normalizer-service
+  demo/                 # (P2) SFTP, NiFi, file generator, ballast
+hack/                   # linkcheck.py — the docs link and anchor check
+tests/                  # (P1) integration + e2e harness, kind config, scenarios
 docs/                   # this design set
 ```
 
@@ -205,10 +235,10 @@ open questions are resolved or deferred with a stated default, and the settled a
 [architecture § 11](docs/architecture.md#11-phase-1-architecture-baseline). **No Phase 1 blockers remain**
 ([prerequisites](docs/implementation-plan.md#81-prerequisites-for-starting-phase-1-implementation)).
 
-Begin [P0 — Foundation](docs/implementation-plan.md#p0--foundation). The first code milestone is
-[P1](docs/implementation-plan.md#p1--observation-dry-run-only): a controller that computes fit capacity and
-reports the decisions it *would* make, validated by hand against `kubectl describe node` before it is ever
-allowed to write. P1 needs no pipeline at all — the `synthetic` signal source exercises the entire demand
+[P0 — Foundation](docs/implementation-plan.md#p0--foundation) is complete. Next is
+[P1](docs/implementation-plan.md#p1--observation-dry-run-only), the first milestone that observes anything: a
+controller that computes fit capacity and reports the decisions it *would* make, validated by hand against
+`kubectl describe node` before it is ever allowed to write. P1 needs no pipeline at all — the `synthetic` signal source exercises the entire demand
 path — so the Normalizer and NiFi arrive in
 [P2](docs/implementation-plan.md#p2--demonstration-workload), gated on proving that replicas convert into
 throughput.

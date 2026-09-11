@@ -1,0 +1,58 @@
+# golangci-lint configuration (schema v2).
+#
+# A deliberately small set. Every linter here has caught a real class of bug in
+# Go services; the noisy ones (gochecknoglobals, funlen, wsl, and friends) are
+# omitted because a linter that is routinely silenced with nolint stops being
+# a signal.
+
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck      # unchecked errors are the most common real Go bug
+    - govet         # shadowing, printf arity, lock copying
+    - ineffassign   # assignments that are never read
+    - staticcheck   # the broad correctness suite, includes gosimple/stylecheck
+    - unused        # dead code
+    - bodyclose     # leaked HTTP response bodies — relevant from P2's http signal source
+    - errorlint     # %w and errors.Is/As misuse
+    - misspell
+    - nilerr        # returning nil after a non-nil error check
+    - unconvert     # redundant conversions
+    - copyloopvar   # stale loop-variable captures
+
+  settings:
+    errcheck:
+      # Failing to check these is always a bug worth surfacing.
+      check-type-assertions: true
+      check-blank: false
+    staticcheck:
+      checks:
+        - all
+    govet:
+      enable:
+        - shadow
+
+  exclusions:
+    generated: lax
+    rules:
+      # Table-driven tests legitimately ignore errors from helpers that have
+      # already been asserted on, and t.Fatal-style flows make some checks noisy.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - bodyclose
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/jensilin/KubeScaleSense
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

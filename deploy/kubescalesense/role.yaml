@@ -1,0 +1,38 @@
+# Namespaced permissions on the target workload's namespace.
+#
+# PHASE 0 GRANTS NOTHING. See the reasoning in clusterrole.yaml: the Phase 0
+# binary makes no API calls, so least privilege (FR-25) is an empty rule set.
+#
+# Deferred namespaced rules, from the canonical table in
+# docs/architecture.md § 7:
+#
+#   | Resource                 | API group            | Verbs               | Added in | Why                                                         |
+#   |--------------------------|----------------------|---------------------|----------|-------------------------------------------------------------|
+#   | deployments              | apps                 | get, list, watch    | P1       | Spec/status + pod template; rollout and external-write detection (FR-31, FR-32) |
+#   | replicasets              | apps                 | get, list, watch    | P1       | Identify pods of the target's *current* ReplicaSet (DR-09)  |
+#   | horizontalpodautoscalers | autoscaling          | get, list, watch    | P1       | Conflict detection (FR-19)                                  |
+#   | deployments/scale        | apps                 | get, update, patch  | P3       | The one mutation that changes the replica count (FR-01)     |
+#   | pods                     | core                 | patch               | P3       | pod-deletion-cost annotation (FR-21)                        |
+#   | events                   | core / events.k8s.io | create, patch       | P3       | Decision audit trail (FR-24)                                |
+#   | leases                   | coordination.k8s.io  | get, create, update | P4       | Leader election (FR-26)                                     |
+#
+# Note the phase split on `deployments`: the read arrives in P1 so the estimator
+# can be validated against a real cluster in dry-run, while `deployments/scale`
+# is withheld until P3. That ordering is the RBAC expression of the plan's
+# sequencing principle — observe correctly before acting at all — and it means a
+# P1 bug cannot change a replica count even if it tries.
+#
+# `deployments` `update` is never granted, only `deployments/scale`, so a bug
+# cannot rewrite the pod template.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kubescalesense
+  # The namespace of the scaled workload, matching target.namespace in the
+  # ConfigMap. The controller itself runs in the kubescalesense namespace.
+  namespace: data-pipeline
+  labels:
+    app.kubernetes.io/name: kubescalesense
+    app.kubernetes.io/component: controller
+    kubescalesense.io/phase: "P0"
+rules: []

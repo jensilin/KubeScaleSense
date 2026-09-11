@@ -1,0 +1,18 @@
+# Binds the (currently empty) namespaced Role to the controller's
+# ServiceAccount in the target workload's namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kubescalesense
+  namespace: data-pipeline
+  labels:
+    app.kubernetes.io/name: kubescalesense
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubescalesense
+subjects:
+  - kind: ServiceAccount
+    name: kubescalesense
+    namespace: kubescalesense

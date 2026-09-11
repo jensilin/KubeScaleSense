@@ -1,0 +1,21 @@
+# Normalise line endings in the repository to LF.
+#
+# The toolchain is Linux-based (the container build, the Makefile, and CI all
+# run under bash), while development happens on Windows. Without this, a
+# checkout would produce CRLF files that gofmt rejects and that break the
+# Makefile's recipes in ways whose error messages point nowhere near the cause.
+* text=auto eol=lf
+
+*.go      text eol=lf
+*.md      text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.py      text eol=lf
+*.sh      text eol=lf
+Makefile  text eol=lf
+Dockerfile text eol=lf
+go.mod    text eol=lf
+go.sum    text eol=lf
+
+# Keep generated coverage profiles out of diffs when they are inspected.
+coverage.out linguist-generated=true

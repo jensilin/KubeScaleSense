@@ -1,0 +1,85 @@
+# Controller Deployment — Phase 0 skeleton, not applied by any automation.
+#
+# What this pod does today: loads and validates its configuration, logs the
+# result, and waits for SIGTERM. It makes no Kubernetes API calls and scales
+# nothing. Its value in Phase 0 is that the manifest, image, security context,
+# and config mount are reviewable and correct before any behaviour depends on
+# them.
+#
+# replicas is 1 and stays 1 until P4 adds leader election (FR-26). Two replicas
+# without a Lease would be two controllers writing the same replica count.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubescalesense
+  namespace: kubescalesense
+  labels:
+    app.kubernetes.io/name: kubescalesense
+    app.kubernetes.io/component: controller
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubescalesense
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kubescalesense
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: kubescalesense
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: kubescalesense:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - -config
+            - /etc/kubescalesense/kubescalesense.yaml
+          env:
+            # Phase 0 consumes no workload signal at all. The config file keeps
+            # the documented default of `synthetic`, and this override switches
+            # it off so the pod does not require a scripted pressure series
+            # that only P1 knows how to interpret. Remove this in P1, when
+            # internal/metrics gains the synthetic source and the series format
+            # is defined.
+            - name: KSS_WORKLOAD_SIGNAL_SOURCE
+              value: "none"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop:
+                - ALL
+          # Modest but real: the controller is a single-threaded loop over
+          # informer caches. Requests are set equal to limits for memory so the
+          # pod is Guaranteed for memory and cannot be evicted ahead of the
+          # workload it is meant to be protecting.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 64Mi
+          # No probes yet: controller.healthAddr is validated but not served
+          # until P1 adds internal/observability. A probe pointing at a port
+          # nothing listens on would crash-loop a working pod, so the ports and
+          # probes are added together with the handler.
+          volumeMounts:
+            - name: config
+              mountPath: /etc/kubescalesense
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: kubescalesense-config
+      terminationGracePeriodSeconds: 30

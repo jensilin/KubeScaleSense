@@ -1,0 +1,20 @@
+# Build artefacts
+/bin/
+/dist/
+
+# Test and coverage output
+coverage.out
+coverage.html
+*.test
+
+# Local overrides: a developer's own config must never be committed, so that
+# the file in config/ stays the documented default set.
+/config/local.yaml
+*.local.yaml
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

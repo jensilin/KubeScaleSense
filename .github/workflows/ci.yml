@@ -1,0 +1,129 @@
+# CI skeleton, following the pipeline in docs/test-plan.md section 10:
+#
+#   lint -> unit -> coverage gate -> integration -> build+image -> e2e
+#
+# The jobs that exist here are the ones that have something to run today: lint,
+# unit, and build. The integration (envtest), image, and e2e (kind) stages are
+# named in the test plan and are deliberately absent rather than stubbed — a
+# green check for a suite that does not exist is worse than no check, because it
+# is the one people trust.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.27"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+      # The design set is heavily cross-referenced, so broken anchors are a
+      # build failure (test-plan section 10).
+      - name: docs link check
+        run: python3 hack/linkcheck.py
+
+  unit:
+    name: unit
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: go mod verify
+        run: |
+          go mod download
+          go mod verify
+
+      - name: test
+        run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: coverage summary
+        run: go tool cover -func=coverage.out
+
+      # The test plan gates coverage on internal/scaling and internal/resources
+      # only, because that is where the correctness lives. Both packages are
+      # placeholders until P1, so the gate is wired up but not yet enforced.
+      - name: coverage gate (enabled in P1)
+        run: |
+          echo "The >=90% gate on internal/scaling and internal/resources activates in P1,"
+          echo "when those packages gain their first real code. See docs/test-plan.md section 10."
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: build
+        run: make build
+
+      # Proves the binary rejects a bad config with a non-zero exit, which is
+      # the P0 exit criterion that a unit test alone cannot demonstrate.
+      - name: reject an invalid configuration
+        run: |
+          printf 'target:\n  namespace: ns\n  deployment: d\n  minReplicas: 9\n  maxReplicas: 2\n' > /tmp/bad.yaml
+          if ./bin/kubescalesense -config /tmp/bad.yaml -validate; then
+            echo "::error::an invalid configuration was accepted"
+            exit 1
+          fi
+          echo "invalid configuration correctly rejected with a non-zero exit"
+
+      - name: accept the shipped configuration
+        env:
+          KSS_WORKLOAD_SIGNAL_SOURCE: none
+        run: ./bin/kubescalesense -config config/kubescalesense.yaml -validate

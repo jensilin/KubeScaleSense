@@ -1,0 +1,77 @@
+# The controller's configuration, mounted read-only at
+# /etc/kubescalesense/kubescalesense.yaml.
+#
+# This is a copy of config/kubescalesense.yaml. Config is immutable at runtime
+# in this version (CR-3): editing this ConfigMap requires a pod restart, which
+# is why the Deployment does not watch it.
+#
+# It contains no credentials, and the schema has no field that could hold one
+# (CR-5). Unknown keys are rejected at startup, so a `password:` added here
+# fails the pod rather than being silently ignored.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubescalesense-config
+  namespace: kubescalesense
+  labels:
+    app.kubernetes.io/name: kubescalesense
+    app.kubernetes.io/component: controller
+data:
+  kubescalesense.yaml: |
+    controller:
+      interval: 15s
+      leaderElection: true
+      dryRun: false
+      metricsAddr: ":8080"
+      healthAddr: ":8081"
+      logLevel: info
+      logFormat: json
+
+    target:
+      namespace: data-pipeline
+      deployment: normalizer
+      minReplicas: 1
+      maxReplicas: 12
+
+    workload:
+      itemsPerReplica: 50
+      targetCPUUtilizationPercent: 70
+      metricsStaleAfter: 60s
+      podWarmupPeriod: 60s
+      backlogSmoothing:
+        mode: ewma
+        alpha: 0.4
+      signal:
+        source: synthetic
+        endpoint: ""
+        timeout: 3s
+        syntheticPath: /etc/kubescalesense/pressure.yaml
+
+    resources:
+      perNodeReserveCPUMilli: 200
+      perNodeReserveMemoryMiB: 256
+      fitCapacityMarginPods: 1
+      respectNodeSelector: true
+      respectNodeAffinity: true
+      respectTaints: true
+      nodeLabelSelector: ""
+
+    scaling:
+      scaleUpCooldown: 60s
+      scaleDownCooldown: 300s
+      scaleDownStabilizationWindow: 300s
+      scaleDownWindowCoverage: 0.8
+      tolerancePercent: 10
+      maxScaleUpStep: 4
+      maxScaleDownStep: 1
+      allowPartialScaleUp: true
+      externalChangeTolerance: 3
+      holdBackoff:
+        initial: 30s
+        max: 15m
+        factor: 2.0
+
+    pending:
+      pendingPodTimeout: 120s
+      onPendingTimeout: revert
+      podStartupTimeout: 300s

@@ -1,0 +1,20 @@
+# Binds the (currently empty) ClusterRole to the controller's ServiceAccount.
+#
+# The binding is created in Phase 0 even though the role grants nothing, so that
+# the wiring is reviewable now and later phases add rules to one place rather
+# than introducing a new binding under time pressure.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kubescalesense
+  labels:
+    app.kubernetes.io/name: kubescalesense
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubescalesense
+subjects:
+  - kind: ServiceAccount
+    name: kubescalesense
+    namespace: kubescalesense

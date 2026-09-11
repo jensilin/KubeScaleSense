@@ -1,0 +1,73 @@
+# config/kubescalesense.yaml — all values shown are the defaults
+#
+# Canonical schema: docs/requirements.md § 8. Every key here is validated at
+# startup and the controller exits non-zero on invalid input (CR-2).
+#
+# Any key may be overridden by an environment variable named KSS_ plus the
+# upper-cased path, e.g. KSS_SCALING_SCALEUPCOOLDOWN. Run
+# `kubescalesense -print-env` for the full list.
+#
+# This file contains no credentials and the schema has no field to hold any:
+# the workload-pressure signal is generated locally or scraped over in-cluster
+# HTTP, so there is no database role, broker user, or API token (CR-5, FR-37).
+# Unknown keys are rejected at startup, so adding one fails loudly.
+
+controller:
+  interval: 15s                 # reconcile period
+  leaderElection: true
+  dryRun: false
+  metricsAddr: ":8080"
+  healthAddr: ":8081"
+  logLevel: info                # debug|info|warn|error
+  logFormat: json
+
+# target has no defaults: a minimal config specifies only this block (CR-1).
+target:
+  namespace: data-pipeline
+  deployment: normalizer        # the Normalizer Deployment behind normalizer-service
+  minReplicas: 1
+  maxReplicas: 12
+
+workload:
+  itemsPerReplica: 50           # outstanding work items one replica is expected to hold
+  targetCPUUtilizationPercent: 70   # of the pod's CPU *request*
+  metricsStaleAfter: 60s
+  podWarmupPeriod: 60s          # pods Ready for less than this are excluded from the utilization average
+  backlogSmoothing:
+    mode: ewma                  # none | ewma
+    alpha: 0.4
+  signal:
+    source: synthetic           # synthetic | http | none  (FR-36; replaceable by design)
+    endpoint: ""                # http source: Normalizer metrics endpoint, e.g.
+                                # http://normalizer-service.data-pipeline.svc.cluster.local:9090/metrics
+    timeout: 3s                 # per-scrape timeout; expiry => unavailable, never zero (FR-38)
+    syntheticPath: /etc/kubescalesense/pressure.yaml   # scripted series for source: synthetic
+
+resources:
+  perNodeReserveCPUMilli: 200   # safety margin left free on every candidate node
+  perNodeReserveMemoryMiB: 256
+  fitCapacityMarginPods: 1      # subtracted from total computed fit capacity
+  respectNodeSelector: true
+  respectNodeAffinity: true     # required-during-scheduling only
+  respectTaints: true
+  nodeLabelSelector: ""         # optional extra restriction of the candidate node set
+
+scaling:
+  scaleUpCooldown: 60s
+  scaleDownCooldown: 300s
+  scaleDownStabilizationWindow: 300s
+  scaleDownWindowCoverage: 0.8  # fraction of expected window samples required before scaling down
+  tolerancePercent: 10          # deadband around current replicas
+  maxScaleUpStep: 4
+  maxScaleDownStep: 1
+  allowPartialScaleUp: true
+  externalChangeTolerance: 3    # replica changes by others, per window, before refusing to act
+  holdBackoff:
+    initial: 30s
+    max: 15m
+    factor: 2.0
+
+pending:
+  pendingPodTimeout: 120s       # unschedulable pod -> remediation
+  onPendingTimeout: revert      # revert | freeze | none
+  podStartupTimeout: 300s       # scheduled but not Ready -> block scale-ups (no auto-remediation)

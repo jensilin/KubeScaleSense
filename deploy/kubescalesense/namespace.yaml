@@ -1,0 +1,9 @@
+# The controller runs in its own namespace, separate from the workload it
+# scales, so that a ResourceQuota or disruption in the data-pipeline namespace
+# cannot take the controller down with it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kubescalesense
+  labels:
+    app.kubernetes.io/name: kubescalesense

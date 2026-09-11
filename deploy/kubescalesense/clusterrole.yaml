@@ -1,0 +1,36 @@
+# Cluster-scoped permissions for the controller.
+#
+# PHASE 0 GRANTS NOTHING, AND THAT IS NOT AN OVERSIGHT.
+#
+# cmd/kubescalesense makes no Kubernetes API calls in Phase 0: it loads config,
+# logs, waits for a signal, and exits. Least privilege (FR-25) therefore means
+# an empty rule set, and each rule below is added in the phase that first needs
+# it, together with the code that uses it and the test that covers it.
+#
+# Granting P1/P3 permissions now would mean a ServiceAccount that can read every
+# pod in the cluster months before anything reads one — and an empty `rules`
+# list is a far louder signal in review than a commented-out block.
+#
+# Deferred cluster-scoped rules, from the canonical table in
+# docs/architecture.md § 7 ("Kubernetes permissions and RBAC"):
+#
+#   | Resource        | API group    | Verbs            | Added in | Why                                          |
+#   |-----------------|--------------|------------------|----------|----------------------------------------------|
+#   | nodes           | core         | get, list, watch | P1       | Allocatable, taints, labels (FR-11, FR-12)   |
+#   | pods            | core         | get, list, watch | P1       | Sum requests per node, across all namespaces |
+#   | nodes, pods     | metrics.k8s.io | get, list      | P1       | Utilization signal (FR-07)                   |
+#
+# Deliberately never granted, in any phase:
+#   - delete on pods: scale-down goes through the ReplicaSet controller so that
+#     graceful termination applies (D-05). Direct deletion would bypass it.
+#   - any write to nodes: no cordon, no taint, no eviction.
+#   - secrets: nothing to read (CR-5).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubescalesense
+  labels:
+    app.kubernetes.io/name: kubescalesense
+    app.kubernetes.io/component: controller
+    kubescalesense.io/phase: "P0"
+rules: []
