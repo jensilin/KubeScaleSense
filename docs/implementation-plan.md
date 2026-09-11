@@ -140,10 +140,12 @@ gantt
 - `Makefile` (`build`, `test`, `lint`, `demo-up`, `demo-down`), `Dockerfile` (distroless, non-root),
   `.golangci.yml`.
 - CI skeleton per [test-plan § 10](test-plan.md#10-ci-pipeline), including the markdown link check over `docs/`.
-- `deploy/kubescalesense/` skeleton: ServiceAccount, Role/ClusterRole per
-  [architecture § 7](architecture.md#7-kubernetes-permissions-and-rbac), ConfigMap, Deployment (not yet
-  applied). No `Secret` is created in this phase or any later one — the controller has no workload credentials
-  to hold ([CR-5](requirements.md#8-configuration-requirements)).
+- `deploy/kubescalesense/` skeleton: ServiceAccount, ClusterRole, Role, their bindings, ConfigMap, Deployment
+  (not yet applied). The two roles ship with **empty rule sets**: P0 makes no API call, so least privilege
+  ([FR-25](requirements.md#4-functional-requirements)) grants nothing, and every rule from
+  [architecture § 7](architecture.md#7-kubernetes-permissions-and-rbac) is instead listed in the manifest
+  against the phase that introduces it. No `Secret` is created in this phase or any later one — the controller
+  has no workload credentials to hold ([CR-5](requirements.md#8-configuration-requirements)).
 
 **Exit criteria**
 
@@ -153,9 +155,15 @@ gantt
 
 **Not in this phase.** Any Kubernetes API call.
 
-**Prerequisite note.** The development machine currently has neither Go nor `kubectl`/`kind` installed;
-installing the toolchain is the first P0 task. That list is now shorter than it was in v0.1.2: no PostgreSQL
-image and no pinned JDBC driver.
+**Status: complete.** The exit criteria above are met: `go build ./...`, `go test ./...`, `make build`,
+`make test`, `make lint`, the docs link check, and the container image build all pass, and a deliberately
+broken config is rejected with a non-zero exit and a message naming the offending key, its value, the
+constraint, and the override variable.
+
+**Environment.** The toolchain is installed: Go 1.27.1 (the module targets Go ≥ 1.24), Docker, `kubectl`,
+`make`, and `golangci-lint`, under WSL 2. `kind` is the one item still outstanding; it is first needed by the
+P1 manual validation gate below, not by P0. Either way the list is shorter than it was in v0.1.2: no
+PostgreSQL image and no pinned JDBC driver.
 
 ---
 
@@ -509,7 +517,7 @@ Every item is satisfied or explicitly scheduled; none is outstanding.
 | 5 | Design-review findings folded in, each with an owning test | **Done** — `DR-01`…`DR-16`, [test-plan § 11](test-plan.md#11-traceability-matrix) |
 | 6 | Immutable decisions recorded, so implementation cannot drift silently | **Done** — [`I-1`…`I-16`](design-review.md#5-immutable-phase-1-decisions), plus `I-20`…`I-22` for v0.2; `I-17`…`I-19` are superseded and marked as such |
 | 7 | Config schema frozen for P0 (keys, defaults, validation rules) | **Done** — [requirements § 8](requirements.md#8-configuration-requirements), now including `workload.signal.*` in place of `workload.workStore.*` |
-| 8 | Toolchain: Go ≥ 1.24, kind ≥ 0.23, kubectl ≥ 1.29, Docker, `make` | **Environment task in P0** — [test-plan § 7.3](test-plan.md#73-prerequisites). No database image and no JDBC driver, so the toolchain is now the Go/Kubernetes basics and nothing else |
+| 8 | Toolchain: Go ≥ 1.24, kind ≥ 0.23, kubectl ≥ 1.29, Docker, `make` | **Done except `kind`** — Go 1.27.1, Docker, `kubectl`, `make`, and `golangci-lint` are installed; `kind` is first needed by the P1 validation gate, not by P0 ([test-plan § 7.3](test-plan.md#73-prerequisites)). No database image and no JDBC driver, so the toolchain is the Go/Kubernetes basics and nothing else |
 | 9 | RBAC set final, including the `replicasets` read added by review | **Done** — [architecture § 7](architecture.md#7-kubernetes-permissions-and-rbac) |
 | 10 | CI shape decided (kind on hosted runners, E2E label-gated) | **Done** — Q-7 |
 
