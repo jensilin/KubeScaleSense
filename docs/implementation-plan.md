@@ -78,9 +78,9 @@ flowchart LR
 
 | Phase | Goal | Effort | Cumulative capability |
 | --- | --- | --- | --- |
-| **P0** | Foundation: module, layout, config, CI | ~1 week | Builds, validates config, refuses bad input |
-| **P1** | Observation: fit capacity + demand + decisions, dry-run | ~2 weeks | Reports what it *would* do; estimator verified by hand |
-| **P2** | Demonstration workload | ~1 week | Real pipeline normalizes files over HTTP; pressure signal live; `itemsPerReplica` measured |
+| **P0** ✅ | Foundation: module, layout, config, CI | ~1 week | Builds, validates config, refuses bad input |
+| **P1** ✅ | Observation: fit capacity + demand + decisions, dry-run | ~2 weeks | Reports what it *would* do; estimator verified by hand |
+| **P2** ✅ | Demonstration workload | ~1 week | Real pipeline normalizes files over HTTP; pressure signal live; `itemsPerReplica` **still to be measured** ([as built](#p2-as-built-deviations-from-the-plan)) |
 | **P3** | Actuation and stability | ~2 weeks | Actually scales, safely; the demo works end to end |
 | **P4** | Hardening and operability | ~1.5 weeks | **POC complete**: HA, dashboards, full test matrix, runbook |
 | P5 | Production evolution | open-ended | CRD, higher predicate fidelity, quota, multi-target |
@@ -225,6 +225,12 @@ scale anything.
 
 ### P2 — Demonstration workload
 
+> **Status: implemented, with two exit criteria outstanding.** The pipeline, the Normalizer, the load
+> generator, the `http` signal source, and the kind environment all exist and are tested. What is *not* done
+> is the part that requires actually running the cluster: `itemsPerReplica` is still a guess and `DI-08` has
+> not been executed, because `kind` is not installed in the development environment
+> ([§ as built](#p2-as-built-deviations-from-the-plan)). Both gate P3.
+
 **Goal.** A real pipeline whose pressure signal is a genuine demand signal, and a cluster topology in which
 resource exhaustion is reachable on purpose.
 
@@ -290,6 +296,37 @@ controller demonstrating nothing, however correct its arithmetic
 
 **Not in this phase.** Any scaling. The replica count is set by hand throughout P2 — which is exactly what
 makes the `itemsPerReplica` measurement and the DI-08 throughput curve clean.
+
+<a id="p2-as-built-deviations-from-the-plan"></a>
+
+#### P2 as built — deviations from the plan
+
+Five things differ from the deliverables above. Each is recorded here rather than quietly absorbed, because a
+plan that gets edited to match the implementation stops being able to tell anyone what was traded away.
+
+| Planned | Built | Why |
+| --- | --- | --- |
+| `atmoz/sftp` container, `ListSFTP` → `FetchSFTP` | A local input directory, `ListFile` → `FetchFile`, with the SFTP mapping documented as a two-processor swap | An SFTP server needs an account, and committing one to this repository would trade the project's no-credentials property for convenience. Everything downstream of the fetch is byte-identical either way, so the swap costs nothing the demo depends on ([deploy/demo](../deploy/demo/README.md)) |
+| `file-generator` Job | `tests/demo/loadgen`, run as a sidecar in the NiFi pod over a shared `emptyDir`, and as a Job for the direct-HTTP mode | A Job writing into a directory NiFi reads needs a shared volume, and [ADR-13](architecture.md#adr-13-what-happens-if-a-newly-created-pod-stays-pending) forbids RWX. Two containers in one pod sharing an `emptyDir` is the only way to share a directory without one |
+| `SplitRecord` | `SplitText` with a line split count of 1 | `SplitRecord` needs a reader and writer controller service and a schema; the input is one record per line, so the schema machinery buys nothing here |
+| Single `/metrics` scrape of `normalizer-service` | A second, **headless** `normalizer-metrics` Service, and a source that resolves it and scrapes every Ready pod | Pressure is queued + in-flight **summed over pods**. A ClusterIP scrape returns one pod's numbers, under-reporting total pressure by roughly the replica count — correct-looking at one replica and wrong at every other, in the direction that causes scale-down under load |
+| NiFi flow verified by importing it | Flow definition shipped and its invariants machine-checked as a file (`tests/demo/nififlow`) plus against a live instance at demo time (`tests/e2e/assert-nifi-flow.sh`) | `kind` is not installed in this environment, so NiFi has never been started here. "NiFi accepts this JSON" is therefore **unverified**; the runbook says so and gives the processor/property table as the manual fallback |
+
+**Still open, and gating P3:**
+
+- **`itemsPerReplica` is a guess.** `deploy/demo/kubescalesense-configmap.yaml` sets 12 on the reasoning that
+  a pod has four processing slots. The exit criterion asks for a *measurement* — the pressure level at which
+  per-request latency reaches the SLO at a fixed replica count — and that needs a running cluster.
+- **`DI-08` has not run.** The throughput-versus-replicas curve is the gate on the entire premise: if
+  throughput does not respond to replica count, the controller is demonstrating nothing however correct its
+  arithmetic ([FS-28](failure-scenarios.md#fs-28-adding-replicas-does-not-add-throughput)). It needs
+  `kind` ≥ 0.23 and roughly 6 GiB of memory.
+
+What *was* verified without a cluster: the Normalizer's normalization purity, capacity enforcement, queue
+shedding and drain order; the `http` source's pod fan-out, all-or-nothing sampling, staleness stamping,
+counter-reset handling and unavailable-not-zero semantics; the load generator's determinism; and the
+end-to-end decision path — a spike raising real pressure through real HTTP requests, producing a scale-up
+decision, with the replica count unchanged (`tests/demo/pipeline`).
 
 ---
 

@@ -1,0 +1,60 @@
+# Normalizer configuration, consumed with envFrom.
+#
+# These values define what the demonstration measures, so each one is chosen
+# rather than defaulted. Changing them is how a scenario is set up; changing
+# them without understanding them is how a demo stops meaning anything.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: normalizer-config
+  namespace: data-pipeline
+  labels:
+    app.kubernetes.io/name: normalizer
+    app.kubernetes.io/component: workload
+    app.kubernetes.io/part-of: kubescalesense-demo
+data:
+  NORMALIZER_ADDR: ":8080"
+  NORMALIZER_ADMIN_ADDR: ":8081"
+
+  # The CPU cost per record: the dial that converts an arrival rate into a
+  # replica requirement.
+  #
+  # 250000 rounds of SHA-256 is roughly 100–200 ms of CPU on a kind worker, so
+  # a pod with 4 slots sustains something like 20–40 records per second. That
+  # rate is the basis of itemsPerReplica, which is why the P2 exit criteria
+  # require it to be *measured* on the demo cluster rather than trusted from
+  # this comment (implementation-plan, P2 exit criteria).
+  NORMALIZER_COST_ROUNDS: "250000"
+
+  # No artificial latency by default. This is not the CPU dial — a sleeping pod
+  # has no utilization — and exists only so DI-05 can place processing time
+  # either side of terminationGracePeriodSeconds.
+  NORMALIZER_PROCESSING_DELAY: "0s"
+
+  # 4 concurrent records against a 500m request and a 2000m limit: the pod can
+  # genuinely use more than it reserved, so a spike is visible as utilization
+  # rather than only as queue depth.
+  NORMALIZER_MAX_CONCURRENT: "4"
+
+  # 64 waiting records per pod. Deep enough that a burst queues instead of
+  # being shed — queueing is the signal the controller reads — and shallow
+  # enough that a sustained overload sheds to NiFi, where the durable buffer
+  # is (D-02, FS-20).
+  NORMALIZER_QUEUE_LIMIT: "64"
+
+  # A record waits at most 10s for a slot. This must stay *below* NiFi's
+  # InvokeHTTP response timeout, or NiFi retries a record that is still queued
+  # here and the pool does duplicate work exactly when it is most saturated
+  # (FS-29).
+  NORMALIZER_QUEUE_TIMEOUT: "10s"
+
+  NORMALIZER_MAX_BODY_BYTES: "65536"
+  NORMALIZER_READ_HEADER_TIMEOUT: "5s"
+
+  # The drain sequence. DRAIN_DELAY covers eventually-consistent endpoint
+  # removal — kube-proxy on another node keeps routing here for a moment after
+  # readiness fails — and SHUTDOWN_TIMEOUT bounds the drain of in-flight
+  # records. Their sum must stay under the Deployment's
+  # terminationGracePeriodSeconds of 45s (WR-06, A-07).
+  NORMALIZER_DRAIN_DELAY: "5s"
+  NORMALIZER_SHUTDOWN_TIMEOUT: "30s"

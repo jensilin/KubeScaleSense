@@ -1,0 +1,11 @@
+# The demonstration pipeline's namespace.
+#
+# Separate from the controller's namespace so that the two can be deleted
+# independently, and so that a ResourceQuota can be applied to the workload
+# without constraining the controller that observes it (E2E-08).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: data-pipeline
+  labels:
+    app.kubernetes.io/part-of: kubescalesense-demo

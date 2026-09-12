@@ -1,0 +1,43 @@
+# The demonstration cluster.
+#
+# Four nodes, deliberately unequal. The interesting behaviour of this project —
+# HOLD instead of Pending — only exists in a cluster that can run out of room,
+# so the topology's job is to make resource exhaustion reachable on purpose
+# (test-plan § 7.1).
+#
+# This cluster is created by name and is entirely separate from any other
+# Kubernetes cluster on the host. `make demo-up` and `make demo-down` act only
+# on the context `kind-kubescalesense-demo` and refuse to run against anything
+# else.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: kubescalesense-demo
+nodes:
+  # The control-plane carries the standard NoSchedule taint, which is what
+  # makes it a *test case*: it must be excluded from the candidate set, and a
+  # fit calculation that counted its free capacity would be wrong in the most
+  # expensive possible way (resource-calculation, check C3).
+  - role: control-plane
+
+  # worker: the small node. The kubelet reserves a full CPU and 1Gi from
+  # allocatable, so it has room for roughly one 500m Normalizer once the
+  # ballast has taken its share. Shrinking allocatable rather than only using
+  # ballast means the node is genuinely small, so `kubectl describe node`
+  # corroborates the demo instead of merely agreeing with it.
+  - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: KubeletConfiguration
+        systemReserved:
+          cpu: "1"
+          memory: "1Gi"
+        maxPods: 40
+
+  # worker2: the roomy node. Room for about four Normalizers, which is where a
+  # feasible scale-up lands (E2E-01).
+  - role: worker
+
+  # worker3: filled by ballast at demo-up time, so free CPU exists in the
+  # cluster while nothing fits on this node. That contradiction, stated
+  # correctly by two metrics that disagree, is E2E-04.
+  - role: worker

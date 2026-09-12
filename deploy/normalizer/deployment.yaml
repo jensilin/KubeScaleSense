@@ -1,0 +1,121 @@
+# Normalizer Deployment — the scaling target.
+#
+# This is the workload KubeScaleSense observes. In P2 it is observed and
+# nothing else: the controller runs in dry-run and writes no replica count, so
+# replicas stays where a human put it. P3 owns actuation.
+#
+# replicas is 1 deliberately, and the demo narrative starts from 1. Every
+# scenario in test-plan § 7.4 begins by declaring a capacity state and a
+# demand, and a starting replica count that drifts between runs makes the
+# resulting reason-code sequence unreproducible.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: normalizer
+  namespace: data-pipeline
+  labels:
+    app.kubernetes.io/name: normalizer
+    app.kubernetes.io/component: workload
+    app.kubernetes.io/part-of: kubescalesense-demo
+spec:
+  replicas: 1
+  # RollingUpdate with the default surge would let a rollout add a pod that the
+  # controller's fit capacity did not account for. The controller already holds
+  # during a rollout (FR-32), and Recreate keeps the pod count during a rollout
+  # unambiguous while the demo is running.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: normalizer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: normalizer
+        app.kubernetes.io/component: workload
+        app.kubernetes.io/part-of: kubescalesense-demo
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: normalizer
+          image: normalizer:dev
+          imagePullPolicy: IfNotPresent
+          # Every setting comes from the ConfigMap, so the workload is retuned
+          # by editing one object and restarting the pods — no rebuilt image
+          # and no edited manifest, which matters because the demo tunes the
+          # cost per record to reach a chosen replica count.
+          envFrom:
+            - configMapRef:
+                name: normalizer-config
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: admin
+              containerPort: 8081
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop:
+                - ALL
+          # These numbers are the input to the entire feasibility calculation:
+          # fit capacity is computed from this pod's *requests* against each
+          # node's free allocatable, so changing them changes every number the
+          # demo shows (resource-calculation § 3, A-02, A-03, WR-04).
+          #
+          # 500m / 512Mi is the documented target shape. It is small enough
+          # that several pods fit on a kind worker — the demo needs room for
+          # ~4 on one node — and large enough that a ballasted node genuinely
+          # cannot take another one, which is the state the whole project
+          # exists to handle.
+          #
+          # The CPU limit is 4x the request on purpose: the pod is Burstable
+          # for CPU so a spike can actually consume more than it reserved,
+          # which is what makes utilization rise and fall visibly. The memory
+          # limit equals its request, so the pod is never the reason a node
+          # goes under memory pressure — a normalizer that ballooned would
+          # evict its own peers and corrupt the demonstration (D-07).
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: 2000m
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 2
+            failureThreshold: 15
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: admin
+            periodSeconds: 10
+            failureThreshold: 3
+          # Readiness is the mechanism that makes scale-down safe: it fails the
+          # instant SIGTERM arrives, so the Service withdraws this pod before
+          # it stops accepting records (WR-06, D-05, FS-14).
+          #
+          # periodSeconds is short because the drain delay is only a few
+          # seconds; a slow readiness probe would let the endpoint linger for
+          # longer than the pod is willing to wait.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: admin
+            periodSeconds: 2
+            failureThreshold: 1
+      # Must exceed NORMALIZER_DRAIN_DELAY + NORMALIZER_SHUTDOWN_TIMEOUT, or
+      # SIGKILL arrives mid-drain and the in-flight records are cut off — the
+      # A-07 violation DI-05 exists to make observable rather than silent.
+      terminationGracePeriodSeconds: 45

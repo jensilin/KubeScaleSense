@@ -71,6 +71,17 @@ var packagesAllowedAClient = map[string]bool{
 	"internal/metrics":       false,
 	"internal/observability": false,
 	"internal/config":        false,
+
+	// The workload and the demo tooling, added in P2. `false` here is a
+	// stronger statement than it is for the controller's packages: those may
+	// not hold a *client*, while these may not talk to Kubernetes at all. A
+	// Normalizer that reads the API stops being a workload that happens to be
+	// autoscaled and becomes part of the autoscaler
+	// (WR-01), and a load generator that can scale a Deployment could quietly
+	// produce the very effect P2 exists to demonstrate is absent.
+	"cmd/normalizer":      false,
+	"internal/normalizer": false,
+	"tests/demo/loadgen":  false,
 }
 
 // The interface the controller is given must have no way to write. Asserted by
@@ -299,7 +310,11 @@ func forEachGoFile(t *testing.T, root string, visit func(path string, file *ast.
 	fset := token.NewFileSet()
 	visited := 0
 
-	for _, dir := range []string{"cmd", "internal"} {
+	// tests/ is swept too, from P2 onwards: the demo tooling runs against a
+	// real cluster, which makes it the most plausible place for a Kubernetes
+	// client to appear "just for setup" — and a generator that can scale the
+	// target would invalidate every observation made about it.
+	for _, dir := range []string{"cmd", "internal", "tests"} {
 		err := filepath.WalkDir(filepath.Join(root, dir), func(path string, entry os.DirEntry, err error) error {
 			if err != nil {
 				return err

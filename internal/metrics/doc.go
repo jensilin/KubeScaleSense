@@ -23,7 +23,10 @@
 // busy system to the floor during a monitoring outage, and it is the single
 // most important thing this package does not do (FR-38, I-7).
 //
-// Phase 1 implements the `synthetic` and `none` sources, which is enough to
+// Phase 1 implemented the `synthetic` and `none` sources, which was enough to
 // exercise the entire demand path — including staleness and unavailability —
-// before the demonstration pipeline exists. The `http` source arrives in P2.
+// before the demonstration pipeline existed. Phase 2 adds `http`, which scrapes
+// the Normalizer's own exposition and sums queued + in-flight records over every
+// pod. Summing over pods rather than over one Service-balanced response is the
+// detail that makes the number mean what it says.
 package metrics

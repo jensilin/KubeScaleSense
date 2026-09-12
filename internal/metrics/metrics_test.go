@@ -433,21 +433,16 @@ func TestNewWorkloadSignal(t *testing.T) {
 	// back to something that happens to work: substituting `none` for a broken
 	// `http` would freeze the controller forever and report it as a metrics
 	// problem.
-	t.Run("http is not implemented in this phase", func(t *testing.T) {
+	t.Run("http rejects an unusable endpoint at startup", func(t *testing.T) {
 		t.Parallel()
 
 		_, err := NewWorkloadSignal(config.SignalConfig{
 			Source:   config.SignalSourceHTTP,
-			Endpoint: "http://normalizer:9090/metrics",
+			Endpoint: "normalizer-metrics:8081/metrics", // no scheme
 		}, func() time.Time { return now })
 
 		if err == nil {
-			t.Fatal("the http source must report that it is unimplemented")
-		}
-		for _, want := range []string{"P2", config.SignalSourceSynthetic, config.SignalSourceNone} {
-			if !strings.Contains(err.Error(), want) {
-				t.Errorf("error should mention %q, got: %v", want, err)
-			}
+			t.Fatal("an endpoint with no scheme must be rejected at startup")
 		}
 	})
 

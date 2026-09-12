@@ -86,11 +86,7 @@ func NewWorkloadSignal(cfg config.SignalConfig, clock func() time.Time) (Workloa
 		return NoneSignal{}, nil
 
 	case config.SignalSourceHTTP:
-		return nil, fmt.Errorf(
-			"workload.signal.source %q is not implemented until P2 — Demonstration workload, because it "+
-				"scrapes the Normalizer's metrics endpoint and the Normalizer does not exist yet; "+
-				"use %q or %q in this phase",
-			config.SignalSourceHTTP, config.SignalSourceSynthetic, config.SignalSourceNone)
+		return NewHTTPSignal(cfg, clock)
 
 	default:
 		// Unreachable: configuration validation rejects unknown sources. Kept

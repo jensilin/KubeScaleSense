@@ -140,6 +140,33 @@ semantics matter — subresources, preconditions, RBAC, events.
 | IT-15 | Unhealthy pods | Pods forced into `ImagePullBackOff` with a rising backlog: after `podStartupTimeout` the controller emits `PodStartupFailure` and issues **no further scale-ups**, even though demand keeps growing. Asserts the DR-06 loop is broken; also asserts no auto-revert ([FS-24](failure-scenarios.md#fs-24-scheduled-but-unhealthy-pods)) |
 | IT-16 | Workload-signal source | Each source implementation satisfies the same contract: `synthetic` replays a scripted series exactly and deterministically; `http` collects queued + in-flight counts from a stub endpoint; a stopped endpoint, a connection refusal, and a response slower than `signal.timeout` each yield an *unavailable* signal (→ `HoldStaleMetrics`), **never zero**; `none` is permanently unavailable. Asserts the sources are interchangeable behind one interface, which is the property [FR-36](requirements.md#workload-signal-requirements-v02) exists to guarantee ([FR-38](requirements.md#workload-signal-requirements-v02), [FS-15](failure-scenarios.md#fs-15-metrics-source-unavailable)) |
 
+### 5.1 Workload and pipeline tests — P2, no cluster required
+
+These run in `make test` on every commit. They exist because the `DI-*` suites in [§6](#6-data-integrity-scenarios)
+need a cluster, and a property that is only checked when someone has 6 GiB free and `kind` installed is a
+property that regresses between demos.
+
+| ID | Case | Asserts |
+| --- | --- | --- |
+| WT-01 | Normalization is a pure function | Four *equivalent* inputs — differing only in timestamp offset, case, and whitespace — produce **byte-identical** output; the output also matches a committed golden value, so a change to the format is a change to this file ([WR-03](requirements.md#workload-signal-requirements-v02), DI-04) |
+| WT-02 | Purity survives the CPU knob | Changing `COST_ROUNDS` changes the work performed and **not one output byte**: the proof-of-work digest is returned in a response header, never in the body. Without this, retuning the workload would silently invalidate DI-04 |
+| WT-03 | Malformed input is permanent | Eleven malformed forms each return `400` with `ErrMalformed`, and a malformed record **consumes no processing capacity** — so a poison pill cannot starve the pool it cannot be processed by |
+| WT-04 | Capacity is enforced | With `MAX_CONCURRENT: 4` and 6 simultaneous records, in-flight is exactly 4 and queued is exactly 2. Beyond `QUEUE_LIMIT`, `503` with `Retry-After`; past `QUEUE_TIMEOUT`, the record is shed rather than held indefinitely |
+| WT-05 | Concurrency does not change results | The same record normalized by 16 goroutines yields 16 identical results; a client cancelling mid-request releases its slot rather than leaking it |
+| WT-06 | Drain order | On shutdown `/readyz` fails first, the process then waits `DRAIN_DELAY` before closing the data plane, and the admin plane closes last so the final metrics stay scrapeable. Bounded by `SHUTDOWN_TIMEOUT` ([WR-06](requirements.md#workload-signal-requirements-v02), [FS-14](failure-scenarios.md#fs-14-scale-down-terminates-a-busy-pod)) |
+| WT-07 | Configuration is validated, not coerced | Every invalid combination is rejected at startup with **all** problems reported at once, not the first; `-validate` exits without serving |
+| WT-08 | Pressure is summed over pods | The `http` source resolves a name to three addresses **on one shared port** and sums all three (7+4, 3+4, 0+4 = 22). The shared port is what makes the fixture faithful: servers on different ports would pass even if only the first address were ever scraped ([ADR-22a](architecture.md#adr-22a-the-http-source-scrapes-every-pod)) |
+| WT-09 | A partial sum is never reported | One pod returning `500`, serving a non-Normalizer endpoint, omitting half the signal, returning unparsable text, or refusing the connection each make the **whole sample** unavailable. A partial sum is indistinguishable from a drop in load, which the controller would answer by scaling down |
+| WT-10 | Sample age is source-reported | `SampledAt` comes from the `Date` header of the **oldest** contributing response, so the sample's age is the age of its stalest part ([FR-34](requirements.md#review-driven-requirements-v011), [DR-14](design-review.md#dr-14-staleness-measured-only-from-local-receive-time-misses-a-frozen-source)) |
+| WT-11 | A counter reset skips an interval | A pod restart makes the completed counter go backwards; the interval's rate is skipped rather than reported as a negative or wrapped value, and rates recover on the following interval |
+| WT-12 | The generator is deterministic | The same flags produce byte-identical records; every generated record is accepted by the real `Normalize`; the LOW → HIGH → LOW plan produces the stated record count and burst-aware intervals; files are published by atomic rename so NiFi never lists a half-written file |
+| WT-13 | The NiFi flow's invariants hold | In the shipped flow definition: `InvokeHTTP` concurrency exceeds `maxReplicas`, `Retry` and `Failure` are retried, `No Retry` is **not** retried but is still routed to a sink, the read timeout exceeds the Normalizer's worst case, the URL names the Service rather than a pod, every processor is bundled against NiFi 2.6.7, back-pressure is bounded, and no credential appears anywhere ([A-13](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful), [FS-28](failure-scenarios.md#fs-28-adding-replicas-does-not-add-throughput), [FS-29](failure-scenarios.md#fs-29-a-retried-request-is-normalized-twice)) |
+| WT-14 | The decision path, end to end, in process | Real pods behind real Services, a real spike over real HTTP, the real `http` source and the real decision engine: a spike produces a scale-up decision whose target exceeds current replicas and respects fit capacity — **and the replica count does not change**. A vanished pool freezes on `HoldStaleMetrics` rather than scaling down |
+
+WT-13 checks the flow *as a file*; `tests/e2e/assert-nifi-flow.sh` checks the same three settings in the
+running NiFi at demo start-up. Both are needed, because a correct file that was never imported and a running
+flow that was edited in the UI are both failures this project would otherwise ship.
+
 ---
 
 ## 6. Data integrity scenarios
@@ -207,11 +234,10 @@ flowchart TB
     end
 
     subgraph NS["namespace: data-pipeline"]
-        SFTP["sftp (atmoz/sftp)"]
-        NIFI["nifi-0 (NiFi 2.6.7, StatefulSet, PVCs)"]
+        NIFI["nifi-0 (NiFi 2.6.7, StatefulSet, PVCs)<br/>+ loadgen sidecar: spike driver"]
         SVC["normalizer-service (ClusterIP)"]
+        MSVC["normalizer-metrics (headless)"]
         NORM["normalizer Deployment<br/>500m / 512Mi per pod ← the scaling target"]
-        GEN["file-generator Job<br/>spike driver"]
     end
 
     subgraph KSSNS["namespace: kubescalesense"]
@@ -219,9 +245,10 @@ flowchart TB
         PROM["prometheus + metrics-server"]
     end
 
-    GEN --> SFTP --> NIFI -->|HTTP| SVC --> NORM
-    KSS -->|scale| NORM
-    NORM -.->|"pressure: queued + in-flight"| KSS
+    NIFI -->|HTTP| SVC --> NORM
+    KSS -->|"scale (P3; dry-run in P2)"| NORM
+    NORM --- MSVC
+    MSVC -.->|"pressure: queued + in-flight, summed over pods"| KSS
     PROM -.->|utilization| KSS
 
     classDef full fill:#9e6a03,color:#fff,stroke:#7d4e00
@@ -274,8 +301,15 @@ node capacity should never assume it.
 | Docker / Podman | kind node runtime |
 | `kind` ≥ 0.23, `kubectl` ≥ 1.29 | Cluster lifecycle |
 | Go ≥ 1.24 | Build the controller |
+| `jq`, `curl` | `assert-nifi-flow.sh` reads NiFi's REST API |
 | `helm` (optional) | metrics-server / Prometheus install |
-| `make` | `make demo-up`, `make demo-scenario-N`, `make demo-down` |
+| `make` | `make demo-up`, `make demo-spike`, `make demo-observe`, `make demo-down` |
+
+Budget roughly **6 GiB of memory and 4 CPUs**. The four-node topology plus NiFi's JVM plus several Normalizer
+replicas does not fit in much less, and the failure mode is OOM kills that present as a broken pipeline.
+`demo-up.sh` checks and warns rather than refusing. Below that, `make demo-spike MODE=http` drives the same
+workload straight at `normalizer-service` with NiFi out of the path, which exercises the controller, the
+signal, the feasibility calculation, and the dry-run guarantee — everything except NiFi itself.
 
 `metrics-server` needs `--kubelet-insecure-tls` on kind. Scripts live in `tests/e2e/`; nothing in the demo
 requires cloud access or a paid service.

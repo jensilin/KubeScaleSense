@@ -170,7 +170,7 @@ Produces the demand half of the snapshot:
 
 | Signal | Source | Notes |
 | --- | --- | --- |
-| `pressureItems` | The configured `WorkloadSignal` source: `synthetic` (a scripted series) or `http` (scraped from the Normalizer's metrics endpoint) | Primary demand signal — **outstanding work**: queued plus in-flight requests. Optional EWMA smoothing ([scaling-algorithm § 8.4](scaling-algorithm.md#84-signal-smoothing)) |
+| `pressureItems` | The configured `WorkloadSignal` source: `synthetic` (a scripted series) or `http` (scraped from **every** Normalizer pod through a headless Service and summed, [ADR-22a](#adr-22a-the-http-source-scrapes-every-pod)) | Primary demand signal — **outstanding work**: queued plus in-flight requests. Optional EWMA smoothing ([scaling-algorithm § 8.4](scaling-algorithm.md#84-signal-smoothing)) |
 | `inFlightRequests` | Same source; the Normalizer's own in-flight counter, summed over pods | Reported, and the natural input for `pod-deletion-cost`. Makes "the pool is busy but nothing is queued" visible |
 | `requestRate`, `processingRate`, `processingLatency` | Same source | **Observability only** in v0.2 ([FR-39](requirements.md#workload-signal-requirements-v02)); recorded from Phase 1 so a latency- or arrival-rate-driven demand model can be derived from data instead of guessed |
 | `podCPUUsage`, `podMemoryUsage` | `PodMetrics` from `metrics.k8s.io/v1beta1` for the target's pods | Averaged over **Ready and warm** pods only; starting pods would drag the average down and suppress scale-up |
@@ -910,10 +910,17 @@ termination already does, and requires pod-delete permission we deliberately do 
 
 **Decision.** A `kind` cluster with one control-plane and three workers, deliberately **small and
 heterogeneous** so resource exhaustion is reachable on a laptop, plus `metrics-server`, a single-node NiFi
-2.6.7 StatefulSet, an `atmoz/sftp` server, the `normalizer` Deployment behind `normalizer-service`, and a file
-generator. Five scripted scenarios (happy-path spike, insufficient resources, capacity restored, node cordon,
-pod crash) drive the demo; full setup and expected outputs in
+2.6.7 StatefulSet, the `normalizer` Deployment behind `normalizer-service`, and a load generator. Five
+scripted scenarios (happy-path spike, insufficient resources, capacity restored, node cordon, pod crash)
+drive the demo; full setup and expected outputs in
 [test-plan § 7](test-plan.md#7-local-demonstration-environment).
+
+**As built (P2).** The `atmoz/sftp` server is **not** part of the demo. An SFTP server needs an account, and
+committing one here would trade the project's no-credentials property for a convenience; the flow uses
+`ListFile` / `FetchFile` on a directory a generator sidecar fills, and the realistic deployment swaps those
+two processors for `ListSFTP` / `FetchSFTP` with operator-supplied credentials. Everything downstream of the
+fetch is byte-identical either way, so nothing the demo demonstrates depends on the difference
+([deploy/demo](../deploy/demo/README.md)).
 
 **Rationale.** The interesting behaviour — HOLD instead of Pending — only appears in a cluster that can run
 out of room. Constraining worker sizes makes that a two-command demo instead of a cloud-scale exercise. Node
@@ -1242,6 +1249,50 @@ wants to be autoscaled. A source failure is `unavailable`, never zero
 which source produced it. [E2E](test-plan.md#8-end-to-end-scenarios) scenarios therefore run against the
 `http` source, and the synthetic source is confined to unit and integration levels.
 
+<a id="adr-22a-the-http-source-scrapes-every-pod"></a>
+
+#### ADR-22a (P2 addendum): the `http` source scrapes every pod, through a headless Service
+
+**Decision.** The `http` source resolves its endpoint host to **every address behind it** and scrapes each
+one, summing the results. The endpoint is a second Service, `normalizer-metrics`, with
+`clusterIP: None` and `publishNotReadyAddresses: false`.
+
+```mermaid
+flowchart LR
+    KSS["KubeScaleSense<br/>http signal source"]
+    DNS["normalizer-metrics<br/>headless: one A record per Ready pod"]
+    P1(["pod 1<br/>queued 7 · in-flight 4"])
+    P2(["pod 2<br/>queued 3 · in-flight 4"])
+    P3(["pod 3<br/>queued 0 · in-flight 4"])
+
+    KSS -->|resolve| DNS
+    DNS --> P1 & P2 & P3
+    KSS -.->|"sum = 22"| KSS
+```
+
+**Rationale.** Pressure is *queued plus in-flight, summed over pods*. `normalizer-service` is a ClusterIP and
+balances each request to one backend, so scraping it returns **one pod's** counters. That under-reports total
+pressure by roughly the replica count: identical to the true value at one replica, and wrong at every other
+count — in the direction that makes the controller scale *down* under load. It is the kind of error that
+passes a single-replica test and then never looks obviously wrong.
+
+Resolving DNS rather than listing Endpoints through the Kubernetes API is what keeps this decision cheap: the
+signal source needs no API access, no informer, and **no additional RBAC**, so it stays a plain HTTP client
+and the read-only permission set is unchanged.
+
+**A partial sum is worse than no sum.** If any pod fails to answer, the whole sample is reported
+`unavailable` rather than summed short, because a partial sum is indistinguishable from a genuine drop in
+load and the controller would react by scaling down — exactly the wrong response to a pod that is too busy to
+answer. `SampledAt` is taken from the **oldest** contributing response's `Date` header, so the sample's age
+is the age of its stalest part ([FR-34](requirements.md#review-driven-requirements-v011),
+[DR-14](design-review.md#dr-14-staleness-measured-only-from-local-receive-time-misses-a-frozen-source)).
+
+**Rejected.** *Scraping the ClusterIP and multiplying by the replica count* — assumes the load is evenly
+distributed, which is precisely the assumption that fails when one pod is wedged. *Listing Endpoints through
+the API* — correct, but buys a permission and a cache to obtain what DNS already reports. *Having each pod
+push its counters* — needs an aggregator, which is a stateful component the v0.2 architecture deliberately
+does not have.
+
 ---
 
 ## 10. Evolution to a production controller
@@ -1378,3 +1429,56 @@ cooperation with the cluster autoscaler. Each has a documented pick-up trigger i
 The storage-shaped items are listed together deliberately. They were in scope in v0.1.2 and were removed as
 disproportionate ([ADR-21](#adr-21-how-does-work-reach-the-normalizer-pods)); reintroducing one is a change to
 the project's scope, not an implementation detail, and needs a new ADR before code.
+
+### 11.7 As built, after P2
+
+§11.1–§11.6 are the design baseline and are left as written. This subsection records where the implementation
+differs, so the two can be compared rather than conflated.
+
+```mermaid
+flowchart TB
+    subgraph N1["namespace: data-pipeline"]
+        subgraph POD["nifi-0 · StatefulSet"]
+            GEN["loadgen<br/>sidecar · spike driver"]
+            NIFI["nifi<br/>NiFi 2.6.7<br/>repositories on PVCs"]
+            GEN -->|"emptyDir: /data/input"| NIFI
+        end
+        SVC["normalizer-service<br/>ClusterIP :80"]
+        MSVC["normalizer-metrics<br/>headless :8081"]
+        NORM["normalizer · Deployment<br/>500m / 512Mi requests<br/>THE SCALING TARGET"]
+        BAL["ballast x3<br/>pinned per node · capacity shaping"]
+    end
+
+    subgraph N2["namespace: kubescalesense"]
+        KSS["kubescalesense<br/>Deployment · dryRun: true"]
+    end
+
+    subgraph N3["kube-system"]
+        MS["metrics-server"]
+    end
+
+    NIFI -->|"InvokeHTTP: raw record"| SVC
+    SVC --> NORM
+    NORM --- MSVC
+    MSVC -.->|"scrape every pod, sum queued + in-flight"| KSS
+    MS -.->|"pod CPU / memory"| KSS
+    KSS -.->|"decision, logged only — NO WRITE"| NORM
+
+    classDef ctrl fill:#1f6feb,color:#fff,stroke:#0b3d91,stroke-width:2px
+    classDef target fill:#238636,color:#fff,stroke:#116329
+    class KSS ctrl
+    class NORM target
+```
+
+| § | Baseline | As built |
+| --- | --- | --- |
+| 11.1 | `sftp` Deployment; `file-generator` Job; one Service | No SFTP ([ADR-16](#adr-16-how-will-this-be-demonstrated-in-a-local-kubernetes-environment) as-built note); the generator is a sidecar sharing an `emptyDir` with NiFi; **two** Services, the second headless for the pressure scrape ([ADR-22a](#adr-22a-the-http-source-scrapes-every-pod)) |
+| 11.1 | `KSS -->` scale subresource | **No write path exists.** The controller's Kubernetes client exposes read-only interfaces and a test asserts that structurally. The arrow is P3's |
+| 11.2 | `ListSFTP → FetchSFTP → ConvertRecord → InvokeHTTP` | `ListFile → FetchFile → SplitText → InvokeHTTP → PutFile`, with the SFTP variant a two-processor swap |
+| 11.3 | Step 6 "writes at most one replica change per reconcile" | Step 6 computes the decision and logs it. Nothing is written |
+
+The P2 pipeline's output is an `emptyDir`, not durable storage, and the project does not claim otherwise: what
+P2 demonstrates is that a real workload can be measured and that the measurement drives a correct decision.
+End-to-end durable delivery is not among its claims, and the v0.2 architecture contains nothing that would
+provide it beyond NiFi's retry
+([D-02](requirements.md#7-durability-boundary-and-workload-responsibilities)).

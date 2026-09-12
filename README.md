@@ -6,17 +6,18 @@ KubeScaleSense scales a normalization workload according to incoming demand **wh
 the Kubernetes cluster can actually schedule the additional pods** — preventing the Pending pods, resource
 exhaustion, and processing interruptions that follow from scaling blindly.
 
-> **Status: P0 — Foundation implemented. It does not autoscale anything yet.**
+> **Status: P2 — it observes a real workload and reports decisions. It does not autoscale anything yet.**
 >
 > | | State |
 > | --- | --- |
-> | **Implemented** | Go module and package layout; configuration schema, defaults, `KSS_*` overrides, and startup validation that refuses unsafe input; structured logging; signal handling and graceful shutdown; build, test, lint, and docs-link checks; container image; skeleton manifests |
-> | **Not implemented** | [P1](docs/implementation-plan.md#p1--observation-dry-run-only) cluster observation and fit-capacity estimation · [P2](docs/implementation-plan.md#p2--demonstration-workload) Normalizer, NiFi, and the demo pipeline · [P3](docs/implementation-plan.md#p3--actuation-and-stability) actuation — **no replica count is ever written today** · [P4](docs/implementation-plan.md#p4--hardening-and-operability-poc-complete) hardening |
+> | **Implemented** | **P0** module and package layout, configuration schema with `KSS_*` overrides and startup validation that refuses unsafe input, structured logging, graceful shutdown, build/test/lint/docs checks, container image · **P1** read-only cluster observation, per-node fit-capacity calculation, the full decision engine, and dry-run reporting · **P2** the Normalizer workload, NiFi 2.6.7 ingest, the deterministic load generator, the `kind` demo environment, and the live `http` pressure signal |
+> | **Not implemented** | [P3](docs/implementation-plan.md#p3--actuation-and-stability) actuation — **no replica count is ever written today** · [P4](docs/implementation-plan.md#p4--hardening-and-operability-poc-complete) hardening |
 >
-> The P0 binary makes **no Kubernetes API calls at all**: it loads its configuration, logs what it would be
-> configured to do, and waits for a shutdown signal. The RBAC in
-> [`deploy/kubescalesense/`](deploy/kubescalesense/) therefore grants nothing yet, and each deferred
-> permission is listed with the phase that introduces it. See
+> The controller runs with `dryRun: true` and there is no code path that writes a replica count: its
+> Kubernetes client exposes read-only interfaces, which a test asserts structurally rather than by review.
+> During a demo spike it will report `currentReplicas: 1, demandReplicas: 8, fitCapacity: 3,
+> targetReplicas: 4, reason: ScaleUpPartial` — and the Deployment stays at 1 replica. That gap is the
+> deliverable; [P3](docs/implementation-plan.md#p3--actuation-and-stability) closes it. See
 > [docs/implementation-plan.md](docs/implementation-plan.md) for the phased build plan.
 
 ## Quick start
@@ -24,7 +25,7 @@ exhaustion, and processing interruptions that follow from scaling blindly.
 Requires Go ≥ 1.24. Nothing here contacts a cluster.
 
 ```sh
-make build                    # compile into bin/
+make build                    # compile the controller, the Normalizer and the load generator
 make test                     # unit tests, race detector, coverage
 make lint                     # gofmt, go vet, golangci-lint
 make docs-check               # every internal docs link and anchor resolves
@@ -34,8 +35,22 @@ make docs-check               # every internal docs link and anchor resolves
 ./bin/kubescalesense -config config/kubescalesense.yaml -validate
 ```
 
-`make demo-up` and `make demo-down` exist but deliberately fail until
-[P2](docs/implementation-plan.md#p2--demonstration-workload) builds the pipeline they would start.
+### See it decide
+
+This part needs `kind`, `docker`, and roughly 6 GiB of memory. It creates a cluster named
+`kubescalesense-demo` and touches nothing else — every `kubectl` call in the demo scripts is pinned to that
+cluster's context, and the ambient current-context is never read.
+
+```sh
+make demo-up                  # create the kind cluster and bring up the pipeline
+make demo-observe             # follow the decisions the controller would make
+make demo-spike               # drive a LOW -> HIGH -> LOW workload spike
+make demo-down                # delete the cluster
+```
+
+Watch the replica count while a spike runs: it stays at 1 while the controller reports that it would scale to
+4. That is the intended result of P2, not a bug — see
+[`deploy/demo/README.md`](deploy/demo/README.md) for the full runbook.
 
 ---
 
@@ -181,30 +196,31 @@ rather than restating it.
 
 ## Repository layout
 
-Filled in across [P0–P3](docs/implementation-plan.md#3-phase-details). The package boundaries are fixed in P0
-so that later phases add code rather than move it; the packages marked *(stub)* hold a package comment stating
-the phase that implements them and nothing else.
+Filled in across [P0–P3](docs/implementation-plan.md#3-phase-details). The package boundaries were fixed in P0
+so that later phases add code rather than move it, and they have not moved.
 
 ```text
 cmd/
   kubescalesense/       # controller entrypoint: config, logging, lifecycle
-  normalizer/           # (P2) the demo workload: a small stateless HTTP server
+  normalizer/           # the demo workload: a small stateless HTTP server
 internal/
   config/               # schema, defaults, KSS_* overrides, validation
-  kubernetes/           # (stub, P1) clients, informers, scale writes, events
-  resources/            # (stub, P1) node filtering, free-resource math, fit capacity
-  metrics/              # (stub, P1) workload-signal sources, pod utilization, staleness
-  scaling/              # (stub, P1) pure decision engine: Snapshot -> Decision
-  controller/           # (stub, P1) reconcile loop, actuator, pending watchdog
-  observability/        # (stub, P1) Prometheus metrics, health, logging
-  normalizer/           # (P2) normalization logic, in-flight accounting, drain
+  kubernetes/           # read-only clients, informers, target and node readers
+  resources/            # node filtering, free-resource math, fit capacity
+  metrics/              # workload-signal sources (synthetic, http, none), pod utilization, staleness
+  scaling/              # pure decision engine: Snapshot -> Decision
+  controller/           # reconcile loop, dry-run actuator
+  observability/        # Prometheus metrics, health, logging
+  normalizer/           # normalization logic, in-flight accounting, drain
 config/                 # kubescalesense.yaml — the documented defaults
 deploy/
   kubescalesense/       # RBAC, ConfigMap, controller Deployment
-  normalizer/           # (P2) Normalizer Deployment + normalizer-service
-  demo/                 # (P2) SFTP, NiFi, file generator, ballast
+  normalizer/           # Normalizer Deployment, both Services, tuning ConfigMap
+  demo/                 # NiFi 2.6.7, the flow definition, ballast, demo controller config
 hack/                   # linkcheck.py — the docs link and anchor check
-tests/                  # (P1) integration + e2e harness, kind config, scenarios
+tests/
+  demo/                 # the load generator, the in-process pipeline test, flow invariants
+  e2e/                  # kind config and the demo-up / demo-spike / demo-down scripts
 docs/                   # this design set
 ```
 
@@ -230,15 +246,17 @@ Rationale for each: [requirements § 3](docs/requirements.md#3-non-goals). When 
 
 ## Next step
 
-Design and architecture are closed: the [design review](docs/design-review.md) findings are folded in, all
-open questions are resolved or deferred with a stated default, and the settled architecture is
-[architecture § 11](docs/architecture.md#11-phase-1-architecture-baseline). **No Phase 1 blockers remain**
-([prerequisites](docs/implementation-plan.md#81-prerequisites-for-starting-phase-1-implementation)).
+[P0 — Foundation](docs/implementation-plan.md#p0--foundation),
+[P1 — Observation](docs/implementation-plan.md#p1--observation-dry-run-only) and
+[P2 — Demonstration workload](docs/implementation-plan.md#p2--demonstration-workload) are implemented. There
+is a real pipeline, a real pressure signal read from the workload itself, and a controller that computes
+demand and feasibility and reports a decision every interval — while writing nothing.
 
-[P0 — Foundation](docs/implementation-plan.md#p0--foundation) is complete. Next is
-[P1](docs/implementation-plan.md#p1--observation-dry-run-only), the first milestone that observes anything: a
-controller that computes fit capacity and reports the decisions it *would* make, validated by hand against
-`kubectl describe node` before it is ever allowed to write. P1 needs no pipeline at all — the `synthetic` signal source exercises the entire demand
-path — so the Normalizer and NiFi arrive in
-[P2](docs/implementation-plan.md#p2--demonstration-workload), gated on proving that replicas convert into
-throughput.
+Next is [P3 — Actuation and stability](docs/implementation-plan.md#p3--actuation-and-stability): the write
+path, the hysteresis that keeps it from oscillating, the Pending watchdog, and the external-writer
+protection. Everything P3 needs is already measured; what it adds is permission to act on it.
+
+Two things stand between P2 and that. First, `itemsPerReplica` is still a **guess** (12 in the demo config)
+and the P2 exit criteria require measuring it — the pressure level at which per-request latency reaches the
+SLO at a fixed replica count. Second, `DI-08` must show that replicas actually convert into throughput on the
+demo cluster; a flat curve means the whole premise is wrong and scaling would be theatre. Both gate P3.

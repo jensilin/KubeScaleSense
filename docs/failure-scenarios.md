@@ -527,7 +527,15 @@ processing rate and per-pod utilization are plotted beside replica count so a fl
 visible immediately; and **DI-08 fails the build** if throughput does not track replica count
 ([A-15](requirements.md#103-assumptions-that-must-hold-for-the-guarantees-to-be-meaningful)).
 **Data-loss risk.** None. Work waits in NiFi's queue, which is durable (D-01).
-**Test.** DI-08.
+**Test.** DI-08, plus [WT-13](test-plan.md#51-workload-and-pipeline-tests--p2-no-cluster-required) — the
+concurrency setting is checked against the configured `maxReplicas` in the shipped flow on every commit, and
+`tests/e2e/assert-nifi-flow.sh` checks it in the running NiFi at demo start-up. DI-08 is the test that
+matters, because only a live pipeline can show a flat throughput curve; the two static checks catch the
+specific cause that is cheap to catch and easy to introduce.
+**Status (P2).** The mitigations are in place; **DI-08 has not been run** in this environment, because `kind`
+is unavailable. Until it has, "replicas convert into throughput" is a design argument rather than a
+measurement, and it gates P3
+([implementation-plan](implementation-plan.md#p2-as-built-deviations-from-the-plan)).
 
 ### FS-29: A retried request is normalized twice
 
@@ -550,7 +558,11 @@ a side effect (an email, a counter, a non-idempotent API call), this scenario be
 retried and the pool does duplicate work under exactly the load where it can least afford to. This is the one
 tuning constraint the v0.2 design introduces — the analogue of the lease-duration constraint the work-store
 design introduced, and cheaper because getting it wrong wastes CPU rather than corrupting a claim.
-**Test.** DI-04.
+**Test.** DI-04, plus [WT-01/WT-02](test-plan.md#51-workload-and-pipeline-tests--p2-no-cluster-required) for
+the purity this scenario's harmlessness depends on, and WT-13 for the timeout constraint. WT-02 is the
+non-obvious one: the Normalizer's CPU cost is tunable, and folding its proof-of-work into the response body
+would have made every retuning a change to the output. The digest is returned in a header instead, so purity
+survives the knob.
 
 ### FS-26: Leadership handoff races with an in-flight write
 

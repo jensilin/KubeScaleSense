@@ -1,0 +1,176 @@
+# Ballast — capacity shaping, and the cleanest statement of the project's thesis.
+#
+# Each pod is a `pause` container that requests a large slice of CPU and memory
+# and then does absolutely nothing with it. The scheduler sees a node with no
+# room left; a usage-based autoscaler sees an idle cluster. Those two views
+# disagree, and which one an autoscaler believes is the entire subject of this
+# project (test-plan § 7.2, FS-04).
+#
+# It is also how every scenario sets up its capacity state. Scaling a ballast
+# Deployment up pre-commits a node's budget; deleting it hands the budget back,
+# which is how E2E-03 "adds capacity" without touching the host.
+#
+# One Deployment per worker, pinned with nodeName rather than a nodeSelector,
+# because the point is to control *which* node is full — the demo's premise is
+# that the three workers are deliberately unequal, so scheduling the ballast
+# wherever it fits would defeat it.
+#
+# nodeName bypasses the scheduler, so these pods are placed even on a node
+# whose remaining allocatable is already committed. That is a feature here and
+# a hazard elsewhere: over-committing a node with ballast can make its kubelet
+# evict real pods. The per-node totals below stay inside each worker's
+# allocatable, which is why the replica counts are small and documented.
+#
+# Node names are kind's, from the cluster in tests/e2e/kind-cluster.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ballast-worker
+  namespace: data-pipeline
+  labels:
+    app.kubernetes.io/name: ballast
+    app.kubernetes.io/part-of: kubescalesense-demo
+    kubescalesense.io/target-node: worker
+spec:
+  # worker has 1 CPU and 1Gi reserved from its allocatable by the kubelet
+  # configuration, so it is the small node. Two ballast pods leave room for
+  # roughly one Normalizer.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ballast
+      kubescalesense.io/target-node: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ballast
+        app.kubernetes.io/part-of: kubescalesense-demo
+        kubescalesense.io/target-node: worker
+    spec:
+      nodeName: kubescalesense-demo-worker
+      # Nothing is served, so there is nothing to drain.
+      terminationGracePeriodSeconds: 0
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65535
+        runAsGroup: 65535
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          # Requests equal limits: the pod is Guaranteed, so the kubelet will
+          # not evict it under pressure and the capacity it has claimed stays
+          # claimed for the whole scenario.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ballast-worker2
+  namespace: data-pipeline
+  labels:
+    app.kubernetes.io/name: ballast
+    app.kubernetes.io/part-of: kubescalesense-demo
+    kubescalesense.io/target-node: worker2
+spec:
+  # worker2 is the roomy node: no ballast by default, so it can take several
+  # Normalizers. Scale this up to squeeze it.
+  replicas: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ballast
+      kubescalesense.io/target-node: worker2
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ballast
+        app.kubernetes.io/part-of: kubescalesense-demo
+        kubescalesense.io/target-node: worker2
+    spec:
+      nodeName: kubescalesense-demo-worker2
+      terminationGracePeriodSeconds: 0
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65535
+        runAsGroup: 65535
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ballast-worker3
+  namespace: data-pipeline
+  labels:
+    app.kubernetes.io/name: ballast
+    app.kubernetes.io/part-of: kubescalesense-demo
+    kubescalesense.io/target-node: worker3
+spec:
+  # worker3 is the full node: enough ballast that no Normalizer fits. This is
+  # what makes "free CPU exists in the cluster but nothing fits" true at the
+  # same time (E2E-04).
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ballast
+      kubescalesense.io/target-node: worker3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ballast
+        app.kubernetes.io/part-of: kubescalesense-demo
+        kubescalesense.io/target-node: worker3
+    spec:
+      nodeName: kubescalesense-demo-worker3
+      terminationGracePeriodSeconds: 0
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65535
+        runAsGroup: 65535
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

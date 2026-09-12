@@ -1,0 +1,234 @@
+# NiFi 2.6.7 — the ingest buffer and the client of the Normalizer.
+#
+# NiFi's job here is narrow and worth stating as much for what it excludes:
+# it reads input files, splits them into records, posts each record to
+# `normalizer-service`, and retries what fails. It contains no autoscaling
+# logic, never touches the Kubernetes API, and has no idea KubeScaleSense
+# exists. The controller likewise has no NiFi client in any phase
+# (implementation-plan Q-1).
+#
+# What NiFi *does* own is the pipeline's durability. It is the only component
+# here that writes anything to disk, and D-01/D-02 rest entirely on its
+# repositories being on a PersistentVolume and its retry relationships being
+# configured. That is why this is a StatefulSet with PVCs rather than a
+# Deployment with an emptyDir: an emptyDir would make every claim in
+# requirements § 7 false, quietly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nifi
+  namespace: data-pipeline
+  labels:
+    app.kubernetes.io/name: nifi
+    app.kubernetes.io/part-of: kubescalesense-demo
+spec:
+  # Headless, because a single-replica StatefulSet needs a stable identity
+  # rather than load balancing.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: nifi
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: nifi
+  namespace: data-pipeline
+  labels:
+    app.kubernetes.io/name: nifi
+    app.kubernetes.io/component: ingest
+    app.kubernetes.io/part-of: kubescalesense-demo
+spec:
+  serviceName: nifi
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nifi
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nifi
+        app.kubernetes.io/component: ingest
+        app.kubernetes.io/part-of: kubescalesense-demo
+    spec:
+      # NiFi's image runs as uid 1000 and needs to own its repositories.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: nifi
+          # Pinned exactly. NiFi's flow format and processor bundle coordinates
+          # are version-specific, so the flow definition in nifi/flow/ is only
+          # valid against this tag.
+          image: apache/nifi:2.6.7
+          imagePullPolicy: IfNotPresent
+          env:
+            # Plain HTTP with anonymous access. NiFi 2.x otherwise generates
+            # single-user credentials at startup, and a demo that needs a
+            # password is a demo that needs a Secret — which this project does
+            # not create, for the workload or for anything else (CR-5).
+            #
+            # This is acceptable *only* because the UI is never exposed outside
+            # the cluster: reaching it requires `kubectl port-forward`, which
+            # already requires cluster credentials.
+            - name: NIFI_WEB_HTTP_PORT
+              value: "8080"
+            - name: NIFI_WEB_HTTP_HOST
+              value: "0.0.0.0"
+            # A modest heap. NiFi's default is larger than a kind worker can
+            # spare next to three Normalizer replicas, and an OOM-killed NiFi
+            # would look like a pipeline failure rather than a sizing mistake.
+            - name: NIFI_JVM_HEAP_INIT
+              value: "512m"
+            - name: NIFI_JVM_HEAP_MAX
+              value: "1g"
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            # readOnlyRootFilesystem is deliberately *not* set here, unlike
+            # every other container in this project: NiFi writes logs, work
+            # directories, and a generated nifi.properties inside its image
+            # root, and mounting each of those would be a fork of the upstream
+            # image's layout for no security gain in a local demo cluster.
+          # NiFi is not the scaling target, but it must not be the bottleneck
+          # either: if NiFi cannot dispatch requests faster than the pool can
+          # serve them, adding replicas changes nothing and the demonstration
+          # measures NiFi instead of the controller (FS-28, A-13).
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1536Mi
+            limits:
+              cpu: 2000m
+              memory: 2Gi
+          # NiFi takes a while to start and the flow must be loaded before it
+          # is useful, so the startup budget is generous and liveness only
+          # begins afterwards.
+          startupProbe:
+            httpGet:
+              path: /nifi-api/system-diagnostics
+              port: http
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /nifi-api/system-diagnostics
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+          volumeMounts:
+            - name: database-repository
+              mountPath: /opt/nifi/nifi-current/database_repository
+            - name: flowfile-repository
+              mountPath: /opt/nifi/nifi-current/flowfile_repository
+            - name: content-repository
+              mountPath: /opt/nifi/nifi-current/content_repository
+            - name: provenance-repository
+              mountPath: /opt/nifi/nifi-current/provenance_repository
+            - name: conf
+              mountPath: /opt/nifi/nifi-current/conf
+            - name: input
+              mountPath: /data/input
+            - name: output
+              mountPath: /data/output
+        # The input producer stands in for the SFTP drop.
+        #
+        # It is a sidecar rather than a separate Job because the only way to
+        # share a directory between two containers without a ReadWriteMany
+        # volume is to put them in one pod, and an RWX volume is exactly what
+        # the v0.2 architecture removed (ADR-21). An emptyDir shared inside the
+        # pod is the simplest reproducible local input, which is what the demo
+        # asks for; deploy/demo/README.md documents how the realistic SFTP path
+        # replaces it without touching the rest of the flow.
+        - name: input-producer
+          image: loadgen:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - -mode=file
+            - -dir=/data/input
+            # Idle until a scenario asks for records. `make demo-spike` drives
+            # the load; a sidecar that generated continuously would mean the
+            # demo never has a quiet baseline to start from (test-plan § 7.4,
+            # step 1).
+            - -serve=:9000
+          ports:
+            - name: control
+              containerPort: 9000
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 64Mi
+          volumeMounts:
+            - name: input
+              mountPath: /data/input
+      volumes:
+        # Input and output are pod-local scratch. Neither needs to survive the
+        # pod: input files are consumed within seconds, and the output is the
+        # demonstration's result, read while the demo is running. P2 does not
+        # claim durable end-to-end storage, and an emptyDir here says so
+        # honestly rather than implying a guarantee a local-path PVC would not
+        # actually provide either.
+        - name: input
+          emptyDir: {}
+        - name: output
+          emptyDir: {}
+        - name: conf
+          emptyDir: {}
+      terminationGracePeriodSeconds: 60
+  # The repositories, and the only PersistentVolumes in the demo. kind's
+  # default local-path provisioner serves these correctly because they are
+  # genuinely node-local to a single-replica StatefulSet — which is the one
+  # thing that provisioner can do without qualification (test-plan § 7.3).
+  volumeClaimTemplates:
+    - metadata:
+        name: database-repository
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+    - metadata:
+        name: flowfile-repository
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+    - metadata:
+        name: content-repository
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+    - metadata:
+        name: provenance-repository
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

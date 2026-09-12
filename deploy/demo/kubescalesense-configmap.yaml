@@ -1,0 +1,110 @@
+# Controller configuration for the demonstration.
+#
+# Two differences from config/kubescalesense.yaml, and they are the whole of
+# what P2 changes about the controller:
+#
+#   workload.signal.source is `http`, so pressure is the Normalizer's own
+#   queued + in-flight count instead of a scripted series. This is the point of
+#   P2: the demand signal becomes a real measurement of a real workload.
+#
+#   workload.itemsPerReplica is lowered to a value that suits the demo cluster,
+#   where a Normalizer pod has four processing slots rather than a production
+#   pod's capacity.
+#
+# dryRun stays true. P2 observes and reports; P3 owns actuation. demo-up.sh
+# asserts this value rather than trusting it, because the whole P2 claim is
+# false if it is ever flipped here by accident.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubescalesense-config
+  namespace: kubescalesense
+  labels:
+    app.kubernetes.io/name: kubescalesense
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: kubescalesense-demo
+data:
+  kubescalesense.yaml: |
+    controller:
+      interval: 15s
+      leaderElection: true
+      # P2 is dry-run, without exception. The binary has no actuator to enable.
+      dryRun: true
+      metricsAddr: ":8080"
+      healthAddr: ":8081"
+      logLevel: info
+      logFormat: json
+
+    target:
+      namespace: data-pipeline
+      deployment: normalizer
+      minReplicas: 1
+      # Above the 8 replicas DI-08 measures, and below anything the demo
+      # cluster could actually schedule, so HoldAtMaxReplicas is reachable
+      # deliberately rather than by accident (E2E-10).
+      maxReplicas: 12
+
+    workload:
+      # Four processing slots per pod, so a pod is saturated at roughly four
+      # outstanding records and a handful of queued ones. 12 makes a spike of a
+      # few hundred records demand more replicas than the cluster can fit,
+      # which is the state the demonstration is about.
+      #
+      # This number is a placeholder until it is *measured*: the P2 exit
+      # criteria require finding the pressure level at which per-request
+      # latency reaches the SLO at a fixed replica count, and recording that
+      # measurement rather than this guess.
+      itemsPerReplica: 12
+      targetCPUUtilizationPercent: 70
+      metricsStaleAfter: 60s
+      podWarmupPeriod: 60s
+      backlogSmoothing:
+        mode: ewma
+        alpha: 0.4
+      signal:
+        # The real signal, scraped from the workload itself (ADR-22, FR-36).
+        source: http
+        # The *headless* Service. A ClusterIP would balance the scrape to one
+        # pod and under-report pressure by a factor of the replica count; the
+        # headless Service resolves to every Ready pod, and the source scrapes
+        # and sums all of them.
+        endpoint: http://normalizer-metrics.data-pipeline.svc.cluster.local:8081/metrics
+        # Comfortably under the 15s reconcile interval: a scrape that outlives
+        # its interval would make the controller decide on the previous
+        # sample while believing it was current.
+        timeout: 3s
+        # Kept at its default and unused: this ConfigMap replaces the one in
+        # deploy/kubescalesense/, so no scripted series is mounted here. The
+        # path is only read when source is `synthetic`, which is what makes
+        # switching back to a scripted demo a one-line change plus mounting
+        # config/pressure.yaml.
+        syntheticPath: /etc/kubescalesense/pressure.yaml
+
+    resources:
+      perNodeReserveCPUMilli: 200
+      perNodeReserveMemoryMiB: 256
+      fitCapacityMarginPods: 1
+      respectNodeSelector: true
+      respectNodeAffinity: true
+      respectTaints: true
+      nodeLabelSelector: ""
+
+    scaling:
+      scaleUpCooldown: 60s
+      scaleDownCooldown: 300s
+      scaleDownStabilizationWindow: 300s
+      scaleDownWindowCoverage: 0.8
+      tolerancePercent: 10
+      maxScaleUpStep: 4
+      maxScaleDownStep: 1
+      allowPartialScaleUp: true
+      externalChangeTolerance: 3
+      holdBackoff:
+        initial: 30s
+        max: 15m
+        factor: 2.0
+
+    pending:
+      pendingPodTimeout: 120s
+      onPendingTimeout: revert
+      podStartupTimeout: 300s

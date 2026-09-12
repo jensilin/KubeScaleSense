@@ -1,0 +1,61 @@
+# Two Services over the same pods, for two different jobs.
+#
+# normalizer-service is the data path: a ClusterIP that fans NiFi's requests
+# across the Ready replicas. This is the name NiFi targets, and the reason no
+# pod name or pod IP appears anywhere in the flow — kube-proxy picks the pod,
+# so adding a replica changes throughput without changing any configuration
+# (ADR-21).
+apiVersion: v1
+kind: Service
+metadata:
+  name: normalizer-service
+  namespace: data-pipeline
+  labels:
+    app.kubernetes.io/name: normalizer
+    app.kubernetes.io/component: workload
+    app.kubernetes.io/part-of: kubescalesense-demo
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: normalizer
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+# normalizer-metrics is the observation path, and it is headless on purpose.
+#
+# The pressure signal is queued + in-flight records summed over *every* pod. A
+# ClusterIP Service would load-balance the controller's scrape to one pod, so
+# the sum would be one pod's numbers and would under-report pressure by a
+# factor of the replica count — a demo that looks correct at one replica and
+# is wrong at every other count.
+#
+# clusterIP: None makes DNS return one A record per Ready pod instead, which
+# is what the http signal source resolves and scrapes (ADR-22, WR-07).
+#
+# publishNotReadyAddresses stays false: a pod that is not Ready is either
+# starting up, and has no meaningful pressure yet, or draining, and its records
+# are already being retried elsewhere. Including it would add a term to the sum
+# that nothing is going to process.
+apiVersion: v1
+kind: Service
+metadata:
+  name: normalizer-metrics
+  namespace: data-pipeline
+  labels:
+    app.kubernetes.io/name: normalizer
+    app.kubernetes.io/component: workload
+    app.kubernetes.io/part-of: kubescalesense-demo
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: false
+  selector:
+    app.kubernetes.io/name: normalizer
+  ports:
+    - name: admin
+      port: 8081
+      targetPort: admin
+      protocol: TCP

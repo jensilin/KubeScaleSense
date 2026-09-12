@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1
+
+# The load generator. A demonstration tool, not part of KubeScaleSense: it
+# produces input and knows nothing about scaling, the controller, or Kubernetes.
+
+# --- build stage ----------------------------------------------------------
+FROM golang:1.27-alpine AS build
+
+ARG VERSION=dev
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download && go mod verify
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags "-s -w" \
+    -o /out/loadgen ./tests/demo/loadgen
+
+# --- runtime stage --------------------------------------------------------
+FROM gcr.io/distroless/static:nonroot
+
+# A default for standalone runs, such as the Job that drives the direct-HTTP
+# spike. When this runs as NiFi's input-producer sidecar the pod's
+# securityContext overrides it with uid 1000 — which it must, because the two
+# containers share an emptyDir and the writer has to be able to write where
+# NiFi reads.
+USER 65532:65532
+
+WORKDIR /
+
+COPY --from=build /out/loadgen /usr/local/bin/loadgen
+
+# No default arguments: every run states its own record count, rate, and burst
+# size, because a load generator with hidden defaults produces measurements
+# nobody can reproduce.
+ENTRYPOINT ["/usr/local/bin/loadgen"]
