@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 // FieldError is a single validation failure, named by its YAML key so that the
@@ -126,6 +128,18 @@ func (c *Config) validateController(v *validator) {
 	if !isOneOf(c.Controller.LogFormat, LogFormatJSON, LogFormatText) {
 		v.add("controller.logFormat", c.Controller.LogFormat,
 			oneOfMessage(LogFormatJSON, LogFormatText), "CR-2")
+	}
+
+	// Phase 1 observes and decides; it has no actuator that can write a replica
+	// count. Refusing dryRun: false is the difference between a controller that
+	// says so at startup and one that appears to be running live while silently
+	// changing nothing — which is the more dangerous of the two, because
+	// somebody would eventually trust it.
+	if !c.Controller.DryRun {
+		v.add("controller.dryRun", c.Controller.DryRun,
+			"must be true in this phase: Phase 1 implements observation and dry-run decisions only, and "+
+				"actuation of the replica count arrives in P3 — Actuation",
+			"FR-04")
 	}
 }
 
@@ -379,26 +393,21 @@ func validateHTTPEndpoint(endpoint string) error {
 	return nil
 }
 
-// validateLabelSelector checks the shape of a comma-separated equality
-// selector. Full selector grammar belongs to the Kubernetes client that will
-// consume it in Phase 1; this catches the typos worth catching at startup
-// without importing an API-machinery dependency into the foundation.
+// validateLabelSelector checks the selector against the real Kubernetes
+// grammar.
+//
+// Phase 0 hand-rolled an equality-only check to avoid pulling API machinery
+// into the foundation, and noted that the full grammar belonged to the client
+// that would consume the value. That client now exists, so the placeholder is
+// replaced with the same parser the candidate-node filter uses. The difference
+// is not cosmetic: the hand-rolled version rejected legal selectors such as
+// "node-pool in (workers,spot)" and accepted illegal label keys.
 func validateLabelSelector(selector string) error {
 	if strings.TrimSpace(selector) == "" {
 		return nil
 	}
-	for _, term := range strings.Split(selector, ",") {
-		term = strings.TrimSpace(term)
-		if term == "" {
-			return fmt.Errorf("contains an empty term; expected a form such as %q", "node-pool=workers")
-		}
-		key, value, found := strings.Cut(term, "=")
-		if !found {
-			return fmt.Errorf("term %q must be of the form key=value", term)
-		}
-		if strings.TrimSpace(key) == "" || strings.TrimSpace(value) == "" {
-			return fmt.Errorf("term %q must have a non-empty key and value", term)
-		}
+	if _, err := labels.Parse(selector); err != nil {
+		return fmt.Errorf("is not a valid label selector (%w); expected a form such as %q", err, "node-pool=workers")
 	}
 	return nil
 }

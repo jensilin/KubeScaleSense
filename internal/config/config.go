@@ -8,8 +8,8 @@
 //
 // Nothing in this package reads the Kubernetes API. The checks that need a
 // cluster — that the target pod template declares CPU and memory requests
-// (A-03), and that no HPA already manages the target (FR-19) — belong to the
-// startup path added in Phase 1 and are listed in DeferredClusterChecks.
+// (A-03), and that no HPA already manages the target (FR-19) — run in the
+// Phase 1 startup path and are listed in ClusterChecks.
 package config
 
 import "time"
@@ -20,11 +20,23 @@ import "time"
 const (
 	DefaultInterval       = 15 * time.Second
 	DefaultLeaderElection = true
-	DefaultDryRun         = false
-	DefaultMetricsAddr    = ":8080"
-	DefaultHealthAddr     = ":8081"
-	DefaultLogLevel       = LogLevelInfo
-	DefaultLogFormat      = LogFormatJSON
+
+	// DefaultDryRun is true for Phase 1, which is a deliberate departure from
+	// the false shown in docs/requirements.md § 8.
+	//
+	// The two documents disagreed: the parameter table lists the eventual
+	// production default, while docs/implementation-plan.md § P1 requires dryRun
+	// "hard-defaulted to true for this phase". The plan wins, because it is the
+	// document that describes what this code is allowed to do — and because the
+	// safe default is the one that cannot surprise anyone. Validation goes
+	// further and refuses a false value outright: Phase 1 has no write path, so
+	// asking for live mode is asking for something the binary cannot do.
+	DefaultDryRun = true
+
+	DefaultMetricsAddr = ":8080"
+	DefaultHealthAddr  = ":8081"
+	DefaultLogLevel    = LogLevelInfo
+	DefaultLogFormat   = LogFormatJSON
 
 	DefaultMinReplicas int32 = 1
 	DefaultMaxReplicas int32 = 12
@@ -263,14 +275,15 @@ func Default() *Config {
 	}
 }
 
-// DeferredClusterChecks lists validation that docs/architecture.md § 4.1
-// assigns to internal/config but which cannot run without a Kubernetes client.
-// It is recorded here, rather than left as a gap, so that the omission is
-// visible at the point someone looks for it.
+// ClusterChecks lists the validation that docs/architecture.md § 4.1 assigns to
+// internal/config but which cannot run here, because it needs a Kubernetes
+// client.
 //
-// Phase 0 makes no API calls at all, so these are implemented in Phase 1
-// alongside internal/kubernetes.
-var DeferredClusterChecks = []string{
-	"target pod template declares CPU and memory requests (A-03, FS-19) — needs a Deployment read",
-	"no HorizontalPodAutoscaler already manages the target (FR-19, FS-16) — needs an HPA list",
+// Phase 0 recorded these as deferred. Phase 1 implements both in
+// controller.VerifyTarget, which runs once after the informer caches sync and
+// fails startup on either, so the list now documents where they live rather
+// than that they are missing.
+var ClusterChecks = []string{
+	"target pod template declares CPU and memory requests (A-03, FS-19) — controller.VerifyTarget",
+	"no HorizontalPodAutoscaler already manages the target (FR-19, FS-16) — controller.VerifyTarget",
 }

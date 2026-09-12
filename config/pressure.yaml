@@ -1,0 +1,120 @@
+# config/pressure.yaml — scripted workload pressure for `workload.signal.source: synthetic`
+#
+# One sample is consumed per reconcile, so with the default 15 s interval this
+# series covers five minutes before it loops. Mounted at the path named by
+# workload.signal.syntheticPath.
+#
+# Why this exists: the demonstration pipeline (SFTP -> NiFi -> Normalizer) is a
+# P2 deliverable, but the decision engine is finished in P1 and needs a signal
+# to decide on. A scripted series is also reproducible in a way a live pipeline
+# is not, so an assertion on a sequence of reason codes can be exact.
+#
+# Unknown keys are rejected when this file is parsed, so a typo fails at
+# startup instead of quietly changing what the script means.
+#
+# Interpretation of the numbers below assumes the defaults in
+# kubescalesense.yaml: itemsPerReplica 50, tolerancePercent 10,
+# maxScaleUpStep 4, maxScaleDownStep 1, scaleDownStabilizationWindow 300s.
+# Demand is then ceil(pressureItems / 50), and the engine also considers CPU
+# utilization, per-node fit, and the cooldowns — so the reason code for a given
+# sample depends on the cluster, not only on this file.
+
+loop: true
+
+samples:
+  # --- Idle. Demand 1; already at minReplicas, so nothing to do. -------------
+  - pressureItems: 0
+    inFlightRequests: 0
+    requestRateMilliPerSec: 0
+    processingRateMilliPerSec: 0
+    processingLatencyMillis: 0
+
+  - pressureItems: 12
+    inFlightRequests: 1
+    requestRateMilliPerSec: 800
+    processingRateMilliPerSec: 900
+    processingLatencyMillis: 120
+
+  # --- A file lands and the backlog jumps. Demand 5, then 9. -----------------
+  # EWMA smoothing (alpha 0.4) deliberately lags this step, so the first
+  # scale-up is smaller than the raw backlog alone would suggest.
+  - pressureItems: 240
+    inFlightRequests: 8
+    requestRateMilliPerSec: 6000
+    processingRateMilliPerSec: 1500
+    processingLatencyMillis: 450
+
+  - pressureItems: 430
+    inFlightRequests: 14
+    requestRateMilliPerSec: 7200
+    processingRateMilliPerSec: 2600
+    processingLatencyMillis: 900
+
+  # --- Beyond a small cluster's fit capacity: demand 16 against maxReplicas 12.
+  # Expect ScaleUpPartial while pods still fit, then HoldAtMaxReplicas or
+  # HoldInsufficientResources — which of the two is the useful signal, because
+  # one asks for a config change and the other for more nodes.
+  - pressureItems: 800
+    inFlightRequests: 22
+    requestRateMilliPerSec: 9000
+    processingRateMilliPerSec: 4100
+    processingLatencyMillis: 1400
+
+  - pressureItems: 760
+    inFlightRequests: 24
+    requestRateMilliPerSec: 8600
+    processingRateMilliPerSec: 5200
+    processingLatencyMillis: 1300
+
+  # --- Draining. Replicas now outpace arrivals. -----------------------------
+  - pressureItems: 410
+    inFlightRequests: 18
+    requestRateMilliPerSec: 3000
+    processingRateMilliPerSec: 6400
+    processingLatencyMillis: 700
+
+  - pressureItems: 150
+    inFlightRequests: 9
+    requestRateMilliPerSec: 1200
+    processingRateMilliPerSec: 5800
+    processingLatencyMillis: 280
+
+  # --- The signal source freezes: a 10-minute-old sample, well past
+  # metricsStaleAfter. Expect HoldStaleMetrics rather than a scale-down on a
+  # stale low reading, which is the DR-02 correctness point.
+  - pressureItems: 60
+    inFlightRequests: 3
+    requestRateMilliPerSec: 500
+    processingRateMilliPerSec: 5000
+    processingLatencyMillis: 150
+    ageSeconds: 600
+
+  # --- The source goes away entirely. Also HoldStaleMetrics: an absent signal
+  # is unknown demand, never zero demand (FR-38).
+  - available: false
+
+  # --- Recovered, and quiet. The scale-down path now needs a full covered
+  # stabilization window before it acts, so this tail is deliberately long.
+  - pressureItems: 40
+    inFlightRequests: 2
+    requestRateMilliPerSec: 400
+    processingRateMilliPerSec: 4800
+    processingLatencyMillis: 110
+
+  - pressureItems: 35
+    inFlightRequests: 2
+    requestRateMilliPerSec: 350
+    processingRateMilliPerSec: 4600
+    processingLatencyMillis: 105
+
+  - pressureItems: 20
+    inFlightRequests: 1
+    requestRateMilliPerSec: 300
+    processingRateMilliPerSec: 4400
+    processingLatencyMillis: 100
+
+  - pressureItems: 10
+    inFlightRequests: 1
+    requestRateMilliPerSec: 200
+    processingRateMilliPerSec: 4200
+    processingLatencyMillis: 95

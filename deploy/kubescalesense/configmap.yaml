@@ -1,9 +1,11 @@
 # The controller's configuration, mounted read-only at
 # /etc/kubescalesense/kubescalesense.yaml.
 #
-# This is a copy of config/kubescalesense.yaml. Config is immutable at runtime
-# in this version (CR-3): editing this ConfigMap requires a pod restart, which
-# is why the Deployment does not watch it.
+# This is a copy of config/kubescalesense.yaml, plus the scripted pressure
+# series from config/pressure.yaml, which the synthetic signal source reads
+# from the same mount. Config is immutable at runtime in this version (CR-3):
+# editing this ConfigMap requires a pod restart, which is why the Deployment
+# does not watch it.
 #
 # It contains no credentials, and the schema has no field that could hold one
 # (CR-5). Unknown keys are rejected at startup, so a `password:` added here
@@ -21,7 +23,9 @@ data:
     controller:
       interval: 15s
       leaderElection: true
-      dryRun: false
+      # true until P3 builds a write path, and false is rejected rather than
+      # ignored: this binary has no actuator to disable (CR-6).
+      dryRun: true
       metricsAddr: ":8080"
       healthAddr: ":8081"
       logLevel: info
@@ -75,3 +79,31 @@ data:
       pendingPodTimeout: 120s
       onPendingTimeout: revert
       podStartupTimeout: 300s
+
+  # Read by the synthetic signal source, which is the documented default until
+  # the demonstration pipeline exists in P2. See config/pressure.yaml for what
+  # the series is designed to exercise; abbreviated here.
+  pressure.yaml: |
+    loop: true
+    samples:
+      - pressureItems: 0
+      - pressureItems: 240
+        inFlightRequests: 8
+        requestRateMilliPerSec: 6000
+        processingRateMilliPerSec: 1500
+        processingLatencyMillis: 450
+      - pressureItems: 430
+        inFlightRequests: 14
+        requestRateMilliPerSec: 7200
+        processingRateMilliPerSec: 2600
+        processingLatencyMillis: 900
+      - pressureItems: 410
+        inFlightRequests: 18
+        requestRateMilliPerSec: 3000
+        processingRateMilliPerSec: 6400
+        processingLatencyMillis: 700
+      - pressureItems: 40
+        inFlightRequests: 2
+        requestRateMilliPerSec: 400
+        processingRateMilliPerSec: 4800
+        processingLatencyMillis: 110

@@ -312,13 +312,18 @@ parameter list; other documents reference these names verbatim.
   pressure signal is either generated synthetically or scraped from the Normalizer's own metrics endpoint over
   in-cluster HTTP, so there is no database role, broker user, or API token to hold
   ([FR-37](#workload-signal-requirements-v02)).
+- **CR-6** Defaults below are the **v0.1 production** defaults. A phase whose code cannot honour a parameter
+  must default it to the safe value and **reject** the unsafe one, rather than accept a setting it will
+  silently ignore. Only `controller.dryRun` is affected: it defaults to `true` and is rejected when `false`
+  until [P3 — Actuation and stability](implementation-plan.md#p3--actuation-and-stability) builds a write path
+  ([P1](implementation-plan.md#p1--observation-dry-run-only)).
 
 ```yaml
 # config/kubescalesense.yaml — all values shown are the defaults
 controller:
   interval: 15s                 # reconcile period
   leaderElection: true
-  dryRun: false
+  dryRun: false                 # v0.1 production default; forced true before P3 (CR-6)
   metricsAddr: ":8080"
   healthAddr: ":8081"
   logLevel: info                # debug|info|warn|error
@@ -380,7 +385,7 @@ pending:
 | Parameter | Default | Meaning | Consumed by |
 | --- | --- | --- | --- |
 | `controller.interval` | `15s` | Reconcile period. Lower = faster reaction, more API/metrics load | [architecture § 5](architecture.md#5-scaling-decision-flow) |
-| `controller.dryRun` | `false` | Decide and report, never mutate | [FR-04](#4-functional-requirements) |
+| `controller.dryRun` | `false` (`true` before P3, **CR-6**) | Decide and report, never mutate | [FR-04](#4-functional-requirements) |
 | `controller.leaderElection` | `true` | Active/passive HA via a `Lease` | [FR-26](#4-functional-requirements) |
 | `target.namespace` / `.deployment` | — | The scaled workload. **Required** | [ADR-01](architecture.md#adr-01-what-exactly-is-being-scaled) |
 | `target.minReplicas` / `.maxReplicas` | `1` / `12` | Hard clamp on every decision | [scaling-algorithm § 3.4](scaling-algorithm.md#34-clamping) |

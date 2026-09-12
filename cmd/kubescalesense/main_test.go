@@ -10,9 +10,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	"github.com/jensilin/KubeScaleSense/internal/config"
 )
 
 func TestRun_Version(t *testing.T) {
@@ -117,18 +118,24 @@ func TestRun_ValidateOnly(t *testing.T) {
 
 // The startup log must carry the facts needed to reconstruct what the process
 // is doing: name, version, config source, and dry-run state.
+//
+// Asserted against logStartup directly rather than by running the binary,
+// because a Phase 1 process needs a reachable API server to get past startup and
+// this contract is about the log line rather than about the cluster.
 func TestLogStartup_EmitsRequiredFields(t *testing.T) {
 	dir := t.TempDir()
-	cfgPath, pressurePath := writeValidConfig(t, dir)
+	cfgPath, _ := writeValidConfig(t, dir)
 
-	var stdout, stderr syncBuffer
-	code := runWithShutdown(t, []string{"-config", cfgPath}, &stdout, &stderr)
-	if code != exitOK {
-		t.Fatalf("exit code = %d, want %d; stderr: %s", code, exitOK, stderr.String())
+	cfg, src, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("loading the test config: %v", err)
 	}
 
+	var stdout bytes.Buffer
+	logStartup(cfg.NewLogger(&stdout).With(slog.String("app", AppName)), cfg, src)
+
 	records := parseJSONLogs(t, stdout.String())
-	startup := findRecord(records, "KubeScaleSense foundation started")
+	startup := findRecord(records, "KubeScaleSense observer started")
 	if startup == nil {
 		t.Fatalf("no startup record found in logs:\n%s", stdout.String())
 	}
@@ -142,42 +149,43 @@ func TestLogStartup_EmitsRequiredFields(t *testing.T) {
 	if got, want := startup["config_source"], "file:"+cfgPath; got != want {
 		t.Errorf("config_source = %v, want %v", got, want)
 	}
-	if startup["dry_run"] != false {
-		t.Errorf("dry_run = %v, want false", startup["dry_run"])
+	if startup["phase"] != Phase {
+		t.Errorf("phase = %v, want %s", startup["phase"], Phase)
+	}
+
+	// Phase 1 is dry-run by construction, and the startup line is where an
+	// operator confirms it before trusting the process near a live cluster.
+	if startup["dry_run"] != true {
+		t.Errorf("dry_run = %v, want true", startup["dry_run"])
 	}
 
 	// Nobody reading these logs should be able to conclude that the controller
-	// is scaling anything yet.
+	// is changing the replica count.
 	if findRecord(records, "no scaling is performed in this phase") == nil {
-		t.Error("startup should state plainly that no scaling happens in P0")
-	}
-
-	// Guard the one thing that would make P0 a lie.
-	if strings.Contains(stdout.String(), pressurePath) {
-		t.Log("pressure path appears in logs; harmless, but note it is not a credential by design")
+		t.Error("startup should state plainly that no scaling happens in P1")
 	}
 }
 
-func TestServe_ReturnsOnContextCancellation(t *testing.T) {
+func TestAwaitShutdown_ReturnsOnContextCancellation(t *testing.T) {
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- serve(ctx, log) }()
+	go func() { done <- awaitShutdown(ctx, log) }()
 
 	cancel()
 
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("serve returned %v, want nil", err)
+			t.Fatalf("awaitShutdown returned %v, want nil", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("serve did not return within 5s of cancellation")
+		t.Fatal("awaitShutdown did not return within 5s of cancellation")
 	}
 }
 
-func TestServe_DoesNotLeakGoroutines(t *testing.T) {
+func TestAwaitShutdown_DoesNotLeakGoroutines(t *testing.T) {
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
 
 	// Settle first: the test binary and slog may still be starting goroutines.
@@ -185,15 +193,15 @@ func TestServe_DoesNotLeakGoroutines(t *testing.T) {
 
 	for range 20 {
 		ctx, cancel := context.WithCancel(context.Background())
-		cancel() // already cancelled: serve must return immediately
-		if err := serve(ctx, log); err != nil {
-			t.Fatalf("serve returned %v", err)
+		cancel() // already cancelled: awaitShutdown must return immediately
+		if err := awaitShutdown(ctx, log); err != nil {
+			t.Fatalf("awaitShutdown returned %v", err)
 		}
 	}
 
 	after := stableGoroutineCount(t)
 	if after > before {
-		t.Errorf("goroutine count grew from %d to %d across 20 serve cycles", before, after)
+		t.Errorf("goroutine count grew from %d to %d across 20 shutdown cycles", before, after)
 	}
 }
 
@@ -223,7 +231,7 @@ func writeValidConfig(t *testing.T, dir string) (cfgPath, pressurePath string) {
 	t.Helper()
 
 	pressurePath = filepath.Join(dir, "pressure.yaml")
-	if err := os.WriteFile(pressurePath, []byte("series: []\n"), 0o600); err != nil {
+	if err := os.WriteFile(pressurePath, []byte("loop: true\nsamples:\n  - pressureItems: 10\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -234,67 +242,6 @@ func writeValidConfig(t *testing.T, dir string) (cfgPath, pressurePath string) {
 		t.Fatal(err)
 	}
 	return cfgPath, pressurePath
-}
-
-// syncBuffer is a bytes.Buffer safe for concurrent use. runWithShutdown polls
-// the log output from the test goroutine while run writes to it from another,
-// so an unguarded buffer is a genuine data race rather than a theoretical one.
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(p)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-// runWithShutdown starts run in a goroutine and delivers SIGINT to this
-// process once the controller reports that it is waiting, exercising the real
-// signal path rather than a stubbed one.
-func runWithShutdown(t *testing.T, args []string, stdout, stderr *syncBuffer) int {
-	t.Helper()
-
-	type result struct{ code int }
-	done := make(chan result, 1)
-
-	go func() { done <- result{run(args, stdout, stderr)} }()
-
-	proc, err := os.FindProcess(os.Getpid())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	deadline := time.After(10 * time.Second)
-	for !strings.Contains(stdout.String(), "waiting for shutdown signal") {
-		select {
-		case r := <-done:
-			// Exited before reaching the wait state, e.g. a config error.
-			return r.code
-		case <-deadline:
-			t.Fatalf("controller never reached the wait state; logs:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-
-	if err := proc.Signal(os.Interrupt); err != nil {
-		t.Fatalf("delivering SIGINT: %v", err)
-	}
-
-	select {
-	case r := <-done:
-		return r.code
-	case <-time.After(10 * time.Second):
-		t.Fatal("run did not exit within 10s of SIGINT")
-		return -1
-	}
 }
 
 func parseJSONLogs(t *testing.T, out string) []map[string]any {

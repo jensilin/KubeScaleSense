@@ -15,7 +15,9 @@
 controller:
   interval: 15s                 # reconcile period
   leaderElection: true
-  dryRun: false
+  # true until P3 builds a write path, and false is rejected rather than
+  # ignored: this binary has no actuator to disable (CR-6).
+  dryRun: true
   metricsAddr: ":8080"
   healthAddr: ":8081"
   logLevel: info                # debug|info|warn|error

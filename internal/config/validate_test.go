@@ -38,7 +38,10 @@ func TestDefault_MatchesDocumentedValues(t *testing.T) {
 	}{
 		{"controller.interval", cfg.Controller.Interval.Duration(), 15 * time.Second},
 		{"controller.leaderElection", cfg.Controller.LeaderElection, true},
-		{"controller.dryRun", cfg.Controller.DryRun, false},
+		// The one default that deviates from the requirements § 8 table, which
+		// documents the eventual production value. Phase 1 has no write path,
+		// so it defaults to dry-run and rejects the alternative (CR-6).
+		{"controller.dryRun", cfg.Controller.DryRun, true},
 		{"controller.metricsAddr", cfg.Controller.MetricsAddr, ":8080"},
 		{"controller.healthAddr", cfg.Controller.HealthAddr, ":8081"},
 		{"controller.logLevel", cfg.Controller.LogLevel, "info"},
@@ -449,16 +452,32 @@ func TestValidate_Rejects(t *testing.T) {
 			wantMsg: "must differ from controller.metricsAddr",
 		},
 		{
-			name:    "node label selector without a value",
-			mutate:  func(c *Config) { c.Resources.NodeLabelSelector = "node-pool" },
+			name:    "node label selector without a key",
+			mutate:  func(c *Config) { c.Resources.NodeLabelSelector = "=workers" },
 			wantKey: "resources.nodeLabelSelector",
-			wantMsg: "key=value",
+			wantMsg: "not a valid label selector",
 		},
 		{
 			name:    "node label selector with an empty term",
 			mutate:  func(c *Config) { c.Resources.NodeLabelSelector = "a=b,,c=d" },
 			wantKey: "resources.nodeLabelSelector",
-			wantMsg: "empty term",
+			wantMsg: "not a valid label selector",
+		},
+		{
+			name:    "node label selector with an illegal key character",
+			mutate:  func(c *Config) { c.Resources.NodeLabelSelector = "node pool=workers" },
+			wantKey: "resources.nodeLabelSelector",
+			wantMsg: "not a valid label selector",
+		},
+
+		// --- phase constraints ---
+		{
+			// Accepting this would mean accepting a setting the binary cannot
+			// honour: there is no write path to enable (CR-6).
+			name:    "live mode requested from a phase that cannot actuate",
+			mutate:  func(c *Config) { c.Controller.DryRun = false },
+			wantKey: "controller.dryRun",
+			wantMsg: "must be true in this phase",
 		},
 	}
 
@@ -486,6 +505,41 @@ func TestValidate_Rejects(t *testing.T) {
 			if !strings.Contains(err.Error(), tt.wantMsg) {
 				t.Errorf("message must explain the constraint: expected it to contain %q\ngot: %v",
 					tt.wantMsg, err)
+			}
+		})
+	}
+}
+
+// The node label selector is handed to the same parser the candidate-node
+// filter uses, so anything Kubernetes accepts must pass validation. Phase 0
+// hand-rolled an equality-only check that rejected most of these.
+func TestValidate_AcceptsEveryValidLabelSelector(t *testing.T) {
+	t.Parallel()
+
+	selectors := []string{
+		"",
+		"node-pool=workers",
+		"node-pool==workers",
+		"node-pool!=control-plane",
+		"node-pool in (workers,spot)",
+		"node-pool notin (control-plane)",
+		"kubescalesense.io/schedulable",
+		"!node.kubernetes.io/exclude",
+		"node-pool=workers,zone in (eu-north-1a,eu-north-1b)",
+		// An empty value is a legal label value, and means something different
+		// from an absent label.
+		"node-pool=",
+	}
+
+	for _, selector := range selectors {
+		t.Run(selector, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := validConfig()
+			cfg.Resources.NodeLabelSelector = selector
+
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("selector %q must be accepted, got: %v", selector, err)
 			}
 		})
 	}

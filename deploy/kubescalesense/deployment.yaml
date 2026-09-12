@@ -1,10 +1,10 @@
-# Controller Deployment — Phase 0 skeleton, not applied by any automation.
+# Controller Deployment — Phase 1, not applied by any automation.
 #
-# What this pod does today: loads and validates its configuration, logs the
-# result, and waits for SIGTERM. It makes no Kubernetes API calls and scales
-# nothing. Its value in Phase 0 is that the manifest, image, security context,
-# and config mount are reviewable and correct before any behaviour depends on
-# them.
+# What this pod does today: watches nodes, pods, the target Deployment, its
+# ReplicaSets, and HorizontalPodAutoscalers; reads pod metrics; and reports the
+# scaling decision it would make. It scales nothing. Its Kubernetes client
+# rejects mutating requests at the transport layer and its ServiceAccount has
+# no write permission, so the read-only claim holds even if the code is wrong.
 #
 # replicas is 1 and stays 1 until P4 adds leader election (FR-26). Two replicas
 # without a Lease would be two controllers writing the same replica count.
@@ -43,15 +43,17 @@ spec:
           args:
             - -config
             - /etc/kubescalesense/kubescalesense.yaml
-          env:
-            # Phase 0 consumes no workload signal at all. The config file keeps
-            # the documented default of `synthetic`, and this override switches
-            # it off so the pod does not require a scripted pressure series
-            # that only P1 knows how to interpret. Remove this in P1, when
-            # internal/metrics gains the synthetic source and the series format
-            # is defined.
-            - name: KSS_WORKLOAD_SIGNAL_SOURCE
-              value: "none"
+          # The synthetic source now exists and the ConfigMap carries a
+          # scripted series, so the Phase 0 override that forced
+          # workload.signal.source to `none` is gone: the pod runs the
+          # documented default.
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -70,10 +72,31 @@ spec:
             limits:
               cpu: 500m
               memory: 64Mi
-          # No probes yet: controller.healthAddr is validated but not served
-          # until P1 adds internal/observability. A probe pointing at a port
-          # nothing listens on would crash-loop a working pod, so the ports and
-          # probes are added together with the handler.
+          # /healthz answers as soon as the listener is up; /readyz waits for
+          # the informer caches to sync and for a recent successful reconcile.
+          # The startup probe carries the cold cache list, so a slow first
+          # sync on a large cluster is not read as a liveness failure.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 20
+            failureThreshold: 3
+          # Not ready is not a reason to restart: a controller that has lost its
+          # metrics source recovers by itself, and restarting it would only
+          # discard the decision history it needs for a stable scale-down.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 10
+            failureThreshold: 3
           volumeMounts:
             - name: config
               mountPath: /etc/kubescalesense

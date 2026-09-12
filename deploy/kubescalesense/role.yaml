@@ -1,29 +1,32 @@
 # Namespaced permissions on the target workload's namespace.
 #
-# PHASE 0 GRANTS NOTHING. See the reasoning in clusterrole.yaml: the Phase 0
-# binary makes no API calls, so least privilege (FR-25) is an empty rule set.
+# PHASE 1 IS READ-ONLY. See the reasoning in clusterrole.yaml: this rule set is
+# the enforcement that holds even if the controller's code is wrong.
+#
+# Note the phase split on `deployments`: the read arrives here in P1 so the
+# estimator can be validated against a real cluster in dry-run, while
+# `deployments/scale` is withheld until P3. That ordering is the RBAC
+# expression of the plan's sequencing principle — observe correctly before
+# acting at all — and it means a P1 bug cannot change a replica count even if
+# it tries.
+#
+# `deployments` `update` is never granted, only `deployments/scale`, so a bug
+# cannot rewrite the pod template.
 #
 # Deferred namespaced rules, from the canonical table in
 # docs/architecture.md § 7:
 #
-#   | Resource                 | API group            | Verbs               | Added in | Why                                                         |
-#   |--------------------------|----------------------|---------------------|----------|-------------------------------------------------------------|
-#   | deployments              | apps                 | get, list, watch    | P1       | Spec/status + pod template; rollout and external-write detection (FR-31, FR-32) |
-#   | replicasets              | apps                 | get, list, watch    | P1       | Identify pods of the target's *current* ReplicaSet (DR-09)  |
-#   | horizontalpodautoscalers | autoscaling          | get, list, watch    | P1       | Conflict detection (FR-19)                                  |
-#   | deployments/scale        | apps                 | get, update, patch  | P3       | The one mutation that changes the replica count (FR-01)     |
-#   | pods                     | core                 | patch               | P3       | pod-deletion-cost annotation (FR-21)                        |
-#   | events                   | core / events.k8s.io | create, patch       | P3       | Decision audit trail (FR-24)                                |
-#   | leases                   | coordination.k8s.io  | get, create, update | P4       | Leader election (FR-26)                                     |
+#   | Resource          | API group            | Verbs               | Added in | Why                                                     |
+#   |-------------------|----------------------|---------------------|----------|---------------------------------------------------------|
+#   | deployments/scale | apps                 | get, update, patch  | P3       | The one mutation that changes the replica count (FR-01) |
+#   | pods              | core                 | patch               | P3       | pod-deletion-cost annotation (FR-21)                    |
+#   | events            | core / events.k8s.io | create, patch       | P3       | Decision audit trail (FR-24)                            |
+#   | leases            | coordination.k8s.io  | get, create, update | P4       | Leader election (FR-26)                                 |
 #
-# Note the phase split on `deployments`: the read arrives in P1 so the estimator
-# can be validated against a real cluster in dry-run, while `deployments/scale`
-# is withheld until P3. That ordering is the RBAC expression of the plan's
-# sequencing principle — observe correctly before acting at all — and it means a
-# P1 bug cannot change a replica count even if it tries.
-#
-# `deployments` `update` is never granted, only `deployments/scale`, so a bug
-# cannot rewrite the pod template.
+# On events in particular: architecture § 8.2 defines the event set, and P1
+# emits none of it. A decision the controller did not act on is a log line and
+# a metric, not an event on someone else's Deployment — and `create` on events
+# is a write, which P1 does not hold.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -34,5 +37,29 @@ metadata:
   labels:
     app.kubernetes.io/name: kubescalesense
     app.kubernetes.io/component: controller
-    kubescalesense.io/phase: "P0"
-rules: []
+    kubescalesense.io/phase: "P1"
+rules:
+  # Spec, status, and pod template of the target. The template supplies the
+  # effective pod request that the whole fit calculation is built on (A-03),
+  # and generation vs. observedGeneration detects an in-flight rollout
+  # (FR-31). Comparing spec.replicas against our own last decision detects an
+  # external writer (FR-32).
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+
+  # Needed to tell the target's *current* pods from those of a previous
+  # ReplicaSet during a rollout (DR-09). Without this, a rolling update makes
+  # the controller count pods from two generations as one population and
+  # misread both utilization and readiness.
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+
+  # Conflict detection (FR-19). An HPA on the same Deployment is a fatal
+  # misconfiguration, not a warning: two controllers writing one replica count
+  # will fight indefinitely. Checked once at startup and watched thereafter,
+  # because an HPA can be created after we start.
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]

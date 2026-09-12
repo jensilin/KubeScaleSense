@@ -1,30 +1,36 @@
 # Cluster-scoped permissions for the controller.
 #
-# PHASE 0 GRANTS NOTHING, AND THAT IS NOT AN OVERSIGHT.
+# PHASE 1 IS READ-ONLY, AND THIS FILE IS THE ENFORCEMENT THAT DOES NOT DEPEND
+# ON THE CODE BEING CORRECT.
 #
-# cmd/kubescalesense makes no Kubernetes API calls in Phase 0: it loads config,
-# logs, waits for a signal, and exits. Least privilege (FR-25) therefore means
-# an empty rule set, and each rule below is added in the phase that first needs
-# it, together with the code that uses it and the test that covers it.
+# The binary also refuses to mutate in two other ways — its REST transport
+# rejects any method other than GET, HEAD, and OPTIONS, and the only actuator
+# compiled into it logs what it would have done — but those are properties of
+# code that could in principle be changed by mistake. This rule set is checked
+# by the API server, so a write attempt fails with a 403 regardless.
 #
-# Granting P1/P3 permissions now would mean a ServiceAccount that can read every
-# pod in the cluster months before anything reads one — and an empty `rules`
-# list is a far louder signal in review than a commented-out block.
+# Every verb below is used by code that exists. The remaining rules from the
+# canonical table in docs/architecture.md § 7 arrive in the phase that first
+# needs them.
 #
-# Deferred cluster-scoped rules, from the canonical table in
-# docs/architecture.md § 7 ("Kubernetes permissions and RBAC"):
-#
-#   | Resource        | API group    | Verbs            | Added in | Why                                          |
-#   |-----------------|--------------|------------------|----------|----------------------------------------------|
-#   | nodes           | core         | get, list, watch | P1       | Allocatable, taints, labels (FR-11, FR-12)   |
-#   | pods            | core         | get, list, watch | P1       | Sum requests per node, across all namespaces |
-#   | nodes, pods     | metrics.k8s.io | get, list      | P1       | Utilization signal (FR-07)                   |
+# Deferred cluster-scoped rules: none. The cluster-scoped set is complete for
+# every phase; all later additions are namespaced.
 #
 # Deliberately never granted, in any phase:
 #   - delete on pods: scale-down goes through the ReplicaSet controller so that
 #     graceful termination applies (D-05). Direct deletion would bypass it.
 #   - any write to nodes: no cordon, no taint, no eviction.
 #   - secrets: nothing to read (CR-5).
+#
+# One documented narrowing of architecture § 7, which lists
+# `metrics.k8s.io: nodes, pods`. Only `pods` is granted, because only pod
+# metrics are read. Node *utilization* is not an input to any decision: how
+# much CPU a node is currently burning says nothing about how much CPU is
+# available to schedule, which comes from allocatable minus the sum of
+# requests. Granting a permission for a signal the design specifically rejects
+# would make the rule set a worse description of the controller than this
+# comment is. The rule is added in the phase that first reads node metrics, if
+# one ever does.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -32,5 +38,26 @@ metadata:
   labels:
     app.kubernetes.io/name: kubescalesense
     app.kubernetes.io/component: controller
-    kubescalesense.io/phase: "P0"
-rules: []
+    kubescalesense.io/phase: "P1"
+rules:
+  # Allocatable, taints, labels, and Ready condition of every node: the inputs
+  # to the candidate-node filter and the per-node fit calculation
+  # (FR-11, FR-12).
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+
+  # Pods across all namespaces, not just the target's. A neighbouring
+  # namespace's pods consume the same node's CPU, so a namespaced pod list
+  # would overstate free capacity on every shared node — the single most
+  # consequential way to get this calculation wrong.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+
+  # Utilization of the target's own pods (FR-07). `watch` is not granted:
+  # metrics.k8s.io is a sampling API served on request and does not support
+  # informers, so the controller lists on each reconcile.
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]

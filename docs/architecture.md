@@ -781,8 +781,11 @@ because the reset is driven by observed capacity, and the informer sees a new no
 4. **Re-read before commit** — the resource snapshot is built immediately before `Decide`, and the `scale`
    write carries a `resourceVersion` precondition; a `409 Conflict` discards the decision and re-runs the
    loop rather than retrying a stale value ([FR-05](requirements.md#4-functional-requirements)).
-5. **Node heartbeat check** — nodes whose `Ready` condition heartbeat is older than the node-monitor grace
-   period are excluded from the candidate set: a silent node's "free" resources are not usable.
+5. **Node heartbeat check** — nodes whose `Ready` condition heartbeat is older than twice the kubelet status
+   report frequency are excluded from the candidate set: the "free" resources of a node we can no longer see
+   are not usable. The window is minutes rather than the 40 s node-monitor grace period because the 40 s
+   budget applies to the node `Lease`, not to `status.conditions`
+   ([resource-calculation § 2](resource-calculation.md#2-step-1--candidate-node-set)).
 6. **Headroom as slack for the irreducible race** — between our read and the scheduler's placement, other
    controllers may consume capacity; `perNodeReserve*` and `fitCapacityMarginPods` absorb it.
 

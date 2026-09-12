@@ -65,13 +65,27 @@ exported as `kss_excluded_nodes{exclusion_reason}` so an unexpected HOLD is expl
 | # | Check | Source | `exclusion_reason` |
 | --- | --- | --- | --- |
 | C1 | `Ready` condition is `True` | `node.status.conditions` | `notReady` |
-| C2 | `Ready` heartbeat is recent (within the node-monitor grace period, 40 s default) | `lastHeartbeatTime` | `staleHeartbeat` |
+| C2 | `Ready` heartbeat is recent (within twice the kubelet status report frequency, 10 min default — see below) | `lastHeartbeatTime` | `staleHeartbeat` |
 | C3 | Not cordoned | `node.spec.unschedulable == false` | `cordoned` |
 | C4 | No untolerated `NoSchedule` / `NoExecute` taint | `node.spec.taints` vs. pod tolerations | `taint` |
 | C5 | Matches `nodeSelector` (if `respectNodeSelector`) | node labels | `nodeSelector` |
 | C6 | Matches required node affinity (if `respectNodeAffinity`) | node labels | `nodeAffinity` |
 | C7 | Matches `resources.nodeLabelSelector`, when configured | node labels | `operatorRestricted` |
 | C8 | Has a non-zero remaining pod slot count | `allocatable.pods` vs. pod count | `podSlotsFull` |
+
+**Why C2's window is minutes, not the 40 s node-monitor grace period.** Since node leases went GA the
+kubelet's liveness heartbeat is the `Lease` in `kube-node-lease`, renewed every 10 s, and that is what
+kube-controller-manager evaluates `--node-monitor-grace-period` against. `node.status.conditions` is written
+only when a condition changes or every `--node-status-report-frequency` (5 min default), so a healthy node's
+`lastHeartbeatTime` is routinely a minute or more old. An earlier revision of this document specified 40 s
+here; measured against a live single-node k3s cluster that excluded the only node on most reconciles and drove
+fit capacity to zero. Two report periods is the window, so one missed status write is not an exclusion.
+
+C2 is therefore a guard against a **stale view** — a silently desynced watch, or a kubelet that has stopped
+reporting status altogether — and not against node death. Node death is C1's job: when a lease expires the
+node controller writes `Ready=Unknown`, which arrives on the same watch. Reading the `Lease` directly would be
+more precise, but it is not needed for correctness here and `leases` access is deferred to
+[P4](implementation-plan.md#p4--hardening-and-operability-poc-complete).
 
 ### 2.1 Taints and tolerations (C4)
 
@@ -345,7 +359,7 @@ between our read and the scheduler's placement of our new pods, other actors can
 | Race | Window | Mitigation |
 | --- | --- | --- |
 | Another controller's pods take the free space | ms–seconds | `perNodeReserve*` + `fitCapacityMarginPods`; watchdog if it still fails |
-| A node goes `NotReady` after our read | ≤ 40 s heartbeat + watch latency | C1/C2 exclusion next reconcile; a scale-up already issued is caught by the watchdog |
+| A node goes `NotReady` after our read | ≤ lease grace period + watch latency | C1 exclusion next reconcile — C2's longer window guards a stale view, not node death; a scale-up already issued is caught by the watchdog |
 | Our own previous scale-up is still being scheduled | ≤ `pendingPodTimeout` | Assigned-but-Pending pods already count in Step 3; `HoldPendingPods` blocks stacking |
 | Deployment pod template changed mid-flight | one interval | Effective request re-read every reconcile; `resourceVersion` precondition on the write ([FR-05](requirements.md#4-functional-requirements)) |
 | Informer watch silently desynced | until re-list | Periodic informer resync; `kss_metric_sample_age_seconds`; `HoldStaleMetrics` |
