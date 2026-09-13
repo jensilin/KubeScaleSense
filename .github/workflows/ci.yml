@@ -49,10 +49,14 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      # The action major and the golangci-lint major are coupled: action v6 is
+      # restricted to golangci-lint v1, so `latest` there resolves to v1.64.8,
+      # which cannot parse the schema v2 `.golangci.yml`. v9 is the v2 line.
+      # Pinned rather than `latest` so a new release cannot break CI on its own.
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.13.2
 
       # The design set is heavily cross-referenced, so broken anchors are a
       # build failure (test-plan section 10).
