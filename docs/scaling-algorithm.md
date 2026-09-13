@@ -156,6 +156,55 @@ desiredClamped = min(max(desiredRaw, R_min), R_max)
 visible rather than hidden by the clamp. If `desiredRaw > R_max` and `R_cur == R_max`, the reason is
 `HoldAtMaxReplicas`; symmetrically for `R_min`.
 
+### 3.5 Measuring `itemsPerReplica`
+
+`IPR` sets the gain of the whole loop, so it is measured rather than reasoned about
+([`tests/e2e/measure-items-per-replica.sh`](../tests/e2e/measure-items-per-replica.sh)). The SLO it is
+measured against is a property of the workload, not of KubeScaleSense: for the demonstration Normalizer it is
+**p95 request latency ≤ 500 ms**. That is deliberately not
+[NFR-02](requirements.md#5-non-functional-requirements), which bounds the *controller's* reconcile duration
+and has nothing to do with how much work a Normalizer pod can hold.
+
+**Step the in-flight count, not the offered rate.** This is the part that is easy to get wrong, and the first
+attempt at this measurement got it wrong. Stepping the offered rate produces no usable curve: below the pod's
+service rate the queue stays empty and pressure reads ≈ 1, and one step above it the queue is unstable and
+runs straight to `NORMALIZER_QUEUE_LIMIT`, so the measurement jumps from 1 to 64 with nothing in between.
+Neither number answers "how much pressure can one replica carry".
+
+A closed-loop client does answer it. Holding `N` requests in flight pins pressure at `N` by construction —
+the client cannot send the `N+1`th until one returns — so latency becomes a function of pressure, which is
+the function the engine needs. Two further precautions, both of which flatter the result if skipped:
+
+- **Measure latency over the `normalized` outcome only.** A saturated Normalizer rejects with `503`
+  *immediately*, so counting rejections would make an overloaded pod look faster than a busy one. The shed
+  fraction is reported alongside, and a step that sheds has not met the SLO — it has stopped trying.
+- **Take histogram deltas, not totals.** The exposition is cumulative over pod lifetime, so one fast early
+  step would keep flattering every later one.
+
+0.5 s is one of the histogram's bucket boundaries, which is why the SLO is evaluated *exactly* — the
+proportion inside it is read off the `le="0.5"` bucket rather than interpolated by a quantile estimator.
+
+**Result on the demonstration cluster**, one replica, 2000 requests per level:
+
+| Requests in flight | 44 | 48 | 52 | 56 | 60 | 64 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Pressure the controller measured | 38.4 | 39.8 | 43.0 | 46.5 | 54.8 | 53.7 |
+| Fraction within 500 ms | 1.0000 | 0.9565 | 0.5065 | 0.0910 | 0.0125 | 0.0265 |
+| Meets p95 ≤ 500 ms | yes | yes | no | no | no | no |
+
+The SLO is crossed between a measured pressure of 39.8 and 43.0, so **`IPR` = 40** — the last passing level,
+which is very slightly conservative. That is the safe direction for a divisor: it asks for the next replica a
+little early rather than a little late. The demonstration config had guessed 12, low by more than a factor of
+three, which would have made the controller demand roughly three times the replicas a spike warranted.
+
+**What the number depends on, and therefore what invalidates it.** `IPR` = 40 is a property of *this*
+Normalizer configuration on *this* cluster, not of the workload in general. It moves if any of these move:
+the per-request cost (`NORMALIZER_COST_ROUNDS`, 250 000 here), the pod's CPU limit (2 CPUs), the concurrency
+and queue limits (4 and 64), or the amount of host CPU actually spare — the measurement ran on a 4-CPU WSL
+host, so a pod at its 2-CPU limit is contending with everything else on the box. Re-measure after changing
+any of them. Two independent runs agreed here (40.0 and 39.8 at the same level), so the figure is repeatable
+on this host, which is a weaker claim than being repeatable anywhere.
+
 ---
 
 ## 4. Step 2 — Direction, deadband, and step limits

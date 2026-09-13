@@ -130,17 +130,17 @@ func (c *Config) validateController(v *validator) {
 			oneOfMessage(LogFormatJSON, LogFormatText), "CR-2")
 	}
 
-	// Phase 1 observes and decides; it has no actuator that can write a replica
-	// count. Refusing dryRun: false is the difference between a controller that
-	// says so at startup and one that appears to be running live while silently
-	// changing nothing — which is the more dangerous of the two, because
-	// somebody would eventually trust it.
-	if !c.Controller.DryRun {
-		v.add("controller.dryRun", c.Controller.DryRun,
-			"must be true in this phase: Phase 1 implements observation and dry-run decisions only, and "+
-				"actuation of the replica count arrives in P3 — Actuation",
-			"FR-04")
-	}
+	// controller.dryRun is no longer constrained here.
+	//
+	// Through P2 this validator refused dryRun: false outright, because the
+	// binary had no actuator that could write and a controller that appears to
+	// run live while silently changing nothing is the more dangerous of the two
+	// failure modes. P3 supplies the write path, so false is now a legal and
+	// meaningful value.
+	//
+	// What has not changed is the default: DefaultDryRun remains true, so live
+	// actuation is something an operator turns on deliberately rather than
+	// something they get by omission (FR-04).
 }
 
 func (c *Config) validateTarget(v *validator) {

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jensilin/KubeScaleSense/internal/config"
+	"github.com/jensilin/KubeScaleSense/internal/observability"
 )
 
 func TestRun_Version(t *testing.T) {
@@ -135,7 +136,7 @@ func TestLogStartup_EmitsRequiredFields(t *testing.T) {
 	logStartup(cfg.NewLogger(&stdout).With(slog.String("app", AppName)), cfg, src)
 
 	records := parseJSONLogs(t, stdout.String())
-	startup := findRecord(records, "KubeScaleSense observer started")
+	startup := findRecord(records, "KubeScaleSense started")
 	if startup == nil {
 		t.Fatalf("no startup record found in logs:\n%s", stdout.String())
 	}
@@ -153,16 +154,78 @@ func TestLogStartup_EmitsRequiredFields(t *testing.T) {
 		t.Errorf("phase = %v, want %s", startup["phase"], Phase)
 	}
 
-	// Phase 1 is dry-run by construction, and the startup line is where an
-	// operator confirms it before trusting the process near a live cluster.
+	// Dry-run is the default, and the startup line is where an operator
+	// confirms it before trusting the process near a live cluster.
 	if startup["dry_run"] != true {
 		t.Errorf("dry_run = %v, want true", startup["dry_run"])
 	}
 
 	// Nobody reading these logs should be able to conclude that the controller
 	// is changing the replica count.
-	if findRecord(records, "no scaling is performed in this phase") == nil {
-		t.Error("startup should state plainly that no scaling happens in P1")
+	if findRecord(records, "no scaling will be performed: this process is in dry-run") == nil {
+		t.Error("startup should state plainly that this process writes nothing")
+	}
+}
+
+// The other half of the same contract, and the more important one now that the
+// write path exists: a process that *can* scale must say so at startup, in a
+// line an operator can find without reading the configuration.
+func TestLogStartup_AnnouncesLiveActuation(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath, _ := writeValidConfig(t, dir)
+
+	cfg, src, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("loading the test config: %v", err)
+	}
+	cfg.Controller.DryRun = false
+
+	var stdout bytes.Buffer
+	logStartup(cfg.NewLogger(&stdout).With(slog.String("app", AppName)), cfg, src)
+
+	records := parseJSONLogs(t, stdout.String())
+
+	if findRecord(records, "no scaling will be performed: this process is in dry-run") != nil {
+		t.Error("a live process claimed to be in dry-run")
+	}
+
+	live := findRecord(records, "live actuation is enabled: this process will change the replica count of the target Deployment")
+	if live == nil {
+		t.Fatalf("no live-actuation warning found in logs:\n%s", stdout.String())
+	}
+	if got, want := live["target"], cfg.Target.Namespace+"/"+cfg.Target.Deployment; got != want {
+		t.Errorf("target = %v, want %v: the warning must name what will be scaled", got, want)
+	}
+}
+
+// In dry-run the process must not even build a client that could write.
+//
+// Asserted by giving buildActuator a kubeconfig path that does not exist: a
+// dry-run process never reads it, because it constructs no actuation client at
+// all, while a live one fails. That is the difference between a capability
+// being absent and a flag being checked.
+func TestBuildActuator_DryRunBuildsNoWritableClient(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Default()
+	cfg.Target.Namespace = "data-pipeline"
+	cfg.Target.Deployment = "normalizer"
+
+	opts := options{kubeconfigPath: filepath.Join(t.TempDir(), "does-not-exist")}
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+
+	actuator, err := buildActuator(cfg, opts, observability.NewMetrics(), log)
+	if err != nil {
+		t.Fatalf("buildActuator in dry-run: %v", err)
+	}
+	if actuator.Mode() != "dry-run" {
+		t.Errorf("Mode() = %q, want dry-run", actuator.Mode())
+	}
+
+	cfg.Controller.DryRun = false
+	if _, err := buildActuator(cfg, opts, observability.NewMetrics(), log); err == nil {
+		t.Error("buildActuator in live mode accepted a kubeconfig that does not exist, so it cannot have " +
+			"tried to build a client")
 	}
 }
 

@@ -1,12 +1,14 @@
 package controller
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,21 +16,30 @@ import (
 	kubernetesaccess "github.com/jensilin/KubeScaleSense/internal/kubernetes"
 )
 
-// This file is the machine-checked form of the phase's central claim: the
-// Phase 1 controller has no path by which it could change the cluster.
+// This file is the machine-checked form of the project's central safety claim.
 //
-// Three independent layers enforce it, and each is asserted separately, because
+// Through P2 the claim was "there is no path by which this controller could
+// change the cluster". P3 gives it one, so the claim changes shape rather than
+// weakening: there is exactly one, it writes one field of one object, and every
+// layer that used to say "nothing" now says "this and nothing else".
+//
+// Four independent layers enforce it, and each is asserted separately, because
 // any one of them could be removed by a plausible-looking future edit:
 //
-//	interface    the controller is handed a ClusterReader, which has no
-//	             mutating method and no clientset behind it
-//	transport    the REST client refuses every non-GET method
-//	             (internal/kubernetes, TestReadOnlyClientset_HasNoWritePath)
-//	RBAC         the ServiceAccount holds no write verb (deploy/)
+//	interface    the controller's observation view is a ClusterReader, which
+//	             has no mutating method and no clientset behind it
+//	surface      exactly two Actuators exist, and the one mutating client-go
+//	             call in the repository is UpdateScale in internal/kubernetes
+//	transport    the observation client refuses every non-GET method, and the
+//	             actuation client refuses every write except PUT/PATCH to the
+//	             target's scale path (internal/kubernetes)
+//	RBAC         the ServiceAccount holds exactly one write rule, on
+//	             deployments/scale (deploy/)
 //
 // The transport and RBAC layers hold even if the code is wrong. The tests below
-// cover the first layer and, more importantly, guard the boundary: they fail if
-// a clientset is ever wired into a package that computes decisions.
+// cover the first two and, more importantly, guard the boundary: they fail if a
+// clientset is ever wired into a package that computes decisions, or if a second
+// way to mutate the cluster appears anywhere.
 
 // mutatingMethods are the client-go verbs that change cluster state. A name
 // here is enough to fail the check, so the list is deliberately broad: it is
@@ -127,15 +138,23 @@ func TestOptions_HoldNoKubernetesClient(t *testing.T) {
 	}
 }
 
-// There is exactly one Actuator in the repository and it writes nothing. A
-// second implementation appearing before P3 is the moment the phase's guarantee
-// would be given up, so it must be a test failure rather than a code review
-// someone might skim.
-func TestActuator_HasExactlyOneImplementation(t *testing.T) {
+// wantActuators is the complete set of things in this repository that can be
+// handed to the reconcile loop as its actuator.
+//
+// Two, named. A third appearing is the moment the safety surface grows, and
+// that should be a failing test rather than a code review someone might skim —
+// whether the newcomer writes anything or not, because the question "how many
+// things here can change a cluster?" should have an answer that is checked.
+var wantActuators = map[string]string{
+	"DryRunActuator": "writes nothing and performs no API call at all",
+	"ScaleActuator":  "writes spec.replicas through the scale subresource, and nothing else",
+}
+
+func TestActuator_ImplementationsAreTheExpectedTwo(t *testing.T) {
 	t.Parallel()
 
 	root := repoRoot(t)
-	var implementations []string
+	found := map[string]string{}
 
 	forEachGoFile(t, root, func(path string, file *ast.File) {
 		for _, decl := range file.Decls {
@@ -147,16 +166,100 @@ func TestActuator_HasExactlyOneImplementation(t *testing.T) {
 			if !mentionsDecision(fn.Type) {
 				continue
 			}
-			implementations = append(implementations, receiverName(fn)+" in "+rel(root, path))
+			found[receiverName(fn)] = rel(root, path)
 		}
 	})
 
-	if len(implementations) != 1 {
-		t.Errorf("found %d Actuator implementations, want exactly 1 (DryRunActuator):\n  %s",
-			len(implementations), strings.Join(implementations, "\n  "))
+	for name, why := range wantActuators {
+		if _, ok := found[name]; !ok {
+			t.Errorf("Actuator %s is missing; it should exist and %s", name, why)
+		}
 	}
-	if len(implementations) == 1 && !strings.Contains(implementations[0], "DryRunActuator") {
-		t.Errorf("the only Actuator is %q, want DryRunActuator", implementations[0])
+	for name, where := range found {
+		if _, expected := wantActuators[name]; !expected {
+			t.Errorf("%s in %s is a third Actuator implementation; the set of things that can act on a "+
+				"cluster is deliberately enumerated, so add it to wantActuators with an explicit decision",
+				name, where)
+		}
+	}
+}
+
+// The one mutating client-go call in the repository.
+//
+// TestNoMutatingCallsOutsideTheKubernetesPackage exempts internal/kubernetes
+// because it legitimately names these verbs. This is the other half of that
+// exemption: inside that package, the set of mutating calls must be exactly
+// one, and it must be the scale subresource. Without this pair, "only
+// internal/kubernetes may write" would be an unbounded licence for the one
+// package nobody else is checking.
+func TestTheKubernetesPackageWritesOnlyTheScaleSubresource(t *testing.T) {
+	t.Parallel()
+
+	root := repoRoot(t)
+	type site struct {
+		verb string
+		file string
+	}
+	var sites []site
+
+	forEachGoFile(t, root, func(path string, file *ast.File) {
+		if filepath.ToSlash(filepath.Dir(rel(root, path))) != "internal/kubernetes" {
+			return
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			for _, verb := range mutatingMethods {
+				if selector.Sel.Name == verb {
+					sites = append(sites, site{verb: verb, file: rel(root, path)})
+				}
+			}
+			return true
+		})
+	})
+
+	if len(sites) != 1 {
+		t.Fatalf("found %d mutating client-go calls in internal/kubernetes, want exactly 1 (UpdateScale): %+v",
+			len(sites), sites)
+	}
+	if sites[0].verb != "UpdateScale" {
+		t.Errorf("the single mutating call is %s in %s; the only mutation this project performs is UpdateScale "+
+			"on deployments/scale (FR-01, architecture § 7)", sites[0].verb, sites[0].file)
+	}
+	if sites[0].file != "internal/kubernetes/scale.go" {
+		t.Errorf("the mutating call lives in %s; it belongs in internal/kubernetes/scale.go, which is the one "+
+			"file a reviewer should have to read to audit the write path", sites[0].file)
+	}
+}
+
+// The write capability handed to the reconcile loop must stay two methods wide.
+//
+// The companion to TestClusterReader_ExposesNoMutatingMethod: that one bounds
+// what the controller can read, this one bounds what it can write. Asserted by
+// reflection so it holds against the compiled interface, and by exact method
+// set rather than by a name filter — because the risk here is not a method
+// called Delete, it is a fourth method that quietly does something else.
+func TestScaleTarget_IsTwoMethodsWide(t *testing.T) {
+	t.Parallel()
+
+	target := reflect.TypeOf((*ScaleTarget)(nil)).Elem()
+
+	want := map[string]bool{"Current": true, "Write": true}
+	got := map[string]bool{}
+
+	for i := range target.NumMethod() {
+		got[target.Method(i).Name] = true
+	}
+
+	if !reflect.DeepEqual(want, got) {
+		t.Errorf("ScaleTarget exposes %v, want exactly %v; the actuator's capability is deliberately "+
+			"limited to reading and setting one replica count", keysOf(got), keysOf(want))
 	}
 }
 
@@ -243,16 +346,20 @@ func TestNoMutatingCallsOutsideTheKubernetesPackage(t *testing.T) {
 	})
 }
 
-// The RBAC manifests must grant no write verb. This layer holds even if every
-// Go-level guarantee above is broken, which is why it is asserted against the
-// shipped YAML rather than trusted.
-func TestRBACManifests_GrantNoWriteVerb(t *testing.T) {
+// The RBAC manifests must grant exactly one write rule, on deployments/scale.
+//
+// This layer holds even if every Go-level guarantee above is broken, which is
+// why it is asserted against the shipped YAML rather than trusted. The
+// assertion is deliberately two-sided: the scale rule must be present, because
+// without it P3 does not work, and it must be the *only* rule carrying a write
+// verb, because that is the bound on what a bug can do.
+func TestRBACManifests_GrantExactlyOneWriteRule(t *testing.T) {
 	t.Parallel()
 
 	root := repoRoot(t)
-	writeVerbs := []string{
-		"create", "update", "patch", "delete", "deletecollection",
-	}
+	writeVerbs := []string{"create", "update", "patch", "delete", "deletecollection"}
+
+	writeRules := map[string][]string{}
 
 	for _, name := range []string{"clusterrole.yaml", "role.yaml"} {
 		path := filepath.Join(root, "deploy", "kubescalesense", name)
@@ -262,20 +369,83 @@ func TestRBACManifests_GrantNoWriteVerb(t *testing.T) {
 			t.Fatalf("reading %s: %v", name, err)
 		}
 
+		// The resource a verbs: line belongs to is the resources: line above
+		// it, which is enough structure for a rule list this small and avoids
+		// pulling a YAML parser into a guard test.
+		resources := ""
 		for i, line := range strings.Split(string(raw), "\n") {
 			trimmed := strings.TrimSpace(line)
-			// Only rule lines matter. The deferred-permission tables in the
-			// comments name every future verb on purpose.
+
+			// Comments are skipped: the deferred-permission tables name every
+			// future verb on purpose.
+			if strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			if strings.HasPrefix(trimmed, "resources:") {
+				resources = strings.TrimSpace(strings.TrimPrefix(trimmed, "resources:"))
+				continue
+			}
 			if !strings.HasPrefix(trimmed, "verbs:") {
 				continue
 			}
+
 			for _, verb := range writeVerbs {
-				if strings.Contains(trimmed, verb) {
-					t.Errorf("%s:%d grants %q: %s", name, i+1, verb, trimmed)
+				if !strings.Contains(trimmed, verb) {
+					continue
 				}
+				where := fmt.Sprintf("%s:%d %s %s", name, i+1, resources, trimmed)
+				writeRules[resources] = append(writeRules[resources], where)
 			}
 		}
 	}
+
+	const scaleResource = `["deployments/scale"]`
+
+	if _, ok := writeRules[scaleResource]; !ok {
+		t.Errorf("no rule grants a write verb on %s; P3 cannot change a replica count without it", scaleResource)
+	}
+
+	for resources, sites := range writeRules {
+		if resources == scaleResource {
+			continue
+		}
+		t.Errorf("%s carries a write verb, which is outside P3's single permitted mutation:\n  %s",
+			resources, strings.Join(sites, "\n  "))
+	}
+}
+
+// Within the one write rule, the verbs must be exactly the documented three.
+// `create` and `delete` on a subresource are meaningless, and their appearance
+// would mean the rule was written by pattern rather than by intent.
+func TestRBACManifests_ScaleRuleGrantsOnlyGetUpdatePatch(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(repoRoot(t), "deploy", "kubescalesense", "role.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading role.yaml: %v", err)
+	}
+
+	lines := strings.Split(string(raw), "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		if !strings.Contains(line, `["deployments/scale"]`) {
+			continue
+		}
+		if i+1 >= len(lines) {
+			t.Fatal("the deployments/scale rule has no verbs line after it")
+		}
+
+		got := strings.TrimSpace(lines[i+1])
+		const want = `verbs: ["get", "update", "patch"]`
+		if got != want {
+			t.Errorf("the deployments/scale rule grants %q, want %q (architecture § 7)", got, want)
+		}
+		return
+	}
+	t.Error("role.yaml declares no deployments/scale rule")
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -343,6 +513,16 @@ func forEachGoFile(t *testing.T, root string, visit func(path string, file *ast.
 	if visited < 10 {
 		t.Fatalf("only %d Go files visited; the source sweep is not covering the repository", visited)
 	}
+}
+
+// keysOf renders a set for an error message, sorted so the message is stable.
+func keysOf(set map[string]bool) []string {
+	keys := make([]string, 0, len(set))
+	for key := range set {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func rel(root, path string) string {

@@ -26,20 +26,44 @@ unreachable from these scripts by construction, not by care.
 | Tool | Version | Why |
 | --- | --- | --- |
 | `docker` | any recent | kind's container runtime |
-| `kind` | ≥ 0.23 | the isolated cluster |
+| `kind` | ≥ 0.32 | the isolated cluster |
 | `kubectl` | ≥ 1.29 | everything |
 | `jq`, `curl` | any | the NiFi flow assertion reads the REST API |
 
 ```bash
-go install sigs.k8s.io/kind@v0.23.0
+go install sigs.k8s.io/kind@v0.32.0
 # or: https://kind.sigs.k8s.io/docs/user/quick-start/#installation
 ```
+
+The floor is 0.32 rather than 0.23 because of the node image each version
+defaults to. kind 0.23 defaults to Kubernetes 1.30, which is five minor
+versions behind the `kubectl` this demo was validated with, and — more to the
+point — node images from 1.35 onwards require cgroup v2 on the host. Pinning
+the kind version is how the demo pins the Kubernetes version without naming an
+image digest in six places.
 
 Expect to need about **6 GiB of memory and 4 CPUs**. The four-node topology plus
 NiFi's JVM plus several Normalizer replicas does not fit in much less, and the
 failure mode is OOM kills that look like a broken pipeline. `demo-up.sh` checks
 and warns rather than refusing, because "it may well work" is true and being
 told why it didn't is what matters.
+
+One kernel setting is not optional, and it fails in a thoroughly misleading way:
+
+```bash
+sudo sysctl -w fs.inotify.max_user_instances=512
+```
+
+The default of 128 is shared across the whole kernel, and each kind node wants
+several instances for its kubelet, cAdvisor and kube-proxy. On a host already
+running another cluster, a four-node kind cluster exhausts it. What you see is
+not "out of inotify instances": you see `kube-proxy` in `CrashLoopBackOff` with
+`too many open files`, a node missing from `kubectl get nodes` entirely, and —
+because no kube-proxy means no service VIP routing — metrics-server panicking
+with `dial tcp 10.96.0.1:443: connect: connection refused`. Three unrelated-looking
+symptoms, one cause. `fs.inotify.max_user_watches` is usually already high
+enough; it is the *instances* limit that runs out. This is
+[kind's own documented known issue](https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files).
 
 Short of memory? `make demo-spike MODE=http` drives the same workload straight
 at `normalizer-service` with NiFi out of the path. That exercises the controller,
@@ -54,6 +78,20 @@ make demo-observe              # follow the controller's decisions
 make demo-spike                # drive LOW -> HIGH -> LOW through NiFi
 make demo-down                 # delete the cluster
 ```
+
+The cluster comes up in **dry-run**, and that is the order to keep: watch the
+decisions first, and only then let the controller act on them.
+
+```bash
+make demo-actuate              # dryRun: false — the controller now scales
+make demo-replicas             # the replica count and the last decision
+make demo-dry-run              # back to observing only
+```
+
+`demo-actuate.sh` asks the API server what the controller's ServiceAccount can
+actually do before it flips the switch: `update deployments --subresource=scale`
+must be allowed, and `update deployments` and `delete pods` must not. A Role
+that has been widened fails there rather than in production.
 
 The interesting part is `make demo-observe` while `make demo-spike` runs. During
 the HIGH phase the controller logs something like:

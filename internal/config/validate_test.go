@@ -469,16 +469,6 @@ func TestValidate_Rejects(t *testing.T) {
 			wantKey: "resources.nodeLabelSelector",
 			wantMsg: "not a valid label selector",
 		},
-
-		// --- phase constraints ---
-		{
-			// Accepting this would mean accepting a setting the binary cannot
-			// honour: there is no write path to enable (CR-6).
-			name:    "live mode requested from a phase that cannot actuate",
-			mutate:  func(c *Config) { c.Controller.DryRun = false },
-			wantKey: "controller.dryRun",
-			wantMsg: "must be true in this phase",
-		},
 	}
 
 	for _, tt := range tests {
@@ -513,6 +503,29 @@ func TestValidate_Rejects(t *testing.T) {
 // The node label selector is handed to the same parser the candidate-node
 // filter uses, so anything Kubernetes accepts must pass validation. Phase 0
 // hand-rolled an equality-only check that rejected most of these.
+// Live mode is a legal configuration from P3 onwards, and the default is still
+// dry-run.
+//
+// Both halves matter. Before P3 this validator refused dryRun: false, because
+// the binary had no write path and a controller that looks live while changing
+// nothing is the more dangerous failure. Now that the write path exists the
+// refusal would be wrong — but the default staying true is what keeps live
+// actuation something an operator chooses rather than something they inherit.
+func TestValidate_LiveModeIsAllowedAndDryRunIsTheDefault(t *testing.T) {
+	t.Parallel()
+
+	cfg := validConfig()
+	cfg.Controller.DryRun = false
+
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("dryRun: false was rejected, but P3 implements actuation: %v", err)
+	}
+
+	if !Default().Controller.DryRun {
+		t.Error("the default is live actuation; it must remain dry-run so that omitting the field is safe")
+	}
+}
+
 func TestValidate_AcceptsEveryValidLabelSelector(t *testing.T) {
 	t.Parallel()
 

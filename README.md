@@ -247,16 +247,26 @@ Rationale for each: [requirements § 3](docs/requirements.md#3-non-goals). When 
 ## Next step
 
 [P0 — Foundation](docs/implementation-plan.md#p0--foundation),
-[P1 — Observation](docs/implementation-plan.md#p1--observation-dry-run-only) and
-[P2 — Demonstration workload](docs/implementation-plan.md#p2--demonstration-workload) are implemented. There
-is a real pipeline, a real pressure signal read from the workload itself, and a controller that computes
-demand and feasibility and reports a decision every interval — while writing nothing.
+[P1 — Observation](docs/implementation-plan.md#p1--observation-dry-run-only),
+[P2 — Demonstration workload](docs/implementation-plan.md#p2--demonstration-workload) and the actuation half
+of [P3](docs/implementation-plan.md#p3--actuation-and-stability) are implemented. There is a real pipeline, a
+real pressure signal read from the workload itself, a controller that computes demand and feasibility every
+interval, and — since P3 — a write path that acts on it.
 
-Next is [P3 — Actuation and stability](docs/implementation-plan.md#p3--actuation-and-stability): the write
-path, the hysteresis that keeps it from oscillating, the Pending watchdog, and the external-writer
-protection. Everything P3 needs is already measured; what it adds is permission to act on it.
+The write path is deliberately one call wide: `UpdateScale` on the target's `deployments/scale`, carrying a
+`resourceVersion` precondition, behind a transport that refuses every other mutating request. The controller
+cannot reach the pod template and holds no permission to delete a pod, so scale-down goes through the
+ReplicaSet controller where graceful termination and PodDisruptionBudgets still apply. In dry-run — still the
+default — no writable client is constructed at all, so the capability is absent from the process rather than
+merely unused.
 
-Two things stand between P2 and that. First, `itemsPerReplica` is still a **guess** (12 in the demo config)
-and the P2 exit criteria require measuring it — the pressure level at which per-request latency reaches the
-SLO at a fixed replica count. Second, `DI-08` must show that replicas actually convert into throughput on the
-demo cluster; a flat curve means the whole premise is wrong and scaling would be theatre. Both gate P3.
+Both P2 exit criteria that gated this are now closed. `itemsPerReplica` was **measured** at 40 against the
+Normalizer's SLO of p95 ≤ 500 ms, correcting a guess of 12
+([scaling-algorithm § 3.5](docs/scaling-algorithm.md#35-measuring-itemsperreplica)), and `DI-08` showed that
+replicas do convert into throughput ([test-plan § 6.1](docs/test-plan.md#61-di-08-result)) — including the
+case that matters most, where demand asked for 17 replicas and the controller added the one that actually
+fit.
+
+What P3 has not finished is the operability half: Kubernetes events, `pod-deletion-cost`, and leader election
+are still [deferred](docs/implementation-plan.md#7-deferred-scope-and-when-to-pick-it-up). Until leader
+election exists, single-writer is enforced the blunt way — `replicas: 1` with `strategy: Recreate`.

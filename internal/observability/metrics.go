@@ -95,7 +95,7 @@ func NewMetrics() *Metrics {
 
 	m.scaleActionsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "kss_scale_actions_total",
-		Help: "Replica-count mutations actually performed. Zero for the whole of Phase 1, which is the point of the phase.",
+		Help: "Replica-count mutations by direction and outcome. The applied series counts writes that reached the cluster; dry_run counts decisions deliberately not acted on.",
 	}, []string{"direction", "outcome"})
 
 	m.currentReplicas = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -343,6 +343,12 @@ type Observation struct {
 	SignalSource string
 	RawBacklog   int64
 
+	// DryRun reports whether this reconcile could have written. It decides
+	// which series a scale action lands in: a dry-run decision is recorded as
+	// dry_run here, while a live one is recorded by the actuator once the write
+	// has actually happened — so "applied" counts writes, not intentions.
+	DryRun bool
+
 	Now             time.Time
 	ObserveDuration time.Duration
 	DecideDuration  time.Duration
@@ -400,13 +406,23 @@ func (m *Metrics) RecordReconcile(obs Observation) {
 		m.backoffFitCapacity.Set(-1)
 	}
 
-	// Phase 1 never mutates, so an action decision is recorded as a dry run
-	// rather than as applied. This is what keeps a dry-run trace directly
-	// comparable with a live one while leaving the "applied" series honestly at
-	// zero.
-	if d.Action == scaling.ActionWrite {
+	// In dry-run an action decision is recorded here, as an intention. In live
+	// mode it is not recorded here at all: the actuator increments the counter
+	// itself, after the write, with the outcome the write actually had. That
+	// split is the whole point — "applied" counts replica counts that reached
+	// the cluster, not decisions that hoped to.
+	if obs.DryRun && d.Action == scaling.ActionWrite {
 		m.scaleActionsTotal.WithLabelValues(string(d.Direction), "dry_run").Inc()
 	}
+}
+
+// RecordScaleAction counts one attempt to change the replica count, labelled
+// with what became of it.
+//
+// Called by the live actuator rather than by the reconcile loop, because only
+// the actuator knows whether the write landed, conflicted, or failed.
+func (m *Metrics) RecordScaleAction(direction, outcome string) {
+	m.scaleActionsTotal.WithLabelValues(direction, outcome).Inc()
 }
 
 func (m *Metrics) recordFeasibility(f resources.Feasibility) {

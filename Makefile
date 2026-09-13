@@ -127,3 +127,25 @@ demo-down: ## Delete the kind demo cluster
 demo-observe: ## Follow the controller's decisions while a spike runs
 	@kubectl --context kind-kubescalesense-demo -n kubescalesense \
 		logs -l app.kubernetes.io/name=kubescalesense -f --tail=20
+
+## --- Phase 3: actuation ---------------------------------------------------
+#
+# Enabling actuation is its own target rather than a flag on demo-up, because
+# the documented order matters: bring the environment up in dry-run, confirm the
+# decisions are the ones you expected, and only then let the controller act on
+# them.
+
+.PHONY: demo-actuate
+demo-actuate: ## Let the demo controller actually scale (dryRun: false)
+	tests/e2e/demo-actuate.sh on
+
+.PHONY: demo-dry-run
+demo-dry-run: ## Return the demo controller to observing only (dryRun: true)
+	tests/e2e/demo-actuate.sh off
+
+.PHONY: demo-replicas
+demo-replicas: ## Show the target's replica count and the controller's last decision
+	@kubectl --context kind-kubescalesense-demo -n data-pipeline \
+		get deployment normalizer -o custom-columns=NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas
+	@kubectl --context kind-kubescalesense-demo -n kubescalesense \
+		logs -l app.kubernetes.io/name=kubescalesense --tail=1

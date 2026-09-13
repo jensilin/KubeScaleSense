@@ -426,6 +426,26 @@ cluster-scoped resource discovery, and a namespaced `Role` for the target and co
 Pod hardening: non-root, read-only root filesystem, all capabilities dropped, `seccompProfile:
 RuntimeDefault`, no service account token beyond the controller's own.
 
+**As built in P3.** The table above is the design target for the finished controller. The shipped manifests
+grant a strict subset of it, because a permission is granted when the code that needs it exists and not
+before:
+
+| Granted now | Still deferred |
+| --- | --- |
+| Everything read-only in the table | `pods` `patch` — arrives with `pod-deletion-cost` |
+| `deployments/scale` get, update, patch — namespaced | `events` create, patch — arrives with the event trail |
+| | `leases` — arrives with leader election in P4 |
+
+The absence of the deferred three is visible in behaviour, not just in the manifest: there is no event trail,
+scale-down cannot influence *which* pod the ReplicaSet controller removes, and single-writer safety rests on
+`replicas: 1` plus `strategy: Recreate` rather than on a lease. `deploy/kubescalesense/role.yaml` records the
+same table next to the rules.
+
+Two tests hold this shut rather than trusting review: one asserts that the manifests contain exactly one rule
+carrying a write verb, and one asserts that the only mutating client-go call in the repository is
+`UpdateScale` in `internal/kubernetes/scale.go`. Widening RBAC or adding a second write path therefore fails
+the build.
+
 ---
 
 ## 8. Observability requirements
@@ -858,6 +878,27 @@ under uncertainty is scale *down*, since that terminates pods holding in-flight 
 
 **Rejected.** *Aggressive retry until success* — amplifies an API-server incident. *Assuming "no data means
 idle"* — would scale a busy pipeline to `minReplicas` precisely during an outage.
+
+**As built in P3.** `internal/controller/scale.go` classifies every write failure into one of four outcomes —
+conflict, stale, fatal, transient — and only the last is retried, with full jitter and doubling, bounded by
+the reconcile interval. Three details are load-bearing and easy to get backwards:
+
+- **Unrecognised errors default to transient.** The alternative is worse: a fatal classification stops the
+  controller acting until someone restarts it, whereas a transient one costs a bounded retry inside one
+  reconcile and then abandons the decision anyway.
+- **A stale decision is abandoned, not adapted.** The actuator re-reads the live scale and refuses to write
+  if the replica count has moved since the snapshot was taken. It does not recompute a new target from the
+  new count — that arithmetic belongs to the engine, on the next tick, with a fresh snapshot. This is also
+  what makes an informer-lagged double write impossible.
+- **A failed write does not start the cooldown.** Decision history and hold backoff advance on every
+  reconcile, but the scale-up and scale-down timers advance only after a write succeeds. Advancing them on
+  failure would let a run of 403s silently consume the cooldown, so the controller would believe it had
+  scaled and then wait before trying again.
+
+The actuator also rejects, rather than clamps, a target outside `minReplicas`/`maxReplicas`. The engine has
+already clamped per [FR-02](requirements.md#4-functional-requirements), so an out-of-range value arriving at
+the actuator is a defect; clamping it would write a plausible number and hide the defect, while rejecting it
+produces the null action and a loud log.
 
 ### ADR-15: How do we protect data processing when a worker pod crashes?
 
@@ -1473,9 +1514,9 @@ flowchart TB
 | § | Baseline | As built |
 | --- | --- | --- |
 | 11.1 | `sftp` Deployment; `file-generator` Job; one Service | No SFTP ([ADR-16](#adr-16-how-will-this-be-demonstrated-in-a-local-kubernetes-environment) as-built note); the generator is a sidecar sharing an `emptyDir` with NiFi; **two** Services, the second headless for the pressure scrape ([ADR-22a](#adr-22a-the-http-source-scrapes-every-pod)) |
-| 11.1 | `KSS -->` scale subresource | **No write path exists.** The controller's Kubernetes client exposes read-only interfaces and a test asserts that structurally. The arrow is P3's |
+| 11.1 | `KSS -->` scale subresource | **Built in P3.** Exactly one write path exists: `UpdateScale` on the target's `deployments/scale`, in `internal/kubernetes/scale.go`, behind a transport that refuses every other mutating request. Tests assert the count structurally ([§7](#7-kubernetes-permissions-and-rbac)) |
 | 11.2 | `ListSFTP → FetchSFTP → ConvertRecord → InvokeHTTP` | `ListFile → FetchFile → SplitText → InvokeHTTP → PutFile`, with the SFTP variant a two-processor swap |
-| 11.3 | Step 6 "writes at most one replica change per reconcile" | Step 6 computes the decision and logs it. Nothing is written |
+| 11.3 | Step 6 "writes at most one replica change per reconcile" | As designed, from P3. One `UpdateScale` per reconcile at most, with a `resourceVersion` precondition, and the cooldown timers advance only if it succeeded |
 
 The P2 pipeline's output is an `emptyDir`, not durable storage, and the project does not claim otherwise: what
 P2 demonstrates is that a real workload can be measured and that the measurement drives a correct decision.

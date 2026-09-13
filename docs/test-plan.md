@@ -214,6 +214,46 @@ assert that a partial output was *unrepresentable*, whereas v0.2 can only assert
 pod loss. That is the durability trade of the simplification, made visible in the test suite rather than
 argued away in prose.
 
+### 6.1 DI-08 result
+
+Run in P3 on the `kind-kubescalesense-demo` cluster with live actuation enabled. The run is recorded here
+because DI-08 gates everything else, so "it passed" is not a useful record on its own.
+
+Capacity was shaped first, with ballast, so that the scale-up would be limited by *placeability* rather than
+by demand — otherwise the test shows only that the arithmetic works:
+
+| Node | CPU requested | Free after reserve | Normalizer slots |
+| --- | --- | --- | --- |
+| worker | 3650m | 150m | 0 |
+| worker2 | 2150m | 1650m | 3 |
+| worker3 | 3200m | 600m | 1 |
+
+Four raw slots, less `fitCapacityMarginPods` = 1, so `fitCapacity` = 3. Then a constant 300 records/s with 96
+requests in flight:
+
+| Time | Reason | `desiredRaw` | Step limit | `fitCapacity` | Replicas |
+| --- | --- | --- | --- | --- | --- |
+| 19:49:50 | `ScaleUp` | 3 | 3 | 3 | 1 → **3** |
+| 19:50:51 | `ScaleUpPartial` | 17 | 7 | 1 | 3 → **4** |
+| 19:51:51 | `HoldInsufficientResources` | 11 | 8 | 0 | 4 |
+| 19:52:06 | `HoldBackoff` | 8 | — | 0 | 4 |
+
+The second row is the whole point of the test. Demand asked for 17, the clamp allowed 12, the step limit
+allowed 7 — and the controller added **one**, because one was all that fit. The four pods landed 2 on worker2,
+1 on worker3 and the original on worker, matching the per-node fit exactly, and all four reached Ready. Once
+`fitCapacity` reached 0 the controller stopped and armed the hold backoff, doubling 30 s → 60 s, rather than
+retrying a write that could only produce Pending pods.
+
+`generation` moved 1 → 3 on the Deployment, so exactly two spec writes occurred for two scaling decisions.
+Throughput responded: the four pods sustained the offered load that one pod had been shedding, which is the
+non-flat curve FS-28 demands.
+
+**What this run does not establish.** It measures 1 → 3 → 4 on three worker nodes, not the 1/2/4/8 sweep the
+DI-08 row specifies, because `fitCapacity` on this host tops out at 13 and the interesting behaviour is at
+the capacity boundary rather than at 8. The near-linearity claim in the row above is therefore **not** yet
+quantified; what is established is that the curve is not flat and that scale-up never exceeded placeable
+capacity.
+
 ---
 
 ## 7. Local demonstration environment
@@ -299,7 +339,7 @@ node capacity should never assume it.
 | Tool | Purpose |
 | --- | --- |
 | Docker / Podman | kind node runtime |
-| `kind` ≥ 0.23, `kubectl` ≥ 1.29 | Cluster lifecycle |
+| `kind` ≥ 0.32, `kubectl` ≥ 1.29 | Cluster lifecycle |
 | Go ≥ 1.24 | Build the controller |
 | `jq`, `curl` | `assert-nifi-flow.sh` reads NiFi's REST API |
 | `helm` (optional) | metrics-server / Prometheus install |

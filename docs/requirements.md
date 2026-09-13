@@ -336,7 +336,10 @@ target:
   maxReplicas: 12
 
 workload:
-  itemsPerReplica: 50           # outstanding work items one replica is expected to hold
+  itemsPerReplica: 50           # outstanding work items one replica is expected to hold.
+                                # A default, not an answer: measure it per deployment
+                                # (scaling-algorithm.md § 3.5). The demonstration
+                                # Normalizer measures 40.
   targetCPUUtilizationPercent: 70   # of the pod's CPU *request*
   metricsStaleAfter: 60s
   podWarmupPeriod: 60s          # pods Ready for less than this are excluded from the utilization average

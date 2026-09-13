@@ -21,16 +21,19 @@ const (
 	DefaultInterval       = 15 * time.Second
 	DefaultLeaderElection = true
 
-	// DefaultDryRun is true for Phase 1, which is a deliberate departure from
-	// the false shown in docs/requirements.md § 8.
+	// DefaultDryRun is true, which is a deliberate departure from the false
+	// shown in docs/requirements.md § 8.
 	//
 	// The two documents disagreed: the parameter table lists the eventual
 	// production default, while docs/implementation-plan.md § P1 requires dryRun
-	// "hard-defaulted to true for this phase". The plan wins, because it is the
-	// document that describes what this code is allowed to do — and because the
-	// safe default is the one that cannot surprise anyone. Validation goes
-	// further and refuses a false value outright: Phase 1 has no write path, so
-	// asking for live mode is asking for something the binary cannot do.
+	// "hard-defaulted to true for this phase". The plan wins, because the safe
+	// default is the one that cannot surprise anyone.
+	//
+	// P3 added the write path, so validation no longer refuses false — but the
+	// default stays true. An autoscaler that starts changing replica counts
+	// because someone forgot to set a field is not a behaviour worth having, and
+	// "it scaled my Deployment and I never enabled it" is not a sentence this
+	// project wants to be the answer to.
 	DefaultDryRun = true
 
 	DefaultMetricsAddr = ":8080"

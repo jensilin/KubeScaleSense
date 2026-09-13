@@ -312,15 +312,18 @@ plan that gets edited to match the implementation stops being able to tell anyon
 | Single `/metrics` scrape of `normalizer-service` | A second, **headless** `normalizer-metrics` Service, and a source that resolves it and scrapes every Ready pod | Pressure is queued + in-flight **summed over pods**. A ClusterIP scrape returns one pod's numbers, under-reporting total pressure by roughly the replica count — correct-looking at one replica and wrong at every other, in the direction that causes scale-down under load |
 | NiFi flow verified by importing it | Flow definition shipped and its invariants machine-checked as a file (`tests/demo/nififlow`) plus against a live instance at demo time (`tests/e2e/assert-nifi-flow.sh`) | `kind` is not installed in this environment, so NiFi has never been started here. "NiFi accepts this JSON" is therefore **unverified**; the runbook says so and gives the processor/property table as the manual fallback |
 
-**Still open, and gating P3:**
+**Both of these gated P3, and P3 closed them:**
 
-- **`itemsPerReplica` is a guess.** `deploy/demo/kubescalesense-configmap.yaml` sets 12 on the reasoning that
-  a pod has four processing slots. The exit criterion asks for a *measurement* — the pressure level at which
-  per-request latency reaches the SLO at a fixed replica count — and that needs a running cluster.
-- **`DI-08` has not run.** The throughput-versus-replicas curve is the gate on the entire premise: if
-  throughput does not respond to replica count, the controller is demonstrating nothing however correct its
-  arithmetic ([FS-28](failure-scenarios.md#fs-28-adding-replicas-does-not-add-throughput)). It needs
-  `kind` ≥ 0.23 and roughly 6 GiB of memory.
+- **`itemsPerReplica` was a guess, and is now measured.** The demo config set 12 on the reasoning that a pod
+  has four processing slots. `tests/e2e/measure-items-per-replica.sh` measured **40** against the agreed SLO
+  of p95 ≤ 500 ms ([scaling-algorithm § 3.5](scaling-algorithm.md#35-measuring-itemsperreplica)).
+  The guess was low by more than a factor of three, which would have made the controller ask for roughly
+  three times the replicas a spike actually warranted.
+- **`DI-08` has run.** Throughput does respond to replica count, and the run is recorded in
+  [test-plan § 6.1](test-plan.md#61-di-08-result)
+  ([FS-28](failure-scenarios.md#fs-28-adding-replicas-does-not-add-throughput)). It needed `kind` ≥ 0.32 and,
+  as it turned out, a raised `fs.inotify.max_user_instances` — see
+  [deploy/demo](../deploy/demo/README.md#prerequisites).
 
 What *was* verified without a cluster: the Normalizer's normalization purity, capacity enforcement, queue
 shedding and drain order; the `http` source's pod fan-out, all-or-nothing sampling, staleness stamping,
@@ -357,6 +360,23 @@ decision, with the replica count unchanged (`tests/demo/pipeline`).
 - HPA conflict detection ([FS-16](failure-scenarios.md#fs-16-competing-controller-on-the-same-target)).
 - Kubernetes events with rate limiting ([architecture § 8.2](architecture.md#82-kubernetes-events)).
 - Scenario scripts `make demo-scenario-1..5` per [test-plan § 7.4](test-plan.md#74-demo-narrative).
+
+**As built.** The actuation half is done and verified on a real cluster; the operability half is not, and the
+split is worth stating precisely rather than reporting "P3 complete":
+
+| Deliverable | Status |
+| --- | --- |
+| Actuator: scale subresource, `resourceVersion` precondition, `409` handling, jittered bounded retry, fatal `403`/`404` | **Done** — `internal/controller/scale.go`, `internal/kubernetes/scale.go` |
+| Controller state: cooldown timers, desired history, hold backoff, `lastGoodReplicas` | **Done** — and the write timers now advance only on a *successful* write |
+| Hysteresis, partial scale-up, pending watchdog, review-driven guards, HPA conflict detection | **Already built in P1/P2**; P3 verified them against a live actuator, including that a live write cannot bypass them |
+| `pod-deletion-cost` refresh before scale-down | **Not done** — needs `pods` `patch`, which P3 deliberately did not grant |
+| Kubernetes events with rate limiting | **Not done** — needs `events` `create`, likewise not granted |
+| `make demo-scenario-1..5` | **Not done** — `demo-spike`, `demo-actuate` and `measure-items-per-replica` cover the scale-up, scale-down and measurement narratives; the five scripted scenarios and the HPA side-by-side are not written |
+
+The RBAC consequence is deliberate: a permission is granted when the code needing it exists
+([architecture § 7](architecture.md#7-kubernetes-permissions-and-rbac)). The visible cost is that scale-down
+cannot influence *which* pod the ReplicaSet controller removes, so [D-05](requirements.md#7-durability-boundary-and-workload-responsibilities)
+is not yet satisfied and the demo has no event trail.
 
 **Exit criteria**
 
@@ -554,7 +574,7 @@ Every item is satisfied or explicitly scheduled; none is outstanding.
 | 5 | Design-review findings folded in, each with an owning test | **Done** — `DR-01`…`DR-16`, [test-plan § 11](test-plan.md#11-traceability-matrix) |
 | 6 | Immutable decisions recorded, so implementation cannot drift silently | **Done** — [`I-1`…`I-16`](design-review.md#5-immutable-phase-1-decisions), plus `I-20`…`I-22` for v0.2; `I-17`…`I-19` are superseded and marked as such |
 | 7 | Config schema frozen for P0 (keys, defaults, validation rules) | **Done** — [requirements § 8](requirements.md#8-configuration-requirements), now including `workload.signal.*` in place of `workload.workStore.*` |
-| 8 | Toolchain: Go ≥ 1.24, kind ≥ 0.23, kubectl ≥ 1.29, Docker, `make` | **Done except `kind`** — Go 1.27.1, Docker, `kubectl`, `make`, and `golangci-lint` are installed; `kind` is first needed by the P1 validation gate, not by P0 ([test-plan § 7.3](test-plan.md#73-prerequisites)). No database image and no JDBC driver, so the toolchain is the Go/Kubernetes basics and nothing else |
+| 8 | Toolchain: Go ≥ 1.24, kind ≥ 0.32, kubectl ≥ 1.29, Docker, `make` | **Done** — Go 1.27.1, Docker 28.3.2 on cgroup v2, `kind` 0.32.0, standalone `kubectl` 1.36.1, `make`, and `golangci-lint`. `kind` was the last of these to arrive, installed for the P3 validation gate; the version floor moved from 0.23 to 0.32 because 0.23 defaults to a Kubernetes 1.30 node image, and images from 1.35 onwards require cgroup v2 ([test-plan § 7.3](test-plan.md#73-prerequisites)) |
 | 9 | RBAC set final, including the `replicasets` read added by review | **Done** — [architecture § 7](architecture.md#7-kubernetes-permissions-and-rbac) |
 | 10 | CI shape decided (kind on hosted runners, E2E label-gated) | **Done** — Q-7 |
 

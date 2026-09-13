@@ -1,14 +1,16 @@
 // Command kubescalesense is the KubeScaleSense controller entrypoint.
 //
-// Phase 1 scope: observe the cluster, compute how many more target pods it
-// could actually place, collect the workload-pressure signal, and report the
-// scaling decision that would follow — without changing anything.
+// It observes the cluster, computes how many more target pods it could actually
+// place, collects the workload-pressure signal, decides a replica count — and,
+// from P3, writes it.
 //
-// The binary cannot scale. Its Kubernetes client rejects mutating requests at
-// the transport layer, the only actuator compiled into it logs what it would
-// have done, and configuration validation refuses `dryRun: false` outright.
-// Actuation arrives in P3, together with the scale-subresource permission and
-// the conflict handling a write needs in order to be safe.
+// What the binary can do to a cluster is decided at startup and is narrow by
+// construction. Observation runs on a client whose transport refuses every
+// mutating method, exactly as it did in P1 and P2. Actuation, when enabled, runs
+// on a second client whose transport permits two methods against one URL: the
+// scale subresource of the one configured Deployment. In dry-run — still the
+// default — no actuation client is built at all, so the process holds nothing
+// that could write.
 package main
 
 import (
@@ -37,7 +39,7 @@ const AppName = "kubescalesense"
 // Phase names the implementation phase in logs and in kss_config_info, so that
 // a stray log file is self-describing about what the process could and could not
 // do.
-const Phase = "P1"
+const Phase = "P3"
 
 // version is overridden at build time with -ldflags "-X main.version=...".
 var version = "dev"
@@ -172,7 +174,7 @@ func printEnv(w io.Writer) {
 // credentials by design (CR-5), but logging a whole struct is a habit that stops
 // being safe the moment one is added.
 func logStartup(log *slog.Logger, cfg *config.Config, src config.Source) {
-	log.Info("KubeScaleSense observer started",
+	log.Info("KubeScaleSense started",
 		slog.String("version", version),
 		slog.String("config_source", src.String()),
 		slog.Bool("dry_run", cfg.Controller.DryRun),
@@ -192,10 +194,23 @@ func logStartup(log *slog.Logger, cfg *config.Config, src config.Source) {
 		log.Info("environment overrides applied", slog.Any("variables", src.EnvOverrides))
 	}
 
-	// Said once, loudly, so that nobody reading these logs concludes the
-	// controller is changing the replica count.
-	log.Warn("no scaling is performed in this phase",
-		slog.String("detail", "Phase 1 observes the cluster and reports the decision it would make; the Kubernetes client refuses mutating requests and no replica count is ever written"),
+	// Said once, loudly, in whichever direction is true. A log file should be
+	// self-describing about whether the process that wrote it could change a
+	// replica count, and the reader of a stray log has no other way to tell.
+	if cfg.Controller.DryRun {
+		log.Warn("no scaling will be performed: this process is in dry-run",
+			slog.String("detail", "the controller reports the decision it would make; no actuation client is built, "+
+				"the observation client refuses mutating requests, and no replica count is ever written"),
+		)
+		return
+	}
+
+	log.Warn("live actuation is enabled: this process will change the replica count of the target Deployment",
+		slog.String("target", cfg.Target.Namespace+"/"+cfg.Target.Deployment),
+		slog.Int("bounded_between", int(cfg.Target.MinReplicas)),
+		slog.Int("and", int(cfg.Target.MaxReplicas)),
+		slog.String("detail", "writes go to the deployments/scale subresource only, with a resourceVersion "+
+			"precondition; the pod template cannot be reached and no pod is ever deleted"),
 	)
 }
 
@@ -241,6 +256,11 @@ func serve(ctx context.Context, log *slog.Logger, cfg *config.Config, opts optio
 
 	metrics := observability.NewMetrics()
 
+	actuator, err := buildActuator(cfg, opts, metrics, log)
+	if err != nil {
+		return err
+	}
+
 	ctrl, err := controller.New(controller.Options{
 		Config:      cfg,
 		Reader:      reader,
@@ -248,7 +268,7 @@ func serve(ctx context.Context, log *slog.Logger, cfg *config.Config, opts optio
 		Utilization: kssmetrics.NewUtilizationCollector(kubernetesaccess.NewMetricsReader(clients.Metrics)),
 		Resources:   resourceOpts,
 		Metrics:     metrics,
-		Actuator:    controller.NewDryRunActuator(log),
+		Actuator:    actuator,
 		Log:         log,
 	})
 	if err != nil {
@@ -290,6 +310,63 @@ func serve(ctx context.Context, log *slog.Logger, cfg *config.Config, opts optio
 		return err
 	}
 	return <-loopDone
+}
+
+// buildActuator selects the actuator for this process's configuration.
+//
+// The branch is the whole safety story of P3 and it is deliberately the only
+// one: in dry-run no writable client is constructed, so the capability to
+// change the cluster is absent from the process rather than present and
+// unused. A flag that is checked at each write site can be checked wrongly; a
+// client that was never built cannot be called at all.
+//
+// Note that the actuation client is separate from the observation client, and
+// the observation client keeps its read-only transport in both modes. Enabling
+// actuation adds a narrow write path; it does not relax the read path.
+func buildActuator(
+	cfg *config.Config,
+	opts options,
+	metrics *observability.Metrics,
+	log *slog.Logger,
+) (controller.Actuator, error) {
+	if cfg.Controller.DryRun {
+		return controller.NewDryRunActuator(log), nil
+	}
+
+	namespace, deployment := cfg.Target.Namespace, cfg.Target.Deployment
+
+	scaleConfig, err := kubernetesaccess.NewScaleRESTConfig(opts.kubeconfigPath, namespace, deployment)
+	if err != nil {
+		return nil, fmt.Errorf("building the actuation client configuration: %w", err)
+	}
+	scaleClients, err := kubernetesaccess.NewClients(scaleConfig)
+	if err != nil {
+		return nil, fmt.Errorf("building the actuation client: %w", err)
+	}
+
+	actuator, err := controller.NewScaleActuator(controller.ScaleActuatorOptions{
+		Target:      kubernetesaccess.NewScaleWriter(scaleClients.Core, namespace, deployment),
+		MinReplicas: cfg.Target.MinReplicas,
+		MaxReplicas: cfg.Target.MaxReplicas,
+		// Bounded by the reconcile interval, so retries of a transient failure
+		// cannot outlive the reconcile that started them and overlap the next
+		// one (ADR-14).
+		RetryBudget: cfg.Controller.Interval.Duration(),
+		Metrics:     metrics,
+		Log:         log,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	log.Info("actuation client built",
+		slog.String("writable_path", kubernetesaccess.ScalePath(namespace, deployment)),
+		slog.String("retry_budget", cfg.Controller.Interval.Duration().String()),
+		slog.String("detail", "the transport permits PUT and PATCH to this one path and refuses every other "+
+			"mutating request, including any write to the Deployment itself"),
+	)
+
+	return actuator, nil
 }
 
 // shutdownServer stops the HTTP listeners within the shutdown budget.

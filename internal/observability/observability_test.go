@@ -124,14 +124,18 @@ func TestNewMetrics_PreCreatesEveryLabelValue(t *testing.T) {
 	})
 }
 
-// Phase 1 performs no mutation, so the "applied" series must stay honestly at
-// zero while the decision is still counted as a dry run. A dry-run trace that
-// incremented "applied" would be indistinguishable from a live one.
+// A dry-run reconcile counts its decision as an intention, never as an
+// application. A dry-run trace that incremented "applied" would be
+// indistinguishable from a live one, which would make the counter useless for
+// the one question it exists to answer.
 func TestRecordReconcile_ScaleActionsAreCountedAsDryRun(t *testing.T) {
 	t.Parallel()
 
+	observation := scaleUpObservation()
+	observation.DryRun = true
+
 	m := NewMetrics()
-	m.RecordReconcile(scaleUpObservation())
+	m.RecordReconcile(observation)
 
 	families := gatherByName(t, m)
 
@@ -139,7 +143,39 @@ func TestRecordReconcile_ScaleActionsAreCountedAsDryRun(t *testing.T) {
 		t.Errorf("dry_run count = %v, want 1", got)
 	}
 	if got := counterWith(families["kss_scale_actions_total"], map[string]string{"direction": "up", "outcome": "applied"}); got != 0 {
-		t.Errorf("applied count = %v, want 0: Phase 1 applies nothing", got)
+		t.Errorf("applied count = %v, want 0: a dry run applies nothing", got)
+	}
+}
+
+// In live mode the reconcile loop counts nothing: the actuator does it, after
+// the write, with the outcome the write actually had. Asserted because the
+// alternative — counting at decision time — would make "applied" a count of
+// intentions, including the ones that conflicted or were refused.
+func TestRecordReconcile_LiveModeLeavesTheCountingToTheActuator(t *testing.T) {
+	t.Parallel()
+
+	observation := scaleUpObservation()
+	observation.DryRun = false
+
+	m := NewMetrics()
+	m.RecordReconcile(observation)
+
+	families := gatherByName(t, m)
+
+	for _, outcome := range []string{"applied", "dry_run", "conflict", "error"} {
+		got := counterWith(families["kss_scale_actions_total"],
+			map[string]string{"direction": "up", "outcome": outcome})
+		if got != 0 {
+			t.Errorf("%s count = %v after a live decision, want 0 until the write is attempted", outcome, got)
+		}
+	}
+
+	m.RecordScaleAction("up", "applied")
+	families = gatherByName(t, m)
+
+	if got := counterWith(families["kss_scale_actions_total"],
+		map[string]string{"direction": "up", "outcome": "applied"}); got != 1 {
+		t.Errorf("applied count = %v after a successful write, want 1", got)
 	}
 }
 

@@ -7,13 +7,14 @@
 #   queued + in-flight count instead of a scripted series. This is the point of
 #   P2: the demand signal becomes a real measurement of a real workload.
 #
-#   workload.itemsPerReplica is lowered to a value that suits the demo cluster,
-#   where a Normalizer pod has four processing slots rather than a production
-#   pod's capacity.
+#   workload.itemsPerReplica is the value measured on this cluster rather than
+#   the shipped default, which was measured on nothing.
 #
-# dryRun stays true. P2 observes and reports; P3 owns actuation. demo-up.sh
-# asserts this value rather than trusting it, because the whole P2 claim is
-# false if it is ever flipped here by accident.
+# dryRun stays true *here*, even though P3 can actuate. The demo comes up
+# observing and is switched deliberately with `make demo-actuate`, which is
+# also what makes `make demo-dry-run` a way back. demo-up.sh asserts the value
+# in this file rather than trusting it, so a cluster cannot come up live
+# because someone edited it by accident.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -45,16 +46,25 @@ data:
       maxReplicas: 12
 
     workload:
-      # Four processing slots per pod, so a pod is saturated at roughly four
-      # outstanding records and a handful of queued ones. 12 makes a spike of a
-      # few hundred records demand more replicas than the cluster can fit,
-      # which is the state the demonstration is about.
+      # MEASURED, not chosen. tests/e2e/measure-items-per-replica.sh holds one
+      # replica and steps the in-flight request count, reading the proportion
+      # of requests inside the SLO straight off the `le="0.5"` histogram
+      # bucket. On this cluster the Normalizer met p95 <= 500 ms at a measured
+      # pressure of 39.8 items and missed it at 43.0:
       #
-      # This number is a placeholder until it is *measured*: the P2 exit
-      # criteria require finding the pressure level at which per-request
-      # latency reaches the SLO at a fixed replica count, and recording that
-      # measurement rather than this guess.
-      itemsPerReplica: 12
+      #   in flight   44     48     52
+      #   pressure    38.4   39.8   43.0
+      #   within SLO  1.0000 0.9565 0.5065
+      #
+      # 40 is the last passing level, so it is very slightly conservative —
+      # which is the safe direction for a divisor: it asks for the next replica
+      # a little early rather than a little late.
+      #
+      # It is a property of *this* Normalizer configuration (four processing
+      # slots, 250k cost rounds, a 2-CPU limit) on *this* cluster, not of the
+      # workload in general. docs/resource-calculation.md records what would
+      # change it.
+      itemsPerReplica: 40
       targetCPUUtilizationPercent: 70
       metricsStaleAfter: 60s
       podWarmupPeriod: 60s

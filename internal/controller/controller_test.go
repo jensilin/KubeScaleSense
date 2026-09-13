@@ -212,7 +212,7 @@ func TestDryRunActuator_WritesNothing(t *testing.T) {
 	// "would" rather than "scaled": a log line reading "scaled 2 -> 6" from a
 	// controller that scaled nothing is how a dry-run trace gets mistaken for
 	// evidence that autoscaling works.
-	if !containsAll(out, "dry run", "would_action", "never written") {
+	if !containsAll(out, "dry run", "would_action", "no client that can write") {
 		t.Errorf("the dry-run log must be unmistakable, got: %s", out)
 	}
 	if containsAll(out, "scaled ") {

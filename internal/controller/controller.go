@@ -30,8 +30,11 @@ const historyRetention = 2
 // Options wires the controller's collaborators.
 //
 // Every field is an interface or a value, and none of them is a Kubernetes
-// clientset. That is the structural half of the no-write guarantee: there is no
-// object reachable from here that has a write method on it.
+// clientset. Through P2 that was the structural half of a no-write guarantee.
+// From P3 the guarantee is narrower but the structure is unchanged: the only
+// field that can reach the API server with a mutating request is Actuator, and
+// the only mutation any implementation of it can express is a replica count on
+// one named Deployment.
 type Options struct {
 	Config      *config.Config
 	Reader      kubernetesaccess.ClusterReader
@@ -73,15 +76,33 @@ type state struct {
 	backoff          scaling.BackoffState
 	lastGoodReplicas int32
 
-	// observedReplicas is the replica count we last saw. Phase 1 writes
-	// nothing, so any change to it is by definition the work of another actor.
+	// observedReplicas is the replica count we last saw.
 	observedReplicas int32
 	hasBaseline      bool
 	externalDriftAt  []time.Time
 
+	// lastWrittenReplicas is the value this controller most recently wrote.
+	//
+	// P1 and P2 needed no such field: they wrote nothing, so every change to
+	// spec.replicas was external by definition. From P3 that is no longer true,
+	// and without this the controller's own scale-ups would be counted as
+	// external drift and it would freeze itself with HoldExternalChange after
+	// three successful scalings. ADR-17 defines the distinction in exactly
+	// these terms: a change is external when the observed value differs from
+	// what we last wrote *and* we did not write it.
+	lastWrittenReplicas int32
+	hasWritten          bool
+
 	reconciles    int
 	lastReconcile time.Time
 	lastError     error
+
+	// lastFatalError holds an actuation failure that will not fix itself: a
+	// missing scale permission, or a target that no longer exists. Separate
+	// from lastError because readiness must distinguish "this cluster cannot be
+	// observed right now" from "this controller is misconfigured and will never
+	// work" (ADR-14).
+	lastFatalError error
 }
 
 // New builds a controller.
@@ -174,6 +195,12 @@ func (c *Controller) Ready() error {
 	if c.state.reconciles == 0 {
 		return errors.New("no reconcile has completed yet")
 	}
+	// Reported before lastError because it is the more actionable of the two: a
+	// 403 on the scale subresource means an operator has to change the Role,
+	// and no amount of waiting will clear it.
+	if c.state.lastFatalError != nil {
+		return fmt.Errorf("actuation is not possible: %w", c.state.lastFatalError)
+	}
 	if c.state.lastError != nil {
 		return fmt.Errorf("last reconcile failed: %w", c.state.lastError)
 	}
@@ -230,6 +257,10 @@ func (c *Controller) Reconcile(ctx context.Context) (scaling.Decision, error) {
 	decision := scaling.Decide(snapshot, c.cfg, now)
 	decideDone := c.now()
 
+	// Folded before the write because these outputs describe the *decision*,
+	// not its effect: the stabilization window must keep filling and the
+	// backoff must keep advancing whether or not a write succeeds. A hold that
+	// arms the backoff performs no write at all.
 	c.applyDecisionState(decision, now)
 
 	obs := observability.Observation{
@@ -239,6 +270,7 @@ func (c *Controller) Reconcile(ctx context.Context) (scaling.Decision, error) {
 		Sample:          sample,
 		SignalSource:    c.signal.Source(),
 		RawBacklog:      rawBacklog,
+		DryRun:          c.cfg.Controller.DryRun,
 		Now:             now,
 		ObserveDuration: observeDone.Sub(start),
 		DecideDuration:  decideDone.Sub(observeDone),
@@ -251,16 +283,29 @@ func (c *Controller) Reconcile(ctx context.Context) (scaling.Decision, error) {
 	observability.LogDecision(c.log, obs, c.cfg.Controller.DryRun)
 	observability.LogNodeDetail(c.log, obs)
 
-	if err := c.actuator.Apply(ctx, decision); err != nil {
-		return decision, fmt.Errorf("actuator: %w", err)
+	actuateErr := c.actuator.Apply(ctx, decision)
+	if actuateErr == nil {
+		// Only a successful write advances the cooldown timers and the revert
+		// target. Advancing them before the write — which is what P1 did, and
+		// could afford to, because its actuator could not fail — would make a
+		// failed actuation impose a cooldown on the retry that follows it, so
+		// the controller would sit out the next interval having changed
+		// nothing.
+		c.applyWriteState(decision, now)
 	}
 
 	c.mu.Lock()
 	c.state.reconciles++
 	c.state.lastReconcile = now
 	c.state.lastError = observeErr
+	if errors.Is(actuateErr, ErrScaleFatal) {
+		c.state.lastFatalError = actuateErr
+	}
 	c.mu.Unlock()
 
+	if actuateErr != nil {
+		return decision, fmt.Errorf("actuator: %w", actuateErr)
+	}
 	return decision, observeErr
 }
 
@@ -439,14 +484,17 @@ func (c *Controller) collectUtilization(
 
 // trackExternalDrift detects and counts replica changes made by other actors.
 //
-// Phase 1 never writes, so every change is external by definition — which makes
-// this phase the ideal place to validate the detection before there is a write
-// of our own to confuse it with.
-//
 // A drift is adopted as the new baseline rather than fought: the history and the
 // smoothed average are reset, because both described a replica count that no
 // longer exists. Only if drift *recurs* beyond the tolerance does the controller
 // stop acting (DR-07).
+//
+// From P3 this has to tell two kinds of change apart, because the controller is
+// now one of the actors that can cause one. A count that matches our own last
+// write is not drift, and treating it as drift would be self-defeating in the
+// most literal way: three successful scale-ups would exceed the tolerance and
+// the controller would refuse to act on the grounds that someone kept scaling
+// the Deployment — that someone being itself (ADR-17).
 func (c *Controller) trackExternalDrift(observed int32, now time.Time) int32 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -458,11 +506,30 @@ func (c *Controller) trackExternalDrift(observed int32, now time.Time) int32 {
 		return 0
 	}
 
-	if observed != c.state.observedReplicas {
+	switch {
+	case observed == c.state.observedReplicas:
+		// Nothing moved.
+
+	case c.state.hasWritten && observed == c.state.lastWrittenReplicas:
+		// Our own write arriving through the informer cache. Adopted silently:
+		// no event, no drift increment, and the history is deliberately kept.
+		// The window records how much demand there was, which is still true —
+		// unlike an external change, this one is the outcome the history was
+		// used to justify.
+		c.log.Debug("observed our own replica count change",
+			slog.Int("from", int(c.state.observedReplicas)),
+			slog.Int("to", int(observed)),
+		)
+		c.state.observedReplicas = observed
+
+	default:
 		c.log.Warn("replica count changed by another actor; adopting it as the new baseline",
 			slog.Int("from", int(c.state.observedReplicas)),
 			slog.Int("to", int(observed)),
-			slog.String("detail", "Phase 1 issues no writes, so every change to spec.replicas originates elsewhere"),
+			slog.Int("last_written_by_us", int(c.state.lastWrittenReplicas)),
+			slog.Bool("we_have_ever_written", c.state.hasWritten),
+			slog.String("detail", "the observed count is neither the previous value nor the one this controller "+
+				"last wrote, so another actor set it (FR-31)"),
 		)
 		c.state.observedReplicas = observed
 		c.state.externalDriftAt = append(c.state.externalDriftAt, now)
@@ -486,8 +553,11 @@ func (c *Controller) trackExternalDrift(observed int32, now time.Time) int32 {
 	return int32(len(kept))
 }
 
-// applyDecisionState folds the decision's outputs back into the controller's
-// memory: the stabilization window, the backoff, and the cooldown timers.
+// applyDecisionState folds the outputs that describe the decision itself: the
+// stabilization window and the backoff.
+//
+// Both must advance regardless of what the actuator then does, and for the
+// holds there is nothing for the actuator to do at all.
 func (c *Controller) applyDecisionState(decision scaling.Decision, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -512,19 +582,40 @@ func (c *Controller) applyDecisionState(decision scaling.Decision, now time.Time
 		c.state.backoff = decision.Backoff
 	case scaling.BackoffUnchanged:
 	}
+}
 
-	// Counterfactual bookkeeping: see the package comment. The timers advance as
-	// though the write had happened, which keeps the cooldowns exercised and the
-	// dry-run trace readable.
-	if decision.Action == scaling.ActionWrite {
-		switch decision.Direction {
-		case scaling.DirectionUp:
-			c.state.lastScaleUp = now
-			c.state.lastGoodReplicas = decision.CurrentReplicas
-		case scaling.DirectionDown:
-			c.state.lastScaleDown = now
-		case scaling.DirectionNone:
-		}
+// applyWriteState folds the consequences of a write that actually happened.
+//
+// In dry-run this is still reached, because the dry-run actuator reports
+// success — which is the counterfactual bookkeeping P1 relied on and P3 keeps:
+// the timers advance as though the write had happened, so the cooldowns stay
+// exercised and a dry-run trace remains directly comparable with a live one.
+//
+// In live mode it is reached only after the replica count has been written.
+func (c *Controller) applyWriteState(decision scaling.Decision, now time.Time) {
+	if decision.Action != scaling.ActionWrite {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Recorded for both directions and before the direction switch, because
+	// external-change detection needs to recognise *any* value we wrote. A
+	// scale-down we omitted here would come back on the next reconcile as
+	// somebody else's change.
+	c.state.lastWrittenReplicas = decision.TargetReplicas
+	c.state.hasWritten = true
+
+	switch decision.Direction {
+	case scaling.DirectionUp:
+		c.state.lastScaleUp = now
+		// The pre-scale count, which is the revert target if the new pods turn
+		// out to be unschedulable (FS-06).
+		c.state.lastGoodReplicas = decision.CurrentReplicas
+	case scaling.DirectionDown:
+		c.state.lastScaleDown = now
+	case scaling.DirectionNone:
 	}
 }
 

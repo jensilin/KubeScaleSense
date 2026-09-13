@@ -9,15 +9,20 @@ import (
 
 // Actuator applies a decision.
 //
-// The interface exists in Phase 1 so that the seam where writes will eventually
-// happen is visible, reviewable, and already covered by tests — rather than
-// being carved out later inside the reconcile loop, which is how a "dry-run
-// only" controller acquires a write path nobody reviewed.
+// The interface existed from Phase 1 so that the seam where writes would
+// eventually happen was visible, reviewable, and already covered by tests —
+// rather than being carved out later inside the reconcile loop, which is how a
+// "dry-run only" controller acquires a write path nobody reviewed.
 //
-// There is exactly one implementation in this repository, and it writes nothing.
-// The real one arrives in P3 together with the scale subresource permission,
-// the resourceVersion precondition, and the conflict handling that a write
-// needs in order to be safe.
+// P3 filled the seam. There are now exactly two implementations: DryRunActuator
+// below, which writes nothing and is still the default, and ScaleActuator in
+// scale.go, which writes a replica count through the scale subresource. A third
+// appearing is a test failure, because the number of things in this repository
+// that can change a cluster is a property worth counting.
+//
+// The contract both share: returning nil means "the decision has been carried
+// out". The reconcile loop keys its cooldown timers on that, so an
+// implementation must not report success for a write it did not make.
 type Actuator interface {
 	// Apply carries out the decision. Implementations must treat a decision
 	// whose Action is ActionNone as a no-op.
@@ -31,10 +36,11 @@ type Actuator interface {
 
 // DryRunActuator reports what would have happened and changes nothing.
 //
-// It is not a stub or a test double: for the whole of Phase 1 this is the
-// intended production behaviour, and the phase exists to validate that the
-// decisions it reports are the right ones before anything is allowed to act on
-// them.
+// It is not a stub or a test double. For the whole of P1 and P2 it was the
+// intended production behaviour, and it remains the default and the documented
+// way to validate a configuration against a real cluster before allowing it to
+// act. It performs no API call of any kind, which is what makes "dry-run
+// mutates nothing" a structural property rather than a claim about a flag.
 type DryRunActuator struct {
 	log *slog.Logger
 }
@@ -52,7 +58,9 @@ func (DryRunActuator) Mode() string { return "dry-run" }
 // The message is phrased as "would scale" rather than "scaled" deliberately.
 // Log lines outlive the context in which they were written, and a line reading
 // "scaled 2 -> 6" from a controller that scaled nothing is how a dry-run trace
-// gets mistaken for evidence that autoscaling works.
+// gets mistaken for evidence that autoscaling works. The live actuator's
+// message is deliberately different — "replica count updated" — so the two
+// traces cannot be confused with one another.
 func (a DryRunActuator) Apply(_ context.Context, decision scaling.Decision) error {
 	if decision.Action != scaling.ActionWrite {
 		return nil
@@ -64,7 +72,7 @@ func (a DryRunActuator) Apply(_ context.Context, decision scaling.Decision) erro
 		slog.Int("to_replicas", int(decision.TargetReplicas)),
 		slog.Int("fit_capacity", int(decision.FitCapacity)),
 		slog.String("blocking_dimension", string(decision.Blocking)),
-		slog.String("detail", "Phase 1 observes and decides only; the replica count is never written"),
+		slog.String("detail", "this process holds no client that can write; the replica count is not changed"),
 	)
 	return nil
 }

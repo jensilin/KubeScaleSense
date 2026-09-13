@@ -19,6 +19,10 @@ CONTEXT="kind-${CLUSTER_NAME}"
 NAMESPACE="data-pipeline"
 CONTROLLER_NAMESPACE="kubescalesense"
 
+# Pinned so the demo is reproducible. Bumping it is a deliberate edit with a
+# re-run of DI-08 behind it, not something that happens overnight.
+METRICS_SERVER_VERSION="v0.9.0"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
@@ -39,7 +43,7 @@ require_tool() {
 log "checking prerequisites"
 require_tool docker "Install Docker or Podman; kind needs a container runtime."
 require_tool kubectl "Install kubectl >= 1.29."
-require_tool kind    "Install kind >= 0.23: go install sigs.k8s.io/kind@v0.23.0, or see https://kind.sigs.k8s.io/docs/user/quick-start/#installation"
+require_tool kind    "Install kind >= 0.32: go install sigs.k8s.io/kind@v0.32.0, or see https://kind.sigs.k8s.io/docs/user/quick-start/#installation"
 
 # kind needs roughly 6 GiB of memory and 4 CPUs to run four nodes alongside
 # NiFi's JVM and several Normalizer replicas. Checked and reported rather than
@@ -82,12 +86,17 @@ docker build -t loadgen:dev -f Dockerfile.loadgen .
 log "loading images into the cluster"
 kind load docker-image --name "${CLUSTER_NAME}" kubescalesense:dev normalizer:dev loadgen:dev
 
-log "installing metrics-server"
+log "installing metrics-server ${METRICS_SERVER_VERSION}"
 # --kubelet-insecure-tls is required on kind: the kubelets serve certificates
 # that metrics-server cannot verify. This is a demo cluster, it is not reachable
 # from outside the host, and utilization-derived demand is one of the two inputs
 # the project is about (A-04).
-kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+#
+# Pinned rather than tracking `releases/latest`. A demo that installs whatever
+# was released this morning is a demo whose failures cannot be distinguished
+# from its subject's: the utilization signal feeding the decision comes from
+# here, so an upstream change to it would look like a KubeScaleSense regression.
+kubectl apply -f "https://github.com/kubernetes-sigs/metrics-server/releases/download/${METRICS_SERVER_VERSION}/components.yaml"
 kubectl patch deployment metrics-server -n kube-system --type=json \
   -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
 kubectl rollout status deployment/metrics-server -n kube-system --timeout=180s
@@ -119,12 +128,18 @@ kubectl rollout status statefulset/nifi -n "${NAMESPACE}" --timeout=600s || {
   warn "The direct-HTTP demonstration does not need NiFi: make demo-spike MODE=http"
 }
 
-# The dry-run guarantee, checked rather than asserted in prose. If this is ever
-# false, the whole P2 claim is false.
+# The environment always comes up in dry-run, checked rather than asserted in
+# prose.
+#
+# P3 gave the controller a write path, which makes this check more useful than
+# it was rather than obsolete: the documented order is to validate the decisions
+# against the real cluster first and enable actuation second, so an environment
+# that came up live would skip the step that makes the live run meaningful.
+# Switching modes is a separate, deliberate command — see demo-actuate.sh.
 dry_run="$(kubectl -n "${CONTROLLER_NAMESPACE}" get configmap kubescalesense-config \
   -o jsonpath='{.data.kubescalesense\.yaml}' | awk '/dryRun:/ { print $2; exit }')"
 [[ "${dry_run}" == "true" ]] \
-  || die "the controller's dryRun is ${dry_run:-unset}; P2 must run in dry-run and actuation belongs to P3"
+  || die "the shipped demo config has dryRun: ${dry_run:-unset}; the environment must come up in dry-run, and actuation is enabled afterwards with tests/e2e/demo-actuate.sh on"
 
 log "verifying the NiFi flow's load-bearing settings"
 tests/e2e/assert-nifi-flow.sh "${MAX_REPLICAS}" || {
@@ -137,8 +152,8 @@ cat <<EOF
 
 $(log "the demonstration environment is up")
 
-  Replicas start at 1 and KubeScaleSense will NOT change them: it is in dry-run
-  for the whole of P2, and actuation is P3's work. Everything below observes.
+  Replicas start at 1 and KubeScaleSense will NOT change them yet: the
+  environment comes up in dry-run, so everything below observes.
 
   Watch the decision the controller would make:
     kubectl --context ${CONTEXT} -n ${CONTROLLER_NAMESPACE} logs -f deployment/kubescalesense
@@ -148,6 +163,9 @@ $(log "the demonstration environment is up")
 
   Drive one straight at the Normalizer, with NiFi out of the path:
     make demo-spike MODE=http
+
+  Once the dry-run decisions look right, let the controller act on them:
+    make demo-actuate            # and: make demo-dry-run, to go back
 
   Compare the fit calculation against the cluster by hand:
     kubectl --context ${CONTEXT} describe node
