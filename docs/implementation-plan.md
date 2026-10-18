@@ -80,8 +80,8 @@ flowchart LR
 | --- | --- | --- | --- |
 | **P0** ✅ | Foundation: module, layout, config, CI | ~1 week | Builds, validates config, refuses bad input |
 | **P1** ✅ | Observation: fit capacity + demand + decisions, dry-run | ~2 weeks | Reports what it *would* do; estimator verified by hand |
-| **P2** ✅ | Demonstration workload | ~1 week | Real pipeline normalizes files over HTTP; pressure signal live; `itemsPerReplica` **still to be measured** ([as built](#p2-as-built-deviations-from-the-plan)) |
-| **P3** | Actuation and stability | ~2 weeks | Actually scales, safely; the demo works end to end |
+| **P2** ✅ | Demonstration workload | ~1 week | Real pipeline normalizes files over HTTP; pressure signal live; `itemsPerReplica` measured at 40 in P3 ([as built](#p2-as-built-deviations-from-the-plan)) |
+| **P3** 🚧 | Actuation and stability | ~2 weeks | Actually scales, safely; the demo works end to end — code complete, scenario scripts and live E2E runs outstanding ([as built](#p3-as-built)) |
 | **P4** | Hardening and operability | ~1.5 weeks | **POC complete**: HA, dashboards, full test matrix, runbook |
 | P5 | Production evolution | open-ended | CRD, higher predicate fidelity, quota, multi-target |
 
@@ -161,9 +161,8 @@ broken config is rejected with a non-zero exit and a message naming the offendin
 constraint, and the override variable.
 
 **Environment.** The toolchain is installed: Go 1.27.1 (the module targets Go ≥ 1.24), Docker, `kubectl`,
-`make`, and `golangci-lint`, under WSL 2. `kind` is the one item still outstanding; it is first needed by the
-P1 manual validation gate below, not by P0. Either way the list is shorter than it was in v0.1.2: no
-PostgreSQL image and no pinned JDBC driver.
+`make`, `golangci-lint`, and — since P3 — `kind` 0.32, under WSL 2. The list is shorter than it was in
+v0.1.2: no PostgreSQL image and no pinned JDBC driver.
 
 ---
 
@@ -225,11 +224,11 @@ scale anything.
 
 ### P2 — Demonstration workload
 
-> **Status: implemented, with two exit criteria outstanding.** The pipeline, the Normalizer, the load
-> generator, the `http` signal source, and the kind environment all exist and are tested. What is *not* done
-> is the part that requires actually running the cluster: `itemsPerReplica` is still a guess and `DI-08` has
-> not been executed, because `kind` is not installed in the development environment
-> ([§ as built](#p2-as-built-deviations-from-the-plan)). Both gate P3.
+> **Status: implemented.** The pipeline, the Normalizer, the load generator, the `http` signal source, and the
+> kind environment all exist and are tested. The two exit criteria that needed a running cluster —
+> measuring `itemsPerReplica` and running `DI-08` — were left open at the end of P2 and closed early in P3
+> ([§ as built](#p2-as-built-deviations-from-the-plan)). Importing the NiFi flow into a running NiFi is still
+> unverified.
 
 **Goal.** A real pipeline whose pressure signal is a genuine demand signal, and a cluster topology in which
 resource exhaustion is reachable on purpose.
@@ -310,7 +309,7 @@ plan that gets edited to match the implementation stops being able to tell anyon
 | `file-generator` Job | `tests/demo/loadgen`, run as a sidecar in the NiFi pod over a shared `emptyDir`, and as a Job for the direct-HTTP mode | A Job writing into a directory NiFi reads needs a shared volume, and [ADR-13](architecture.md#adr-13-what-happens-if-a-newly-created-pod-stays-pending) forbids RWX. Two containers in one pod sharing an `emptyDir` is the only way to share a directory without one |
 | `SplitRecord` | `SplitText` with a line split count of 1 | `SplitRecord` needs a reader and writer controller service and a schema; the input is one record per line, so the schema machinery buys nothing here |
 | Single `/metrics` scrape of `normalizer-service` | A second, **headless** `normalizer-metrics` Service, and a source that resolves it and scrapes every Ready pod | Pressure is queued + in-flight **summed over pods**. A ClusterIP scrape returns one pod's numbers, under-reporting total pressure by roughly the replica count — correct-looking at one replica and wrong at every other, in the direction that causes scale-down under load |
-| NiFi flow verified by importing it | Flow definition shipped and its invariants machine-checked as a file (`tests/demo/nififlow`) plus against a live instance at demo time (`tests/e2e/assert-nifi-flow.sh`) | `kind` is not installed in this environment, so NiFi has never been started here. "NiFi accepts this JSON" is therefore **unverified**; the runbook says so and gives the processor/property table as the manual fallback |
+| NiFi flow verified by importing it | Flow definition shipped and its invariants machine-checked as a file (`tests/demo/nififlow`) plus against a live instance at demo time (`tests/e2e/assert-nifi-flow.sh`) | NiFi has never been started in this environment — `kind` was missing during P2, and the P3 cluster runs drove the Normalizer directly. "NiFi accepts this JSON" is therefore **unverified**; the runbook says so and gives the processor/property table as the manual fallback |
 
 **Both of these gated P3, and P3 closed them:**
 
@@ -361,22 +360,38 @@ decision, with the replica count unchanged (`tests/demo/pipeline`).
 - Kubernetes events with rate limiting ([architecture § 8.2](architecture.md#82-kubernetes-events)).
 - Scenario scripts `make demo-scenario-1..5` per [test-plan § 7.4](test-plan.md#74-demo-narrative).
 
-**As built.** The actuation half is done and verified on a real cluster; the operability half is not, and the
-split is worth stating precisely rather than reporting "P3 complete":
+<a id="p3-as-built"></a>
+
+**As built.** Every code deliverable is done and unit/integration-tested; the scripted scenarios and the live
+E2E runs are not, and the split is worth stating precisely rather than reporting "P3 complete":
 
 | Deliverable | Status |
 | --- | --- |
-| Actuator: scale subresource, `resourceVersion` precondition, `409` handling, jittered bounded retry, fatal `403`/`404` | **Done** — `internal/controller/scale.go`, `internal/kubernetes/scale.go` |
+| Actuator: scale subresource, `resourceVersion` precondition, `409` handling, jittered bounded retry, fatal `403`/`404` | **Done** — `internal/controller/scale.go`, `internal/kubernetes/scale.go`; verified on the kind cluster |
 | Controller state: cooldown timers, desired history, hold backoff, `lastGoodReplicas` | **Done** — and the write timers now advance only on a *successful* write |
-| Hysteresis, partial scale-up, pending watchdog, review-driven guards, HPA conflict detection | **Already built in P1/P2**; P3 verified them against a live actuator, including that a live write cannot bypass them |
-| `pod-deletion-cost` refresh before scale-down | **Not done** — needs `pods` `patch`, which P3 deliberately did not grant |
-| Kubernetes events with rate limiting | **Not done** — needs `events` `create`, likewise not granted |
+| Hysteresis, partial scale-up, review-driven guards, HPA conflict detection | **Already built in P1/P2**; P3 verified them against a live actuator, including that a live write cannot bypass them |
+| Pending-pod watchdog: `revert` / `freeze` / `none`, quota signature | **Done in P3.** An earlier revision of this table listed it as already built; it was not — P1/P2 had only `HoldPendingPods`, which blocks scale-ups but never remediates. Now: reason `RevertPendingPods`, guard W ([scaling-algorithm § 5](scaling-algorithm.md#5-step-3--stability-gates)), unmaterialised-replica tracking, and `kss_pending_pod_remediations_total` counted once per episode |
+| `pod-deletion-cost` refresh before scale-down | **Done** — each Ready pod's cost is its own queued + in-flight work, from the `http` source; all-or-none; best-effort. Needs `pods` `patch`, now granted and narrowed by a body-validating transport (`internal/kubernetes/deletioncost.go`) |
+| Kubernetes events with rate limiting | **Done** — `events.k8s.io` `create` only, through a POST-only transport (`internal/kubernetes/events.go`); repeating holds follow the hold-backoff cadence per reason (`internal/controller/events.go`) |
 | `make demo-scenario-1..5` | **Not done** — `demo-spike`, `demo-actuate` and `measure-items-per-replica` cover the scale-up, scale-down and measurement narratives; the five scripted scenarios and the HPA side-by-side are not written |
+| Exit-criteria runs (`IT-04`, `IT-07`, `IT-08` against kind; `E2E-*`; `DI-*`) | **Not done** — covered by unit and controller-level tests with fake clients, not yet by live runs |
 
-The RBAC consequence is deliberate: a permission is granted when the code needing it exists
-([architecture § 7](architecture.md#7-kubernetes-permissions-and-rbac)). The visible cost is that scale-down
-cannot influence *which* pod the ReplicaSet controller removes, so [D-05](requirements.md#7-durability-boundary-and-workload-responsibilities)
-is not yet satisfied and the demo has no event trail.
+**Deviations from the design, made while building the watchdog:**
+
+- **The revert target removes only the stuck replicas.** [ADR-13](architecture.md#adr-13-what-happens-if-a-newly-created-pod-stays-pending)
+  says "revert to `lastGoodReplicas`". As built, the target is `clamp(max(lastGoodReplicas, current − stuck))`:
+  a scale-up of 2 → 6 that strands 1 pod reverts to 5, not 2, because the other three pods are running and
+  serving. `lastGoodReplicas` remains the floor, so a revert never removes more than our own scale-up added.
+  An external scale-up is adopted as the new `lastGoodReplicas`, so its stuck pods are never ours to revert
+  ([ADR-17](architecture.md#adr-17-how-do-we-handle-other-writers-of-the-replica-count)).
+- **A shortfall the current ReplicaSet alone accounts for is not a rollout.** `status.updatedReplicas` counts
+  pods that exist, so a quota-blocked scale-up ([FS-10](failure-scenarios.md#fs-10-namespace-resourcequota-blocks-pod-creation))
+  would otherwise read as a rollout forever and hide behind G1′. When the controller has observed the current
+  generation and no older ReplicaSet holds replicas, the gap is treated as unmaterialised replicas instead.
+
+The safety tests now enumerate three write sites and three RBAC write rules rather than asserting "exactly
+one" (`internal/controller/nowrite_test.go`). Only `deployments/scale` can change how many pods run; the
+events client and the pod client each have their own transport guard, user agent, and rule.
 
 **Exit criteria**
 

@@ -31,10 +31,11 @@ const historyRetention = 2
 //
 // Every field is an interface or a value, and none of them is a Kubernetes
 // clientset. Through P2 that was the structural half of a no-write guarantee.
-// From P3 the guarantee is narrower but the structure is unchanged: the only
-// field that can reach the API server with a mutating request is Actuator, and
-// the only mutation any implementation of it can express is a replica count on
-// one named Deployment.
+// From P3 the guarantee is narrower but the structure is unchanged. Three
+// fields can reach the API server with a mutating request: Actuator, whose only
+// expressible mutation is a replica count on one named Deployment; Events,
+// which can only add an announcement about that Deployment; and DeletionCost,
+// which can only set one annotation on a pod.
 type Options struct {
 	Config      *config.Config
 	Reader      kubernetesaccess.ClusterReader
@@ -45,6 +46,14 @@ type Options struct {
 	Actuator    Actuator
 	Log         *slog.Logger
 
+	// Events is optional. Without it decisions are logged and counted but not
+	// announced on the Deployment, which is the dry-run configuration.
+	Events EventRecorder
+
+	// DeletionCost is optional. Without it a scale-down leaves the choice of
+	// pods to the ReplicaSet controller's own ordering.
+	DeletionCost DeletionCostWriter
+
 	// Clock is injected so that cooldowns and windows are tested by advancing
 	// a fake clock rather than by sleeping. A test suite that sleeps for 300
 	// seconds to exercise a 300 second window is a suite nobody runs.
@@ -53,16 +62,18 @@ type Options struct {
 
 // Controller runs the reconcile loop.
 type Controller struct {
-	cfg         *config.Config
-	reader      kubernetesaccess.ClusterReader
-	signal      kssmetrics.WorkloadSignal
-	utilization *kssmetrics.UtilizationCollector
-	resources   resources.Options
-	metrics     *observability.Metrics
-	actuator    Actuator
-	log         *slog.Logger
-	now         func() time.Time
-	smoother    *kssmetrics.Smoother
+	cfg          *config.Config
+	reader       kubernetesaccess.ClusterReader
+	signal       kssmetrics.WorkloadSignal
+	utilization  *kssmetrics.UtilizationCollector
+	resources    resources.Options
+	metrics      *observability.Metrics
+	actuator     Actuator
+	events       EventRecorder
+	deletionCost DeletionCostWriter
+	log          *slog.Logger
+	now          func() time.Time
+	smoother     *kssmetrics.Smoother
 
 	mu    sync.Mutex
 	state state
@@ -92,6 +103,24 @@ type state struct {
 	// what we last wrote *and* we did not write it.
 	lastWrittenReplicas int32
 	hasWritten          bool
+
+	// unmaterialisedSince is when spec.replicas was first seen ahead of the
+	// pods that exist, zero while it is not. The watchdog times the quota
+	// signature from here, because unlike a Pending pod a replica that was
+	// never created carries no timestamp of its own (FS-10).
+	unmaterialisedSince time.Time
+
+	// remediationCounted marks that the current stuck episode has already been
+	// counted and announced. The watchdog fires on every reconcile past the
+	// timeout, and an operator wants one intervention per incident, not one
+	// per tick.
+	remediationCounted bool
+
+	// pendingExternalChange is an adopted external change waiting for this
+	// reconcile's announcement, and holdEvents the cadence of each repeating
+	// hold announcement.
+	pendingExternalChange *externalChange
+	holdEvents            holdEventLimiter
 
 	reconciles    int
 	lastReconcile time.Time
@@ -128,17 +157,19 @@ func New(opts Options) (*Controller, error) {
 	}
 
 	return &Controller{
-		cfg:         opts.Config,
-		reader:      opts.Reader,
-		signal:      opts.Signal,
-		utilization: opts.Utilization,
-		resources:   opts.Resources,
-		metrics:     opts.Metrics,
-		actuator:    opts.Actuator,
-		log:         log,
-		now:         clock,
-		smoother:    kssmetrics.NewSmoother(opts.Config.Workload.BacklogSmoothing),
-		state:       state{backoff: scaling.ClearBackoff()},
+		cfg:          opts.Config,
+		reader:       opts.Reader,
+		signal:       opts.Signal,
+		utilization:  opts.Utilization,
+		resources:    opts.Resources,
+		metrics:      opts.Metrics,
+		actuator:     opts.Actuator,
+		events:       opts.Events,
+		deletionCost: opts.DeletionCost,
+		log:          log,
+		now:          clock,
+		smoother:     kssmetrics.NewSmoother(opts.Config.Workload.BacklogSmoothing),
+		state:        state{backoff: scaling.ClearBackoff(), holdEvents: holdEventLimiter{}},
 	}, nil
 }
 
@@ -283,6 +314,7 @@ func (c *Controller) Reconcile(ctx context.Context) (scaling.Decision, error) {
 	observability.LogDecision(c.log, obs, c.cfg.Controller.DryRun)
 	observability.LogNodeDetail(c.log, obs)
 
+	c.refreshDeletionCosts(ctx, decision, sample, now)
 	actuateErr := c.actuator.Apply(ctx, decision)
 	if actuateErr == nil {
 		// Only a successful write advances the cooldown timers and the revert
@@ -293,6 +325,8 @@ func (c *Controller) Reconcile(ctx context.Context) (scaling.Decision, error) {
 		// nothing.
 		c.applyWriteState(decision, now)
 	}
+	c.recordRemediation(decision, snapshot, actuateErr)
+	c.announce(ctx, decision, snapshot, actuateErr, now)
 
 	c.mu.Lock()
 	c.state.reconciles++
@@ -350,6 +384,8 @@ func (c *Controller) observe(ctx context.Context, now time.Time) (scaling.Snapsh
 	snapshot.OldestPendingAge = target.OldestPendingAge
 	snapshot.UnhealthyOurPods = target.UnhealthyPods
 	snapshot.UnhealthyPodAge = target.UnhealthyPodAge
+	snapshot.UnmaterialisedReplicas = target.UnmaterialisedReplicas
+	snapshot.UnmaterialisedAge = c.trackUnmaterialised(target.UnmaterialisedReplicas, now)
 
 	snapshot.ExternalDrifts = c.trackExternalDrift(target.CurrentReplicas, now)
 
@@ -523,6 +559,7 @@ func (c *Controller) trackExternalDrift(observed int32, now time.Time) int32 {
 		c.state.observedReplicas = observed
 
 	default:
+		previous := c.state.observedReplicas
 		c.log.Warn("replica count changed by another actor; adopting it as the new baseline",
 			slog.Int("from", int(c.state.observedReplicas)),
 			slog.Int("to", int(observed)),
@@ -535,6 +572,12 @@ func (c *Controller) trackExternalDrift(observed int32, now time.Time) int32 {
 		c.state.externalDriftAt = append(c.state.externalDriftAt, now)
 		c.state.desiredHistory = nil
 		c.smoother.Reset()
+		// The adopted count is the new revert floor. Left at a value from
+		// before the change, a watchdog revert could undo another actor's
+		// decision — scaling below what they set because pods *they* added
+		// went Pending — which is fighting them by another route (ADR-17).
+		c.state.lastGoodReplicas = observed
+		c.state.pendingExternalChange = &externalChange{from: previous, to: observed}
 		if c.metrics != nil {
 			c.metrics.RecordExternalScaleChange()
 		}
@@ -551,6 +594,91 @@ func (c *Controller) trackExternalDrift(observed int32, now time.Time) int32 {
 	}
 	c.state.externalDriftAt = kept
 	return int32(len(kept))
+}
+
+// trackUnmaterialised returns how long spec.replicas has been ahead of the pods
+// that exist, measured on this controller's clock.
+//
+// Restarting the controller restarts the clock, which delays a remediation by
+// at most one pendingPodTimeout and never brings one forward — the safe
+// direction for a timer that ends in a write.
+func (c *Controller) trackUnmaterialised(unmaterialised int32, now time.Time) time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if unmaterialised <= 0 {
+		c.state.unmaterialisedSince = time.Time{}
+		return 0
+	}
+	if c.state.unmaterialisedSince.IsZero() {
+		c.state.unmaterialisedSince = now
+	}
+	return now.Sub(c.state.unmaterialisedSince)
+}
+
+// recordRemediation counts and announces one watchdog intervention per stuck
+// episode (FR-20).
+//
+// An episode is a run of reconciles past pendingPodTimeout; it ends when the
+// stuck replicas are gone. A revert is counted once it has been applied, so a
+// write that conflicted or failed is retried next reconcile rather than counted
+// as done. Under revert with nothing of ours to take back, the engine holds
+// scale-ups instead, and that is recorded as what it is — a freeze — rather
+// than as a revert that did not happen.
+func (c *Controller) recordRemediation(decision scaling.Decision, snapshot scaling.Snapshot, actuateErr error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !decision.PendingTimedOut {
+		c.state.remediationCounted = false
+		return
+	}
+	if c.state.remediationCounted {
+		return
+	}
+
+	configured := c.cfg.Pending.OnPendingTimeout
+	action := configured
+	switch {
+	case decision.Reason == scaling.ReasonRevertPendingPods:
+		if actuateErr != nil {
+			return
+		}
+	case configured == config.OnPendingRevert:
+		action = config.OnPendingFreeze
+	}
+
+	c.state.remediationCounted = true
+	if c.metrics != nil {
+		c.metrics.RecordPendingRemediation(action)
+	}
+
+	c.log.Warn("pending-pod watchdog: replicas stuck past pendingPodTimeout",
+		slog.String("configured", configured),
+		slog.String("action", action),
+		slog.Int("pending_pods", int(snapshot.PendingOurPods)),
+		slog.String("oldest_pending", snapshot.OldestPendingAge.Round(time.Second).String()),
+		slog.Int("unmaterialised_replicas", int(snapshot.UnmaterialisedReplicas)),
+		slog.String("unmaterialised_for", snapshot.UnmaterialisedAge.Round(time.Second).String()),
+		slog.Int("from_replicas", int(decision.CurrentReplicas)),
+		slog.Int("to_replicas", int(decision.TargetReplicas)),
+		slog.String("detail", remediationDetail(action, configured)),
+	)
+}
+
+func remediationDetail(action, configured string) string {
+	switch {
+	case action == config.OnPendingRevert:
+		return "the stuck replicas were taken back through the scale subresource; the ReplicaSet controller " +
+			"removes unscheduled pods first, so no scheduled pod is touched, and the backoff is armed (ADR-13)"
+	case configured == config.OnPendingRevert:
+		return "revert is configured but there is nothing of ours to take back — the stuck replicas were added " +
+			"by another actor, or lastGoodReplicas is the current count — so scale-ups are held instead"
+	case action == config.OnPendingFreeze:
+		return "scale-ups are held until the stuck replicas schedule or are removed"
+	default:
+		return "reported only; scale-ups are still held while any replica of ours is stuck"
+	}
 }
 
 // applyDecisionState folds the outputs that describe the decision itself: the

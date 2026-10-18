@@ -1,15 +1,21 @@
 # Namespaced permissions on the target workload's namespace.
 #
-# THIS ROLE GRANTS EXACTLY ONE MUTATION: `deployments/scale`. Everything else
-# here is a read. See the reasoning in clusterrole.yaml: this rule set is the
-# enforcement that holds even if the controller's code is wrong.
+# THIS ROLE GRANTS EXACTLY ONE MUTATION OF THE WORKLOAD: `deployments/scale`.
+# The two other writes cannot change how many pods run: `create` on
+# events.k8s.io events (announcements about the target), and `patch` on pods,
+# which the controller's transport confines to the pod-deletion-cost
+# annotation. Everything else here is a read. See the reasoning in clusterrole.yaml: this rule set is the
+# enforcement that holds even if the controller's code is wrong, and
+# internal/controller/nowrite_test.go fails if a write rule is added or widened
+# without being enumerated there.
 #
 # The phase split on `deployments` was deliberate and is worth keeping in view
 # now that it has closed. The read arrived in P1 so the estimator could be
 # validated against a real cluster in dry-run, and `deployments/scale` was
 # withheld until P3 — the RBAC expression of the plan's sequencing principle,
 # observe correctly before acting at all. A P1 bug could not change a replica
-# count even if it tried. A P3 bug can change exactly one field of one object.
+# count even if it tried. A P3 bug can change exactly one field of one
+# Deployment; the other two writes cannot change how many pods run.
 #
 # `deployments` `update` is still never granted, only `deployments/scale`, so a
 # bug cannot rewrite the pod template (FS-21). There is no `delete` on pods, so
@@ -21,17 +27,11 @@
 #
 #   | Resource | API group            | Verbs               | Added in | Why                                  |
 #   |----------|----------------------|---------------------|----------|--------------------------------------|
-#   | pods     | core                 | patch               | later    | pod-deletion-cost annotation (FR-21) |
-#   | events   | core / events.k8s.io | create, patch       | later    | Decision audit trail (FR-24)         |
 #   | leases   | coordination.k8s.io  | get, create, update | P4       | Leader election (FR-26)              |
 #
-# Those three are documented P3 deliverables that this phase deliberately does
-# not ship, because each needs a permission beyond the one mutation above and
-# the scope of this change is the replica count itself. Their absence is
-# visible in behaviour rather than hidden: no events are emitted, scale-down
-# does not bias pod selection, and a second replica would compete rather than
-# stand by — which is why the Deployment runs a single replica with the
-# Recreate strategy until the lease arrives in P4.
+# Its absence is visible in behaviour rather than hidden: a second replica
+# would compete rather than stand by — which is why the Deployment runs a
+# single replica with the Recreate strategy until the lease arrives in P4.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -67,6 +67,27 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
     verbs: ["get", "update", "patch"]
+
+  # The decision audit trail on the target (FR-24, architecture § 8.2), so
+  # `kubectl describe deployment` says why the replica count is what it is.
+  # `create` only: each announcement is a new object, so there is nothing to
+  # patch, and no read is needed to write one. events.k8s.io rather than core,
+  # because the newer API carries `regarding` and `reportingController`. Only
+  # the live actuator uses it — dry-run builds no events client.
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create"]
+
+  # Least-busy-first scale-down (FR-21, D-06): before lowering the replica
+  # count, each Ready pod's controller.kubernetes.io/pod-deletion-cost is set
+  # to its own outstanding work. RBAC cannot narrow `patch` to one field — this
+  # rule alone would also permit relabelling a pod out of its ReplicaSet — so
+  # the controller's pod client refuses any request body other than a merge
+  # patch of that one annotation (internal/kubernetes/deletioncost.go). Reads
+  # of pods come from the ClusterRole. There is still no `delete` (I-11).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["patch"]
 
   # Needed to tell the target's *current* pods from those of a previous
   # ReplicaSet during a rollout (DR-09). Without this, a rolling update makes

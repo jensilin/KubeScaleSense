@@ -6,18 +6,18 @@ KubeScaleSense scales a normalization workload according to incoming demand **wh
 the Kubernetes cluster can actually schedule the additional pods** — preventing the Pending pods, resource
 exhaustion, and processing interruptions that follow from scaling blindly.
 
-> **Status: P2 — it observes a real workload and reports decisions. It does not autoscale anything yet.**
+> **Status: P3 — it autoscales, when told to. The code for every P3 deliverable exists; the scripted demo
+> scenarios and the live end-to-end runs do not yet.**
 >
 > | | State |
 > | --- | --- |
-> | **Implemented** | **P0** module and package layout, configuration schema with `KSS_*` overrides and startup validation that refuses unsafe input, structured logging, graceful shutdown, build/test/lint/docs checks, container image · **P1** read-only cluster observation, per-node fit-capacity calculation, the full decision engine, and dry-run reporting · **P2** the Normalizer workload, NiFi 2.6.7 ingest, the deterministic load generator, the `kind` demo environment, and the live `http` pressure signal |
-> | **Not implemented** | [P3](docs/implementation-plan.md#p3--actuation-and-stability) actuation — **no replica count is ever written today** · [P4](docs/implementation-plan.md#p4--hardening-and-operability-poc-complete) hardening |
+> | **Implemented** | **P0** module and package layout, configuration schema with `KSS_*` overrides and startup validation that refuses unsafe input, structured logging, graceful shutdown, build/test/lint/docs checks, container image · **P1** read-only cluster observation, per-node fit-capacity calculation, the full decision engine, and dry-run reporting · **P2** the Normalizer workload, NiFi 2.6.7 ingest, the deterministic load generator, the `kind` demo environment, and the live `http` pressure signal · **P3** replica writes through `deployments/scale` with optimistic concurrency, the pending-pod watchdog, rate-limited Kubernetes events, and least-busy-first scale-down through `pod-deletion-cost` |
+> | **Not implemented** | [P3](docs/implementation-plan.md#p3-as-built) scenario scripts and live `IT`/`E2E`/`DI` runs · [P4](docs/implementation-plan.md#p4--hardening-and-operability-poc-complete) hardening, including leader election |
 >
-> The controller runs with `dryRun: true` and there is no code path that writes a replica count: its
-> Kubernetes client exposes read-only interfaces, which a test asserts structurally rather than by review.
-> During a demo spike it will report `currentReplicas: 1, demandReplicas: 8, fitCapacity: 3,
-> targetReplicas: 4, reason: ScaleUpPartial` — and the Deployment stays at 1 replica. That gap is the
-> deliverable; [P3](docs/implementation-plan.md#p3--actuation-and-stability) closes it. See
+> `dryRun: true` is still the shipped default, and in dry-run the process builds no client that can write
+> anything. With `dryRun: false` it writes one field of one Deployment (`spec.replicas`, through the scale
+> subresource), creates events about that Deployment, and sets one annotation on its pods. Each write has its
+> own narrowly guarded client, and a test enumerates all three. See
 > [docs/implementation-plan.md](docs/implementation-plan.md) for the phased build plan.
 
 ## Quick start
@@ -205,11 +205,11 @@ cmd/
   normalizer/           # the demo workload: a small stateless HTTP server
 internal/
   config/               # schema, defaults, KSS_* overrides, validation
-  kubernetes/           # read-only clients, informers, target and node readers
+  kubernetes/           # read-only clients, informers, target and node readers; the three guarded write clients
   resources/            # node filtering, free-resource math, fit capacity
   metrics/              # workload-signal sources (synthetic, http, none), pod utilization, staleness
   scaling/              # pure decision engine: Snapshot -> Decision
-  controller/           # reconcile loop, dry-run actuator
+  controller/           # reconcile loop, dry-run and scale actuators, watchdog accounting, events, deletion cost
   observability/        # Prometheus metrics, health, logging
   normalizer/           # normalization logic, in-flight accounting, drain
 config/                 # kubescalesense.yaml — the documented defaults
@@ -248,17 +248,23 @@ Rationale for each: [requirements § 3](docs/requirements.md#3-non-goals). When 
 
 [P0 — Foundation](docs/implementation-plan.md#p0--foundation),
 [P1 — Observation](docs/implementation-plan.md#p1--observation-dry-run-only),
-[P2 — Demonstration workload](docs/implementation-plan.md#p2--demonstration-workload) and the actuation half
-of [P3](docs/implementation-plan.md#p3--actuation-and-stability) are implemented. There is a real pipeline, a
+[P2 — Demonstration workload](docs/implementation-plan.md#p2--demonstration-workload) and the code of
+[P3](docs/implementation-plan.md#p3--actuation-and-stability) are implemented. There is a real pipeline, a
 real pressure signal read from the workload itself, a controller that computes demand and feasibility every
 interval, and — since P3 — a write path that acts on it.
 
-The write path is deliberately one call wide: `UpdateScale` on the target's `deployments/scale`, carrying a
-`resourceVersion` precondition, behind a transport that refuses every other mutating request. The controller
+The replica write is deliberately one call wide: `UpdateScale` on the target's `deployments/scale`, carrying
+a `resourceVersion` precondition, behind a transport that refuses every other request shape. The controller
 cannot reach the pod template and holds no permission to delete a pod, so scale-down goes through the
-ReplicaSet controller where graceful termination and PodDisruptionBudgets still apply. In dry-run — still the
-default — no writable client is constructed at all, so the capability is absent from the process rather than
-merely unused.
+ReplicaSet controller where graceful termination and PodDisruptionBudgets still apply. Two other writes exist,
+and neither can change how many pods run. Events go through a client that can only POST to the namespace's
+event collection. `pod-deletion-cost` goes through a client whose transport rejects any patch body except
+that one annotation. In dry-run — still the default — none of these clients is constructed, so the
+capability is absent from the process rather than merely unused.
+
+The pending-pod watchdog closes the loop on a wrong fit estimate. A replica that stays unschedulable, or that
+a quota never lets become a pod, is taken back through the scale subresource after `pendingPodTimeout`. The
+revert removes only the stuck replicas and never goes below the count before our own scale-up.
 
 Both P2 exit criteria that gated this are now closed. `itemsPerReplica` was **measured** at 40 against the
 Normalizer's SLO of p95 ≤ 500 ms, correcting a guess of 12
@@ -267,6 +273,6 @@ replicas do convert into throughput ([test-plan § 6.1](docs/test-plan.md#61-di-
 case that matters most, where demand asked for 17 replicas and the controller added the one that actually
 fit.
 
-What P3 has not finished is the operability half: Kubernetes events, `pod-deletion-cost`, and leader election
-are still [deferred](docs/implementation-plan.md#7-deferred-scope-and-when-to-pick-it-up). Until leader
-election exists, single-writer is enforced the blunt way — `replicas: 1` with `strategy: Recreate`.
+What P3 has not finished is the demonstration: the five scripted scenarios, the HPA side-by-side, and live
+runs of the exit-criteria tests ([as built](docs/implementation-plan.md#p3-as-built)). Leader election is
+P4. Until it exists, single-writer is enforced the blunt way — `replicas: 1` with `strategy: Recreate`.

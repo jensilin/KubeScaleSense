@@ -148,6 +148,15 @@ type Snapshot struct {
 	// than podStartupTimeout is.
 	UnhealthyOurPods int32
 	UnhealthyPodAge  time.Duration
+
+	// UnmaterialisedReplicas is how far spec.replicas exceeds the pods the
+	// current ReplicaSet actually has, and UnmaterialisedAge how long the gap
+	// has persisted. A namespace ResourceQuota rejects pod creation outright,
+	// so a quota-blocked scale-up leaves no Pending pod behind at all: this gap
+	// is its only signature, and without it the watchdog would be blind to the
+	// one cause of a wrong estimate that never reaches the scheduler (FS-10).
+	UnmaterialisedReplicas int32
+	UnmaterialisedAge      time.Duration
 }
 
 // MaxDesiredInWindow returns the highest desired value sampled inside the

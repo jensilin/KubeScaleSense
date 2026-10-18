@@ -19,22 +19,25 @@ import (
 // This file is the machine-checked form of the project's central safety claim.
 //
 // Through P2 the claim was "there is no path by which this controller could
-// change the cluster". P3 gives it one, so the claim changes shape rather than
-// weakening: there is exactly one, it writes one field of one object, and every
-// layer that used to say "nothing" now says "this and nothing else".
+// change the cluster". P3 gives it paths, so the claim changes shape rather than
+// weakening: the paths are enumerated, each is bounded to one kind of change
+// regarding the one target, and every layer that used to say "nothing" now
+// says "these and nothing else". Exactly one of them can change how many pods
+// run — the scale subresource — and none can touch the pod template.
 //
 // Four independent layers enforce it, and each is asserted separately, because
 // any one of them could be removed by a plausible-looking future edit:
 //
 //	interface    the controller's observation view is a ClusterReader, which
 //	             has no mutating method and no clientset behind it
-//	surface      exactly two Actuators exist, and the one mutating client-go
-//	             call in the repository is UpdateScale in internal/kubernetes
-//	transport    the observation client refuses every non-GET method, and the
-//	             actuation client refuses every write except PUT/PATCH to the
-//	             target's scale path (internal/kubernetes)
-//	RBAC         the ServiceAccount holds exactly one write rule, on
-//	             deployments/scale (deploy/)
+//	surface      exactly two Actuators exist, and every mutating client-go
+//	             call in the repository is one of wantWriteSites, all in
+//	             internal/kubernetes
+//	transport    the observation client refuses every non-GET method, and
+//	             each write client refuses everything but its one request
+//	             shape (internal/kubernetes)
+//	RBAC         the ServiceAccount's write rules are exactly wantWriteRules
+//	             (deploy/)
 //
 // The transport and RBAC layers hold even if the code is wrong. The tests below
 // cover the first two and, more importantly, guard the boundary: they fail if a
@@ -184,23 +187,33 @@ func TestActuator_ImplementationsAreTheExpectedTwo(t *testing.T) {
 	}
 }
 
-// The one mutating client-go call in the repository.
+// wantWriteSites is every mutating client-go call in the repository, as
+// "file verb", with what it can change.
 //
+// Each entry has its own file, its own transport guard, and its own RBAC rule,
+// so auditing a write path means reading one file. Adding an entry is the
+// moment the safety surface grows, and it should be a deliberate edit here
+// rather than something a sweep happens not to notice.
+var wantWriteSites = map[string]string{
+	"internal/kubernetes/scale.go UpdateScale": "spec.replicas of the target, through deployments/scale and nothing " +
+		"else (FR-01)",
+	"internal/kubernetes/events.go Create": "a new Event regarding the target; it creates announcements and cannot " +
+		"edit or delete anything (FR-24)",
+	"internal/kubernetes/deletioncost.go Patch": "the pod-deletion-cost annotation of a pod, and no other field — " +
+		"the transport validates the body (FR-21)",
+}
+
 // TestNoMutatingCallsOutsideTheKubernetesPackage exempts internal/kubernetes
 // because it legitimately names these verbs. This is the other half of that
-// exemption: inside that package, the set of mutating calls must be exactly
-// one, and it must be the scale subresource. Without this pair, "only
+// exemption: inside that package, the mutating calls must be exactly
+// wantWriteSites, each appearing once. Without this pair, "only
 // internal/kubernetes may write" would be an unbounded licence for the one
 // package nobody else is checking.
-func TestTheKubernetesPackageWritesOnlyTheScaleSubresource(t *testing.T) {
+func TestTheKubernetesPackageWritesOnlyAtTheEnumeratedSites(t *testing.T) {
 	t.Parallel()
 
 	root := repoRoot(t)
-	type site struct {
-		verb string
-		file string
-	}
-	var sites []site
+	found := map[string]int{}
 
 	forEachGoFile(t, root, func(path string, file *ast.File) {
 		if filepath.ToSlash(filepath.Dir(rel(root, path))) != "internal/kubernetes" {
@@ -217,24 +230,28 @@ func TestTheKubernetesPackageWritesOnlyTheScaleSubresource(t *testing.T) {
 			}
 			for _, verb := range mutatingMethods {
 				if selector.Sel.Name == verb {
-					sites = append(sites, site{verb: verb, file: rel(root, path)})
+					found[rel(root, path)+" "+verb]++
 				}
 			}
 			return true
 		})
 	})
 
-	if len(sites) != 1 {
-		t.Fatalf("found %d mutating client-go calls in internal/kubernetes, want exactly 1 (UpdateScale): %+v",
-			len(sites), sites)
+	for site, what := range wantWriteSites {
+		switch found[site] {
+		case 1:
+		case 0:
+			t.Errorf("expected write site %s is missing; it should exist and write %s", site, what)
+		default:
+			t.Errorf("write site %s appears %d times; each write path is a single call a reviewer can find",
+				site, found[site])
+		}
 	}
-	if sites[0].verb != "UpdateScale" {
-		t.Errorf("the single mutating call is %s in %s; the only mutation this project performs is UpdateScale "+
-			"on deployments/scale (FR-01, architecture § 7)", sites[0].verb, sites[0].file)
-	}
-	if sites[0].file != "internal/kubernetes/scale.go" {
-		t.Errorf("the mutating call lives in %s; it belongs in internal/kubernetes/scale.go, which is the one "+
-			"file a reviewer should have to read to audit the write path", sites[0].file)
+	for site := range found {
+		if _, expected := wantWriteSites[site]; !expected {
+			t.Errorf("%s is a mutating client-go call outside the enumerated write sites; add it to "+
+				"wantWriteSites with what it can change, or remove it (architecture § 7)", site)
+		}
 	}
 }
 
@@ -346,20 +363,33 @@ func TestNoMutatingCallsOutsideTheKubernetesPackage(t *testing.T) {
 	})
 }
 
-// The RBAC manifests must grant exactly one write rule, on deployments/scale.
+// wantWriteRules is every RBAC rule that carries a write verb, keyed by
+// "file apiGroups resources", with its exact verbs line.
+//
+// All of them are in the namespaced Role, so every write is confined to the
+// target's namespace. Each matches one entry of wantWriteSites.
+var wantWriteRules = map[string]string{
+	`role.yaml ["apps"] ["deployments/scale"]`: `verbs: ["get", "update", "patch"]`,
+	`role.yaml ["events.k8s.io"] ["events"]`:   `verbs: ["create"]`,
+	`role.yaml [""] ["pods"]`:                  `verbs: ["patch"]`,
+}
+
+// The RBAC manifests must grant exactly the enumerated write rules.
 //
 // This layer holds even if every Go-level guarantee above is broken, which is
 // why it is asserted against the shipped YAML rather than trusted. The
-// assertion is deliberately two-sided: the scale rule must be present, because
-// without it P3 does not work, and it must be the *only* rule carrying a write
-// verb, because that is the bound on what a bug can do.
-func TestRBACManifests_GrantExactlyOneWriteRule(t *testing.T) {
+// assertion is deliberately two-sided: each rule must be present, because
+// without it its feature does not work, and no other rule may carry a write
+// verb, because that is the bound on what a bug can do. In particular nothing
+// may grant a write on `deployments` itself, which would reach the pod
+// template (FS-21), or `delete` on pods (I-11).
+func TestRBACManifests_GrantExactlyTheEnumeratedWriteRules(t *testing.T) {
 	t.Parallel()
 
 	root := repoRoot(t)
-	writeVerbs := []string{"create", "update", "patch", "delete", "deletecollection"}
+	writeVerbs := []string{"create", "update", "patch", "delete", "deletecollection", "escalate", "bind", "impersonate"}
 
-	writeRules := map[string][]string{}
+	found := map[string][]string{}
 
 	for _, name := range []string{"clusterrole.yaml", "role.yaml"} {
 		path := filepath.Join(root, "deploy", "kubescalesense", name)
@@ -369,16 +399,20 @@ func TestRBACManifests_GrantExactlyOneWriteRule(t *testing.T) {
 			t.Fatalf("reading %s: %v", name, err)
 		}
 
-		// The resource a verbs: line belongs to is the resources: line above
-		// it, which is enough structure for a rule list this small and avoids
-		// pulling a YAML parser into a guard test.
-		resources := ""
+		// The rule a verbs: line belongs to is the apiGroups: and resources:
+		// lines above it, which is enough structure for a rule list this small
+		// and avoids pulling a YAML parser into a guard test.
+		apiGroups, resources := "", ""
 		for i, line := range strings.Split(string(raw), "\n") {
-			trimmed := strings.TrimSpace(line)
+			trimmed := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "- "))
 
 			// Comments are skipped: the deferred-permission tables name every
 			// future verb on purpose.
 			if strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			if strings.HasPrefix(trimmed, "apiGroups:") {
+				apiGroups = strings.TrimSpace(strings.TrimPrefix(trimmed, "apiGroups:"))
 				continue
 			}
 			if strings.HasPrefix(trimmed, "resources:") {
@@ -390,27 +424,29 @@ func TestRBACManifests_GrantExactlyOneWriteRule(t *testing.T) {
 			}
 
 			for _, verb := range writeVerbs {
-				if !strings.Contains(trimmed, verb) {
-					continue
+				if strings.Contains(trimmed, `"`+verb+`"`) || strings.Contains(trimmed, `"*"`) {
+					rule := fmt.Sprintf("%s %s %s", name, apiGroups, resources)
+					found[rule] = append(found[rule], fmt.Sprintf("line %d: %s", i+1, trimmed))
+					break
 				}
-				where := fmt.Sprintf("%s:%d %s %s", name, i+1, resources, trimmed)
-				writeRules[resources] = append(writeRules[resources], where)
 			}
 		}
 	}
 
-	const scaleResource = `["deployments/scale"]`
-
-	if _, ok := writeRules[scaleResource]; !ok {
-		t.Errorf("no rule grants a write verb on %s; P3 cannot change a replica count without it", scaleResource)
-	}
-
-	for resources, sites := range writeRules {
-		if resources == scaleResource {
-			continue
+	for rule, verbs := range wantWriteRules {
+		lines, ok := found[rule]
+		switch {
+		case !ok:
+			t.Errorf("no rule grants %s %s; the feature behind it cannot work without it", rule, verbs)
+		case len(lines) != 1 || !strings.HasSuffix(lines[0], verbs):
+			t.Errorf("%s grants %v, want exactly one rule with %s (architecture § 7)", rule, lines, verbs)
 		}
-		t.Errorf("%s carries a write verb, which is outside P3's single permitted mutation:\n  %s",
-			resources, strings.Join(sites, "\n  "))
+	}
+	for rule, lines := range found {
+		if _, expected := wantWriteRules[rule]; !expected {
+			t.Errorf("%s carries a write verb outside the enumerated write rules:\n  %s",
+				rule, strings.Join(lines, "\n  "))
+		}
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -441,6 +442,7 @@ func TestReconcile_SafetyGatesStillBlockWritesWithALiveActuator(t *testing.T) {
 		}},
 		{"a rollout is in progress", func(f *fixture) {
 			f.deployment = deployment(2, withRequests(500, 512), withStatus(1, 1))
+			f.olderReplicaSets = []*appsv1.ReplicaSet{previousReplicaSet(f.deployment, 1)}
 		}},
 		{"the pressure signal is stale", func(f *fixture) {
 			f.signalUnavailable = true

@@ -17,6 +17,14 @@ const (
 	ReasonScaleUpPartial Reason = "ScaleUpPartial"
 	ReasonScaleDown      Reason = "ScaleDown"
 
+	// ReasonRevertPendingPods is the watchdog's remediation write: replicas
+	// that stayed unschedulable, or never materialised into pods, for longer
+	// than pendingPodTimeout are taken back (FR-20, ADR-13). Distinct from
+	// ScaleDown because it is not a statement about demand, it bypasses the
+	// scale-down gates, and an operator reading it has a different job — find
+	// out why the fit estimate was wrong.
+	ReasonRevertPendingPods Reason = "RevertPendingPods"
+
 	// The steady state.
 	ReasonNoChangeWithinTolerance Reason = "NoChangeWithinTolerance"
 
@@ -47,6 +55,7 @@ var Reasons = []Reason{
 	ReasonScaleUp,
 	ReasonScaleUpPartial,
 	ReasonScaleDown,
+	ReasonRevertPendingPods,
 	ReasonNoChangeWithinTolerance,
 	ReasonHoldInsufficientResources,
 	ReasonHoldCooldown,
@@ -78,7 +87,7 @@ const (
 // Action reports whether this reason corresponds to a replica-count write.
 func (r Reason) Action() Action {
 	switch r {
-	case ReasonScaleUp, ReasonScaleUpPartial, ReasonScaleDown:
+	case ReasonScaleUp, ReasonScaleUpPartial, ReasonScaleDown, ReasonRevertPendingPods:
 		return ActionWrite
 	default:
 		return ActionNone
@@ -92,7 +101,7 @@ func (r Reason) Action() Action {
 // permanently saturated in the steady state.
 func (r Reason) IsHold() bool {
 	switch r {
-	case ReasonScaleUp, ReasonScaleUpPartial, ReasonScaleDown, ReasonNoChangeWithinTolerance:
+	case ReasonScaleUp, ReasonScaleUpPartial, ReasonScaleDown, ReasonRevertPendingPods, ReasonNoChangeWithinTolerance:
 		return false
 	default:
 		return true

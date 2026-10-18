@@ -40,8 +40,9 @@ Defaults referenced in this document: `IPR = 50`, `U_target = 70`, `T = 10 %`, `
 
 ## 2. Decision outcomes and reason codes
 
-Every reconcile produces exactly one reason code. The same string appears in the log line, the Kubernetes
-Event, and the `reason` label of `kss_reconcile_total`
+Every reconcile produces exactly one reason code. The same string appears in the log line, the `action` field
+of the Kubernetes Event (whose `reason` is the human-facing name from
+[architecture § 8.2](architecture.md#82-kubernetes-events)), and the `reason` label of `kss_reconcile_total`
 ([architecture § 8](architecture.md#8-observability-requirements)) — this is the project's audit contract, so
 codes are treated as a stable API.
 
@@ -50,6 +51,7 @@ codes are treated as a stable API.
 | `ScaleUp` | write | Demand requires more replicas and all of them fit |
 | `ScaleUpPartial` | write | Demand requires more than fits; scaled by `F`, remainder deferred |
 | `ScaleDown` | write | Demand has been sustainably lower for the whole window |
+| `RevertPendingPods` | write | Our replicas stayed unschedulable, or never became pods, past `pendingPodTimeout`; they are taken back ([ADR-13](architecture.md#adr-13-what-happens-if-a-newly-created-pod-stays-pending)). Not a statement about demand |
 | `NoChangeWithinTolerance` | none | Desired is within the deadband of current — the steady state |
 | `HoldInsufficientResources` | none | Scale-up needed, `F == 0` |
 | `HoldCooldown` | none | Correct direction, but too soon since the last action |
@@ -241,13 +243,14 @@ matters: it is what makes the reported reason the *most actionable* one rather t
 | --- | --- | --- | --- |
 | G0 | Snapshot valid | Target unreadable / caches unsynced | `ErrorAPIFailure` |
 | G1 | Sole ownership | An HPA targets the same workload, or external drift exceeded `externalChangeTolerance` | `HoldScalingConflict` / `HoldExternalChange` |
-| G1′ | Rollout quiet | `generation != observedGeneration` or `updatedReplicas != replicas` | `HoldRolloutInProgress` |
+| G1′ | Rollout quiet | `generation != observedGeneration` or `updatedReplicas != replicas` — except when the current ReplicaSet is the only one holding replicas, which is a scale waiting to materialise, not a rollout | `HoldRolloutInProgress` |
+| W | Pending watchdog | Pending pods or unmaterialised replicas older than `pendingPodTimeout`, `onPendingTimeout: revert`, and some of them are ours to take back | `RevertPendingPods` |
 | G2 | Signal freshness | Backlog unavailable, or `age > metricsStaleAfter` | `HoldStaleMetrics` |
 | G3 | Clamp binding | `desiredRaw > R_max` and `R_cur == R_max` | `HoldAtMaxReplicas` |
 | G3′ | Clamp binding | `desiredRaw < R_min` and `R_cur == R_min` | `HoldAtMinReplicas` |
 | G4 | Deadband | Within `T` of `R_cur` | `NoChangeWithinTolerance` |
 | **Scale-up path** (fit capacity `F` is computed before these guards — see below) | | | |
-| G5 | Pending pods | `PendingOurPods > 0` | `HoldPendingPods` |
+| G5 | Pending pods | `PendingOurPods > 0` or `UnmaterialisedReplicas > 0` | `HoldPendingPods` |
 | G5′ | Unhealthy pods | A scheduled pod has been not-Ready for > `podStartupTimeout` | `HoldUnhealthyPods` |
 | G6 | Backoff | `now < holdBackoff.nextEligible` **and** `F <= holdBackoff.fitCapacityAtArm` | `HoldBackoff` |
 | G7 | Cooldown | `now − LastScaleUp < C_up` | `HoldCooldown` |
@@ -260,6 +263,12 @@ matters: it is what makes the reported reason the *most actionable* one rather t
 
 Notes on specific orderings:
 
+- **W after G0–G1′, before G2.** A remediation must not wait for demand data — a stuck scale-up during a
+  metrics outage is still stuck — but it must not act against another controller, an external writer, or a
+  rollout. The target is `clamp(max(lastGoodReplicas, R_cur − stuck), R_min, R_max)`: only the stuck replicas
+  are removed, never more than our own scale-up added, and the hold backoff is armed so the scale-up is not
+  immediately retried. Under `freeze` and `none`, or when nothing is ours to revert, W writes nothing and G5
+  holds scale-ups instead; the timeout is still counted and announced.
 - **G2 before everything numeric.** Never compute a decision from data known to be stale.
 - **G5/G5′/G6 before G7.** If pods are already Pending, are failing to start, or a scale-up was just proven
   infeasible, the cooldown state is irrelevant and reporting it would be misleading.
@@ -281,7 +290,9 @@ flowchart TD
     G0{"Snapshot valid?"} -- No --> E["ErrorAPIFailure"]
     G0 -- Yes --> G1{"HPA on target?"}
     G1 -- Yes --> SC["HoldScalingConflict"]
-    G1 -- No --> G2{"Signals fresh?"}
+    G1 -- No --> W{"Our replicas stuck<br/>past pendingPodTimeout,<br/>revert configured?"}
+    W -- Yes --> RV["RevertPendingPods"]
+    W -- No --> G2{"Signals fresh?"}
     G2 -- No --> ST["HoldStaleMetrics"]
     G2 -- Yes --> D["desiredRaw = max(backlog target, utilization target)"]
     D --> CL["clamp to min..max"]
@@ -291,7 +302,7 @@ flowchart TD
 
     DIR -- up --> FIT["Compute fit capacity F<br/>always, before the up-gates"]
     FIT --> G5{"Our pods Pending?"}
-    G5 -- Yes --> HP["HoldPendingPods"]
+    G5 -- "Yes, or replicas<br/>not yet created" --> HP["HoldPendingPods"]
     G5 -- No --> G5B{"Scheduled pods<br/>not becoming Ready?"}
     G5B -- Yes --> HU["HoldUnhealthyPods"]
     G5B -- No --> G6{"Backoff active<br/>and F not increased?"}
@@ -315,7 +326,7 @@ flowchart TD
     classDef act fill:#238636,color:#fff,stroke:#116329
     classDef hold fill:#9e6a03,color:#fff,stroke:#7d4e00
     classDef err fill:#da3633,color:#fff,stroke:#a02622
-    class UP,PU,DN act
+    class UP,PU,DN,RV act
     class HR,HB,HC1,HC2,HS,HP,HU,HRS,SC,ST hold
     class E err
 ```
@@ -528,11 +539,22 @@ keep the pipeline as fast as the cluster safely allows and make the shortfall **
 
 ```go
 func Decide(s Snapshot, c Config, now time.Time) Decision {
-    // G0–G2: validity, sole ownership, quiet target, freshness
+    // G0–G1′: validity, sole ownership, quiet target
     if !s.Valid                       { return hold(ErrorAPIFailure) }
     if s.HPAPresent                   { return hold(HoldScalingConflict) }
     if s.ExternalDrifts > c.ExternalChangeTolerance { return hold(HoldExternalChange) }
     if s.RolloutInProgress            { return hold(HoldRolloutInProgress) }
+
+    // W: pending watchdog — acts without demand data, bypasses the scale-down gates
+    stuck := s.PendingOurPods + s.UnmaterialisedReplicas
+    timedOut := (s.PendingOurPods > 0 && s.OldestPendingAge > c.PendingPodTimeout) ||
+                (s.UnmaterialisedReplicas > 0 && s.UnmaterialisedAge > c.PendingPodTimeout)
+    if timedOut && c.OnPendingTimeout == "revert" {
+        target := clamp(max(s.LastGoodReplicas, s.CurrentReplicas-stuck), c.MinReplicas, c.MaxReplicas)
+        if target < s.CurrentReplicas { return scale(target, RevertPendingPods, armBackoff) }
+    }
+
+    // G2: freshness
     if !s.Backlog.Fresh(c.MetricsStaleAfter, now) { return hold(HoldStaleMetrics) }
 
     // Step 1: demand
@@ -558,7 +580,7 @@ func Decide(s Snapshot, c Config, now time.Time) Decision {
         backoffActive := now.Before(s.HoldBackoff.NextEligible) &&
                          s.FitCapacity <= s.HoldBackoff.FitCapacityAtArm
 
-        if s.PendingOurPods > 0                                { return hold(HoldPendingPods) }
+        if s.PendingOurPods > 0 || s.UnmaterialisedReplicas > 0 { return hold(HoldPendingPods) }
         if s.UnhealthyPodAge > c.PodStartupTimeout             { return hold(HoldUnhealthyPods) }
         if backoffActive                                       { return hold(HoldBackoff) }
         if now.Sub(s.LastScaleUp) < c.ScaleUpCooldown          { return hold(HoldCooldown) }

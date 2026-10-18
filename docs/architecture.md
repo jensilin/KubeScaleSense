@@ -171,7 +171,7 @@ Produces the demand half of the snapshot:
 | Signal | Source | Notes |
 | --- | --- | --- |
 | `pressureItems` | The configured `WorkloadSignal` source: `synthetic` (a scripted series) or `http` (scraped from **every** Normalizer pod through a headless Service and summed, [ADR-22a](#adr-22a-the-http-source-scrapes-every-pod)) | Primary demand signal — **outstanding work**: queued plus in-flight requests. Optional EWMA smoothing ([scaling-algorithm § 8.4](scaling-algorithm.md#84-signal-smoothing)) |
-| `inFlightRequests` | Same source; the Normalizer's own in-flight counter, summed over pods | Reported, and the natural input for `pod-deletion-cost`. Makes "the pool is busy but nothing is queued" visible |
+| `inFlightRequests` | Same source; the Normalizer's own in-flight counter, summed over pods | Reported. Makes "the pool is busy but nothing is queued" visible. `pod-deletion-cost` uses each pod's *own* queued + in-flight work rather than in-flight alone, because a terminating pod has to drain both |
 | `requestRate`, `processingRate`, `processingLatency` | Same source | **Observability only** in v0.2 ([FR-39](requirements.md#workload-signal-requirements-v02)); recorded from Phase 1 so a latency- or arrival-rate-driven demand model can be derived from data instead of guessed |
 | `podCPUUsage`, `podMemoryUsage` | `PodMetrics` from `metrics.k8s.io/v1beta1` for the target's pods | Averaged over **Ready and warm** pods only; starting pods would drag the average down and suppress scale-up |
 | `readyReplicas`, `currentReplicas` | Target `Deployment` status/spec | `readyReplicas` is the denominator for utilization |
@@ -402,9 +402,9 @@ cluster-scoped resource discovery, and a namespaced `Role` for the target and co
 | `deployments` | apps | get, list, watch | Namespace | Read spec/status + pod template for the effective request; detect rollouts and external replica writes ([FR-31](requirements.md#review-driven-requirements-v011), [FR-32](requirements.md#review-driven-requirements-v011)) |
 | `deployments/scale` | apps | get, update, patch | Namespace | The one mutation that changes replica count ([FR-01](requirements.md#4-functional-requirements)) |
 | `replicasets` | apps | get, list, watch | Namespace | Identify pods of the target's **current** ReplicaSet, so a doomed pod of a superseded ReplicaSet cannot trigger remediation of a healthy one ([DR-09](design-review.md#dr-09-rbac-omits-replicaset-reads-that-the-watchdog-requires)) |
-| `pods` | core | patch | Namespace | `pod-deletion-cost` annotation ([FR-21](requirements.md#4-functional-requirements)) |
+| `pods` | core | patch | Namespace | `pod-deletion-cost` annotation ([FR-21](requirements.md#4-functional-requirements)); RBAC cannot narrow it to one field, so the client's transport refuses any other patch body |
 | `horizontalpodautoscalers` | autoscaling | get, list, watch | Namespace | Conflict detection ([FR-19](requirements.md#4-functional-requirements)) |
-| `events` | core / events.k8s.io | create, patch | Namespace | Decision audit trail ([FR-24](requirements.md#4-functional-requirements)) |
+| `events` | events.k8s.io | create | Namespace | Decision audit trail ([FR-24](requirements.md#4-functional-requirements)). Each announcement is a new object, so there is nothing to `patch`, and the newer API carries `regarding` and `reportingController` |
 | `leases` | coordination.k8s.io | get, create, update | Namespace | Leader election ([FR-26](requirements.md#4-functional-requirements)) |
 
 **Deliberately excluded:**
@@ -427,24 +427,30 @@ Pod hardening: non-root, read-only root filesystem, all capabilities dropped, `s
 RuntimeDefault`, no service account token beyond the controller's own.
 
 **As built in P3.** The table above is the design target for the finished controller. The shipped manifests
-grant a strict subset of it, because a permission is granted when the code that needs it exists and not
+grant all of it except `leases`, because a permission is granted when the code that needs it exists and not
 before:
 
 | Granted now | Still deferred |
 | --- | --- |
-| Everything read-only in the table | `pods` `patch` — arrives with `pod-deletion-cost` |
-| `deployments/scale` get, update, patch — namespaced | `events` create, patch — arrives with the event trail |
-| | `leases` — arrives with leader election in P4 |
+| Everything read-only in the table | `leases` — arrives with leader election in P4 |
+| `deployments/scale` get, update, patch — namespaced | |
+| `events.k8s.io` `events` create — namespaced | |
+| `pods` patch — namespaced | |
 
-The absence of the deferred three is visible in behaviour, not just in the manifest: there is no event trail,
-scale-down cannot influence *which* pod the ReplicaSet controller removes, and single-writer safety rests on
-`replicas: 1` plus `strategy: Recreate` rather than on a lease. `deploy/kubescalesense/role.yaml` records the
-same table next to the rules.
+Until the lease arrives, single-writer safety rests on `replicas: 1` plus `strategy: Recreate`.
+`deploy/kubescalesense/role.yaml` records the same table next to the rules.
 
-Two tests hold this shut rather than trusting review: one asserts that the manifests contain exactly one rule
-carrying a write verb, and one asserts that the only mutating client-go call in the repository is
-`UpdateScale` in `internal/kubernetes/scale.go`. Widening RBAC or adding a second write path therefore fails
-the build.
+Each write permission has its own client in `internal/kubernetes`, and each client's transport refuses
+everything but its one request shape: PUT/PATCH to the target's scale path; POST to the namespace's
+`events.k8s.io` collection, with no reads at all; and a JSON merge patch of one pod whose body sets
+`controller.kubernetes.io/pod-deletion-cost` to an integer and nothing else. Dry-run builds none of them.
+Only the first can change how many pods run.
+
+Two tests hold this shut rather than trusting review: one asserts that the manifests' write rules are exactly
+the three above with exactly those verbs, and one asserts that the repository's mutating client-go calls are
+exactly `UpdateScale` in `scale.go`, `Create` in `events.go`, and `Patch` in `deletioncost.go`, once each.
+Widening RBAC or adding a write path therefore fails the build until the enumeration in
+`internal/controller/nowrite_test.go` is changed on purpose.
 
 ---
 
@@ -503,6 +509,16 @@ On the target `Deployment`, so `kubectl describe deployment normalizer` explains
 
 Event emission for repeating HOLD states is rate-limited to once per backoff cycle to avoid event spam
 ([FR-24](requirements.md#4-functional-requirements)).
+
+As built: writes are announced once they have succeeded, and a failed or abandoned write is not announced.
+Holds the table does not name (`HoldCooldown`, `HoldStabilizationWindow`, `HoldBackoff`, `HoldPendingPods`,
+`HoldReplicasSettling`, `HoldAtMaxReplicas`, `HoldAtMinReplicas`) are announced under their reason code.
+`NoChangeWithinTolerance` and `ErrorAPIFailure` announce nothing. Every event's `action` is the decision's
+reason code, so an event can be matched to its log line, and an adopted external change is additionally
+announced once as `ExternalScaleDetected` with action `AdoptBaseline`. Each hold reason keeps its own cadence:
+the first occurrence is announced at once, and repeats follow `holdBackoff` (initial, then × factor, up to
+max). A reason that has been absent for longer than `holdBackoff.max` counts as a first occurrence again.
+Recording an event is best-effort and can never fail or delay a reconcile.
 
 ### 8.3 Structured logging
 

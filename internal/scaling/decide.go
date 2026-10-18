@@ -53,6 +53,13 @@ type Decision struct {
 	// blind scale-down (DR-04).
 	DemandComputed bool
 
+	// PendingTimedOut reports that replicas of the target have been stuck —
+	// unschedulable, or never materialised into pods — for longer than
+	// pendingPodTimeout. Set under every onPendingTimeout mode, including the
+	// ones that do not write, because freeze and none are remediations too and
+	// the controller has to count and announce them.
+	PendingTimedOut bool
+
 	RequeueAfter time.Duration
 }
 
@@ -97,6 +104,16 @@ func Decide(s Snapshot, c *config.Config, now time.Time) Decision {
 	// Deployment controller will actually incur (DR-08).
 	if s.RolloutInProgress {
 		return d.with(ReasonHoldRolloutInProgress)
+	}
+
+	// ── W: the pending-pod watchdog (FR-20, ADR-13). Before the freshness gate,
+	// because a stuck replica processes nothing whatever the demand is, so
+	// taking it back needs no demand data — and holding a Pending pod through
+	// a metrics outage would break "never Pending past the timeout" on exactly
+	// the day it is hardest to diagnose.
+	var reverted bool
+	if d, reverted = d.watchdog(s, c, now); reverted {
+		return d
 	}
 
 	// ── G2: never compute a decision from data known to be stale. This is the
@@ -167,9 +184,11 @@ func (d Decision) scaleUpPath(s Snapshot, c *config.Config, now time.Time) Decis
 	backoffActive := now.Before(s.HoldBackoff.NextEligible) &&
 		s.FitCapacity <= s.HoldBackoff.FitCapacityAtArm
 
-	// G5: our pods are already unschedulable. Stacking another request on top
-	// would compound an estimation error across reconciles.
-	if s.PendingOurPods > 0 {
+	// G5: our pods are already unschedulable, or replicas we asked for have not
+	// become pods at all. Stacking another request on top would compound an
+	// estimation error across reconciles. The unmaterialised half is the quota
+	// case, which has no Pending pod to see (FS-10).
+	if s.PendingOurPods > 0 || s.UnmaterialisedReplicas > 0 {
 		return d.with(ReasonHoldPendingPods)
 	}
 
@@ -280,6 +299,63 @@ func (d Decision) scaleDownPath(s Snapshot, c *config.Config, now time.Time) Dec
 	d.TargetReplicas = d.StepLimited
 	d.RequestedDelta = d.TargetReplicas - s.CurrentReplicas
 	return d.with(ReasonScaleDown)
+}
+
+// watchdog evaluates the stuck-replica remediation and reports whether it
+// settles the decision.
+//
+// Only `revert` writes. `freeze` and `none` mark the timeout and fall through
+// to the ordinary guards, where G5 already refuses to stack a scale-up on top
+// of a stuck one — so the two differ in what is counted and announced, not in
+// what the engine decides.
+//
+// The revert removes the stuck replicas and nothing else:
+//
+//	target = max(lastGoodReplicas, current − stuck), clamped to [min, max]
+//
+// The ReplicaSet controller deletes unscheduled pods before scheduled ones and
+// a quota-rejected replica has no pod to delete, so lowering the count by the
+// stuck number removes exactly the stuck replicas. When every pod of the last
+// scale-up is stuck that is lastGoodReplicas, as ADR-13 specifies. When some of
+// them did schedule, those are kept: they are serving traffic, and the stuck
+// ones are the only liability. lastGoodReplicas remains the floor, so a revert
+// can never undo more than our own last scale-up.
+//
+// Nothing to revert — an external actor added the replicas, or the floor
+// already equals the current count — is not a write. G5 still holds every
+// scale-up, which is the freeze behaviour, and is the safe fallback.
+func (d Decision) watchdog(s Snapshot, c *config.Config, now time.Time) (Decision, bool) {
+	timeout := c.Pending.PendingPodTimeout.Duration()
+	stuck := s.PendingOurPods + s.UnmaterialisedReplicas
+
+	timedOut := (s.PendingOurPods > 0 && s.OldestPendingAge > timeout) ||
+		(s.UnmaterialisedReplicas > 0 && s.UnmaterialisedAge > timeout)
+	if !timedOut {
+		return d, false
+	}
+	d.PendingTimedOut = true
+
+	if c.Pending.OnPendingTimeout != config.OnPendingRevert {
+		return d, false
+	}
+
+	target := maxInt32(s.LastGoodReplicas, s.CurrentReplicas-stuck)
+	target = clampInt32(target, c.Target.MinReplicas, c.Target.MaxReplicas)
+	if target >= s.CurrentReplicas {
+		return d, false
+	}
+
+	d.Direction = DirectionDown
+	d.TargetReplicas = target
+	d.RequestedDelta = target - s.CurrentReplicas
+
+	// Armed, not reset: a stuck pod is proof that the fit estimate was wrong
+	// at the level it currently reports, so the next scale-up must wait for
+	// capacity to rise above that level or for the backoff to expire, rather
+	// than reissue the request that just failed (ADR-13).
+	d.Backoff, d.BackoffInterval = armBackoff(s.HoldBackoff, s.FitCapacity, c.Scaling.HoldBackoff, now)
+	d.BackoffAction = BackoffArm
+	return d.with(ReasonRevertPendingPods), true
 }
 
 // with finalises the decision with its single reason code.

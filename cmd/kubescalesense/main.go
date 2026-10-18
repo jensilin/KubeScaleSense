@@ -260,16 +260,26 @@ func serve(ctx context.Context, log *slog.Logger, cfg *config.Config, opts optio
 	if err != nil {
 		return err
 	}
+	events, err := buildEventRecorder(cfg, opts, reader, log)
+	if err != nil {
+		return err
+	}
+	deletionCost, err := buildDeletionCostWriter(cfg, opts, log)
+	if err != nil {
+		return err
+	}
 
 	ctrl, err := controller.New(controller.Options{
-		Config:      cfg,
-		Reader:      reader,
-		Signal:      signalSource,
-		Utilization: kssmetrics.NewUtilizationCollector(kubernetesaccess.NewMetricsReader(clients.Metrics)),
-		Resources:   resourceOpts,
-		Metrics:     metrics,
-		Actuator:    actuator,
-		Log:         log,
+		Config:       cfg,
+		Reader:       reader,
+		Signal:       signalSource,
+		Utilization:  kssmetrics.NewUtilizationCollector(kubernetesaccess.NewMetricsReader(clients.Metrics)),
+		Resources:    resourceOpts,
+		Metrics:      metrics,
+		Actuator:     actuator,
+		Events:       events,
+		DeletionCost: deletionCost,
+		Log:          log,
 	})
 	if err != nil {
 		return err
@@ -367,6 +377,81 @@ func buildActuator(
 	)
 
 	return actuator, nil
+}
+
+// buildEventRecorder builds the events client, on the same rule as the
+// actuator: dry-run constructs no writable client at all, so a dry-run process
+// cannot create an event any more than it can scale.
+//
+// Its own client rather than a shared one, so each write capability keeps its
+// own transport guard and its own user agent in the audit log.
+func buildEventRecorder(
+	cfg *config.Config,
+	opts options,
+	reader kubernetesaccess.ClusterReader,
+	log *slog.Logger,
+) (controller.EventRecorder, error) {
+	if cfg.Controller.DryRun {
+		return nil, nil
+	}
+
+	namespace := cfg.Target.Namespace
+
+	eventsConfig, err := kubernetesaccess.NewEventsRESTConfig(opts.kubeconfigPath, namespace)
+	if err != nil {
+		return nil, fmt.Errorf("building the events client configuration: %w", err)
+	}
+	eventsClients, err := kubernetesaccess.NewClients(eventsConfig)
+	if err != nil {
+		return nil, fmt.Errorf("building the events client: %w", err)
+	}
+
+	log.Info("events client built",
+		slog.String("writable_path", kubernetesaccess.EventsPath(namespace)),
+		slog.String("detail", "the transport permits POST to this one path and refuses every other request, "+
+			"reads included"),
+	)
+
+	return kubernetesaccess.NewEventWriter(eventsClients.Core, reader, namespace, cfg.Target.Deployment), nil
+}
+
+// buildDeletionCostWriter builds the pod-annotation client for FR-21.
+//
+// Built only when it can be used: in live mode, and with the http signal
+// source, the one source that scrapes each pod and so knows which is least
+// busy. With any other source there is nothing to order pods by, and a client
+// that is never called is a capability with no purpose.
+func buildDeletionCostWriter(cfg *config.Config, opts options, log *slog.Logger) (controller.DeletionCostWriter, error) {
+	if cfg.Controller.DryRun {
+		return nil, nil
+	}
+	if cfg.Workload.Signal.Source != config.SignalSourceHTTP {
+		log.Info("pod-deletion-cost disabled",
+			slog.String("signal_source", cfg.Workload.Signal.Source),
+			slog.String("detail", "only the http source reports work per pod; scale-down uses the ReplicaSet "+
+				"controller's own ordering"),
+		)
+		return nil, nil
+	}
+
+	namespace := cfg.Target.Namespace
+
+	costConfig, err := kubernetesaccess.NewDeletionCostRESTConfig(opts.kubeconfigPath, namespace)
+	if err != nil {
+		return nil, fmt.Errorf("building the pod client configuration: %w", err)
+	}
+	costClients, err := kubernetesaccess.NewClients(costConfig)
+	if err != nil {
+		return nil, fmt.Errorf("building the pod client: %w", err)
+	}
+
+	log.Info("pod client built",
+		slog.String("writable_path", kubernetesaccess.PodsPath(namespace)+"/{pod}"),
+		slog.String("detail", "the transport permits a JSON merge patch that sets "+
+			kubernetesaccess.DeletionCostAnnotation+" and refuses every other request and every other body"),
+	)
+
+	return kubernetesaccess.NewDeletionCostWriter(costClients.Core, namespace), nil
 }
 
 // shutdownServer stops the HTTP listeners within the shutdown budget.

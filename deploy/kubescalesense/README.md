@@ -1,8 +1,8 @@
 # Controller manifests
 
-Phase 0 skeleton. Nothing here is applied by any `make` target or CI job — the
-manifests exist so that the RBAC surface, security context, and config mount can
-be reviewed before any code depends on them.
+The controller's identity, permissions, configuration, and pod. The demo
+environment applies them (`make demo-up`, with the demo ConfigMap from
+`deploy/demo/`); nothing in CI does.
 
 ## Files
 
@@ -10,9 +10,9 @@ be reviewed before any code depends on them.
 | --- | --- |
 | `namespace.yaml` | The `kubescalesense` namespace, separate from the workload's |
 | `serviceaccount.yaml` | The controller's identity; the only credential it holds |
-| `clusterrole.yaml` | Cluster-scoped rules — **empty in P0** |
+| `clusterrole.yaml` | Cluster-scoped reads: nodes, pods, and `metrics.k8s.io` |
 | `clusterrolebinding.yaml` | Binds the ClusterRole to the ServiceAccount |
-| `role.yaml` | Namespaced rules in `data-pipeline` — **empty in P0** |
+| `role.yaml` | Namespaced rules in `data-pipeline`: reads of the target, and the three writes |
 | `rolebinding.yaml` | Binds the Role to the ServiceAccount |
 | `configmap.yaml` | A copy of `config/kubescalesense.yaml` |
 | `deployment.yaml` | The controller pod |
@@ -21,27 +21,35 @@ There is no `Secret`, in this phase or any later one. The controller has no
 workload credentials to hold: the pressure signal is generated locally or
 scraped over in-cluster HTTP ([CR-5](../../docs/requirements.md#8-configuration-requirements)).
 
-## Why the roles are empty
+## How the roles grew
 
-`cmd/kubescalesense` makes no Kubernetes API calls in Phase 0. Least privilege
-([FR-25](../../docs/requirements.md#4-functional-requirements)) therefore means
-an empty rule set, so each rule is added in the phase that first needs it,
-alongside the code that uses it.
+Least privilege ([FR-25](../../docs/requirements.md#4-functional-requirements))
+means each rule is added in the phase that first needs it, alongside the code
+that uses it. P0 shipped empty roles; P1 added the reads; P3 added the writes.
 
 The canonical target state is the RBAC table in
 [architecture § 7](../../docs/architecture.md#7-kubernetes-permissions-and-rbac).
-Each deferred rule is listed in `clusterrole.yaml` and `role.yaml` with the
-phase that introduces it, so the gap between "what the design specifies" and
-"what is granted today" is visible in the file rather than tracked elsewhere.
+The one rule still deferred — `leases`, for leader election in P4 — is listed in
+`role.yaml` with the phase that introduces it, so the gap between "what the
+design specifies" and "what is granted today" is visible in the file.
 
-The phase split on `deployments` is worth noticing: the **read** arrives in P1 so
-the fit estimator can be validated against a live cluster in dry-run, while
-`deployments/scale` is withheld until P3. A P1 bug therefore cannot change a
-replica count even if it tries.
+The write rules are all namespaced and all in `role.yaml`:
+
+| Rule | What it can change |
+| --- | --- |
+| `apps` `deployments/scale` get, update, patch | `spec.replicas` of the target — the only write that changes how many pods run |
+| `events.k8s.io` `events` create | Adds an announcement about the target |
+| core `pods` patch | The `pod-deletion-cost` annotation; RBAC alone would allow more, so the controller's transport rejects any other patch body |
+
+`internal/controller/nowrite_test.go` fails the build if a write rule is added
+or widened, or a write call site appears, without being enumerated there.
+
+The phase split on `deployments` is worth noticing: the **read** arrived in P1
+so the fit estimator could be validated against a live cluster in dry-run,
+while `deployments/scale` was withheld until P3. A P1 bug could not change a
+replica count even if it tried.
 
 ## Applying them by hand
-
-Phase 0 is not expected to run in a cluster, but it will:
 
 ```sh
 kubectl apply -f namespace.yaml
@@ -49,5 +57,6 @@ kubectl create namespace data-pipeline   # the target namespace, if absent
 kubectl apply -f .
 ```
 
-The pod will start, log that the foundation is up, and sit idle. It does not
-scale anything, and `kubectl logs` says so explicitly on every start.
+With the shipped `dryRun: true` the controller observes and reports decisions,
+and builds no client that can write. Set `controller.dryRun: false` in the
+ConfigMap to let it act.

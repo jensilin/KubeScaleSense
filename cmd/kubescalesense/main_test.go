@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jensilin/KubeScaleSense/internal/config"
+	kubernetesaccess "github.com/jensilin/KubeScaleSense/internal/kubernetes"
 	"github.com/jensilin/KubeScaleSense/internal/observability"
 )
 
@@ -225,6 +226,34 @@ func TestBuildActuator_DryRunBuildsNoWritableClient(t *testing.T) {
 	cfg.Controller.DryRun = false
 	if _, err := buildActuator(cfg, opts, observability.NewMetrics(), log); err == nil {
 		t.Error("buildActuator in live mode accepted a kubeconfig that does not exist, so it cannot have " +
+			"tried to build a client")
+	}
+}
+
+// The same rule for the events client: dry-run announces nothing, because it
+// builds nothing that could.
+func TestBuildEventRecorder_DryRunBuildsNoWritableClient(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Default()
+	cfg.Target.Namespace = "data-pipeline"
+	cfg.Target.Deployment = "normalizer"
+
+	opts := options{kubeconfigPath: filepath.Join(t.TempDir(), "does-not-exist")}
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	reader := &kubernetesaccess.StaticReader{}
+
+	events, err := buildEventRecorder(cfg, opts, reader, log)
+	if err != nil {
+		t.Fatalf("buildEventRecorder in dry-run: %v", err)
+	}
+	if events != nil {
+		t.Errorf("dry-run built an events recorder (%T)", events)
+	}
+
+	cfg.Controller.DryRun = false
+	if _, err := buildEventRecorder(cfg, opts, reader, log); err == nil {
+		t.Error("buildEventRecorder in live mode accepted a kubeconfig that does not exist, so it cannot have " +
 			"tried to build a client")
 	}
 }

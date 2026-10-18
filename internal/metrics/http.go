@@ -168,16 +168,18 @@ func (s *HTTPSignal) Collect(ctx context.Context) (Sample, error) {
 		queued float64
 		flight float64
 		oldest time.Time
+		byPod  = make(map[string]int64, len(targets))
 	)
 
 	for _, target := range targets {
-		scraped, err := s.scrape(ctx, target)
+		scraped, err := s.scrape(ctx, target.url)
 		if err != nil {
-			return Unavailable(), fmt.Errorf("scraping %s: %w", target, err)
+			return Unavailable(), fmt.Errorf("scraping %s: %w", target.url, err)
 		}
 
 		queued += scraped.queued
 		flight += scraped.inFlight
+		byPod[target.address] += int64(scraped.queued + scraped.inFlight)
 		total.received += scraped.received
 		total.completed += scraped.completed
 		total.latencySum += scraped.latencySum
@@ -198,6 +200,7 @@ func (s *HTTPSignal) Collect(ctx context.Context) (Sample, error) {
 	sample := Sample{
 		PressureItems:    int64(queued + flight),
 		InFlightRequests: int64(flight),
+		WorkByPodIP:      byPod,
 		SampledAt:        oldest,
 		Available:        true,
 	}
@@ -214,16 +217,23 @@ func (s *HTTPSignal) Collect(ctx context.Context) (Sample, error) {
 	return sample, nil
 }
 
+// scrapeTarget is one pod's metrics URL and the address it resolved to, which
+// for a headless Service is the pod IP.
+type scrapeTarget struct {
+	address string
+	url     string
+}
+
 // targets resolves the endpoint to one URL per pod.
 //
 // A literal IP in the endpoint is used as-is; a name is resolved, and every
 // address it yields is a target. The addresses are not sorted, because the sum
 // does not depend on their order and imposing one would imply a stability the
 // DNS response does not have.
-func (s *HTTPSignal) targets(ctx context.Context) ([]string, error) {
+func (s *HTTPSignal) targets(ctx context.Context) ([]scrapeTarget, error) {
 	host := s.endpoint.Hostname()
 	if net.ParseIP(host) != nil {
-		return []string{s.endpoint.String()}, nil
+		return []scrapeTarget{{address: host, url: s.endpoint.String()}}, nil
 	}
 
 	addresses, err := s.resolver.LookupHost(ctx, host)
@@ -239,7 +249,7 @@ func (s *HTTPSignal) targets(ctx context.Context) ([]string, error) {
 	}
 
 	port := s.endpoint.Port()
-	targets := make([]string, 0, len(addresses))
+	targets := make([]scrapeTarget, 0, len(addresses))
 	for _, address := range addresses {
 		target := *s.endpoint
 		if port == "" {
@@ -247,7 +257,7 @@ func (s *HTTPSignal) targets(ctx context.Context) ([]string, error) {
 		} else {
 			target.Host = net.JoinHostPort(address, port)
 		}
-		targets = append(targets, target.String())
+		targets = append(targets, scrapeTarget{address: address, url: target.String()})
 	}
 	return targets, nil
 }

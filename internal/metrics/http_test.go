@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -106,6 +107,13 @@ func TestHTTPSignal_SumsOverEveryPod(t *testing.T) {
 	}
 	if sample.InFlightRequests != 10 {
 		t.Errorf("InFlightRequests = %d, want 10", sample.InFlightRequests)
+	}
+
+	// Each pod's own share, keyed by the address it was scraped at, so a
+	// scale-down can be pointed at the least busy (FR-21).
+	want := map[string]int64{"127.0.0.1": 7, "127.0.0.2": 4, "127.0.0.3": 11}
+	if !maps.Equal(sample.WorkByPodIP, want) {
+		t.Errorf("WorkByPodIP = %v, want %v", sample.WorkByPodIP, want)
 	}
 }
 

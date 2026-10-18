@@ -220,7 +220,7 @@ func NewMetrics() *Metrics {
 
 	m.remediationsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "kss_pending_pod_remediations_total",
-		Help: "Watchdog interventions by action. Zero throughout Phase 1: the watchdog actuates from P3.",
+		Help: "Watchdog interventions by action actually taken, once per stuck episode.",
 	}, []string{"action"})
 
 	m.externalScaleChanges = prometheus.NewCounter(prometheus.CounterOpts{
@@ -292,9 +292,9 @@ func (m *Metrics) initialiseLabelValues() {
 			m.scaleActionsTotal.WithLabelValues(direction, outcome).Add(0)
 		}
 	}
-	// The watchdog does not actuate until P3, so this counter is documented as
-	// zero for the whole of Phase 1 — which only means anything if the series
-	// is actually present and reads zero.
+	// E2E-08 asserts this counter reaches exactly one, and every other scenario
+	// that it stays at zero — which only means anything if the series is
+	// present before the first intervention.
 	for _, action := range []string{config.OnPendingRevert, config.OnPendingFreeze, config.OnPendingNone} {
 		m.remediationsTotal.WithLabelValues(action).Add(0)
 	}
@@ -447,6 +447,12 @@ func (m *Metrics) recordFeasibility(f resources.Feasibility) {
 	for i := range f.Nodes {
 		m.nodeFreeCPU.WithLabelValues(f.Nodes[i].Name).Set(float64(f.Nodes[i].FreeCPUMilli))
 	}
+}
+
+// RecordPendingRemediation counts one watchdog intervention, labelled with the
+// action actually taken.
+func (m *Metrics) RecordPendingRemediation(action string) {
+	m.remediationsTotal.WithLabelValues(action).Inc()
 }
 
 // RecordExternalScaleChange counts a replica change this controller did not

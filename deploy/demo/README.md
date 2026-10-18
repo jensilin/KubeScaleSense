@@ -253,8 +253,9 @@ tests/e2e/assert-nifi-flow.sh 12
 ```
 
 > **Caveat, stated plainly.** This flow definition has **not** been imported
-> into a running NiFi in this repository's development environment, because
-> `kind` is not installed there and NiFi was never started. It is written
+> into a running NiFi in this repository's development environment: NiFi has
+> never been started there, and the kind runs so far drove the Normalizer
+> directly. It is written
 > against the NiFi 2.6.7 bundle coordinates and its invariants are
 > machine-checked as a file, but "NiFi accepts this JSON" is unverified. If the
 > import fails, build the flow by hand from the table below — the properties,

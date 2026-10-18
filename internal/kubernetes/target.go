@@ -52,6 +52,18 @@ type TargetState struct {
 	// rather than encourage them (DR-06).
 	UnhealthyPods   int32
 	UnhealthyPodAge time.Duration
+
+	// ActivePods counts the current ReplicaSet's pods that the ReplicaSet
+	// controller itself counts: not terminating, not Succeeded, not Failed.
+	// Pending pods are included — they exist, they just have nowhere to run.
+	ActivePods int32
+
+	// UnmaterialisedReplicas is how far spec.replicas is ahead of ActivePods
+	// outside a rollout: replicas that were asked for and never became pods.
+	// A namespace ResourceQuota rejecting pod creation produces exactly this
+	// and nothing else — no Pending pod, no event we may read — so it is the
+	// watchdog's only view of that failure (FS-10).
+	UnmaterialisedReplicas int32
 }
 
 // ObserveTarget assembles the target's state from the caches.
@@ -92,9 +104,48 @@ func ObserveTarget(reader ClusterReader, namespace, name string, now time.Time) 
 		}
 		state.Pods = podsOwnedBy(pods, state.CurrentReplicaSet)
 		state.summarisePodHealth(now)
+
+		// updatedReplicas counts pods that exist, so a scale-up whose pods a
+		// quota refuses to create leaves it short of spec.replicas for as long
+		// as the quota holds. Read as a rollout, that would hold G1' forever
+		// and hide the stuck replicas from the watchdog behind it. A gap the
+		// current ReplicaSet alone accounts for is a scale waiting to
+		// materialise; a rollout always has an older ReplicaSet still holding
+		// replicas, or a spec the controller has not yet observed.
+		if state.RolloutInProgress && scaleAheadOfPods(deployment, state.CurrentReplicaSet, replicaSets, state.CurrentReplicas) {
+			state.RolloutInProgress = false
+		}
+		if !state.RolloutInProgress && state.CurrentReplicas > state.ActivePods {
+			state.UnmaterialisedReplicas = state.CurrentReplicas - state.ActivePods
+		}
 	}
 
 	return state, nil
+}
+
+// scaleAheadOfPods reports that the Deployment's only shortfall is replicas
+// its current ReplicaSet has not yet turned into pods.
+func scaleAheadOfPods(
+	deployment *appsv1.Deployment,
+	current *appsv1.ReplicaSet,
+	sets []*appsv1.ReplicaSet,
+	specReplicas int32,
+) bool {
+	if deployment.Generation != deployment.Status.ObservedGeneration {
+		return false
+	}
+	if deployment.Status.UpdatedReplicas >= specReplicas {
+		return false
+	}
+	for _, rs := range sets {
+		if rs.UID == current.UID || !isOwnedBy(rs.OwnerReferences, deployment.UID) {
+			continue
+		}
+		if rs.Status.Replicas > 0 || (rs.Spec.Replicas != nil && *rs.Spec.Replicas > 0) {
+			return false
+		}
+	}
+	return true
 }
 
 // summarisePodHealth classifies the target's pods into pending and unhealthy.
@@ -105,6 +156,9 @@ func (s *TargetState) summarisePodHealth(now time.Time) {
 			// finished. Counting it would make every scale-down look like a
 			// health problem.
 			continue
+		}
+		if pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed {
+			s.ActivePods++
 		}
 
 		scheduled, scheduledAt := scheduledCondition(pod)

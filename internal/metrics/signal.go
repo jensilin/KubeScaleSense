@@ -27,6 +27,12 @@ type Sample struct {
 	// idle.
 	InFlightRequests int64
 
+	// WorkByPodIP is each pod's own queued plus in-flight work, keyed by the
+	// pod IP it was scraped at. Only a source that scrapes pods individually
+	// can fill it; the others leave it nil. It never feeds the decision — it
+	// orders which pods a scale-down removes (FR-21).
+	WorkByPodIP map[string]int64
+
 	RequestRateMilliPerSec    int64
 	ProcessingRateMilliPerSec int64
 	ProcessingLatencyMillis   int64

@@ -1354,6 +1354,9 @@ func TestReasons_AreAllReachable(t *testing.T) {
 			s.DesiredHistory = quietHistory(now, 1)
 			return Decide(s, cfg, now)
 		},
+		ReasonRevertPendingPods: func() Decision {
+			return Decide(stuckAfterScaleUp(2, 6, 4), cfg, now)
+		},
 	}
 
 	for _, reason := range Reasons {
@@ -1375,7 +1378,9 @@ func TestReasons_AreAllReachable(t *testing.T) {
 func TestReason_ActionAndIsHold(t *testing.T) {
 	t.Parallel()
 
-	writes := map[Reason]bool{ReasonScaleUp: true, ReasonScaleUpPartial: true, ReasonScaleDown: true}
+	writes := map[Reason]bool{
+		ReasonScaleUp: true, ReasonScaleUpPartial: true, ReasonScaleDown: true, ReasonRevertPendingPods: true,
+	}
 
 	for _, r := range Reasons {
 		wantAction := ActionNone
@@ -1442,16 +1447,47 @@ func TestDecide_Properties(t *testing.T) {
 			return d.TargetReplicas-f.CurrentReplicas <= cfg.Scaling.MaxScaleUpStep
 		},
 
-		"a scale-down never exceeds maxScaleDownStep": func(f fuzzSnapshot) bool {
+		// Demand-driven only. A watchdog revert takes back every stuck replica
+		// at once, because a pod that will never schedule is not work in
+		// progress and retreating from it gradually would only prolong the
+		// Pending state the watchdog exists to bound.
+		"a demand-driven scale-down never exceeds maxScaleDownStep": func(f fuzzSnapshot) bool {
 			d := Decide(f.Snapshot, cfg, now)
+			if d.Reason == ReasonRevertPendingPods {
+				return true
+			}
 			return f.CurrentReplicas-d.TargetReplicas <= cfg.Scaling.MaxScaleDownStep
+		},
+
+		"a revert removes only stuck replicas and never goes below lastGoodReplicas": func(f fuzzSnapshot) bool {
+			d := Decide(f.Snapshot, cfg, now)
+			if d.Reason != ReasonRevertPendingPods {
+				return true
+			}
+			removed := f.CurrentReplicas - d.TargetReplicas
+			stuck := f.PendingOurPods + f.UnmaterialisedReplicas
+			return removed > 0 && removed <= stuck &&
+				(d.TargetReplicas >= f.LastGoodReplicas || d.TargetReplicas == cfg.Target.MinReplicas)
+		},
+
+		"a revert happens only past pendingPodTimeout, and always arms the backoff": func(f fuzzSnapshot) bool {
+			d := Decide(f.Snapshot, cfg, now)
+			if d.Reason != ReasonRevertPendingPods {
+				return true
+			}
+			timeout := cfg.Pending.PendingPodTimeout.Duration()
+			pastTimeout := (f.PendingOurPods > 0 && f.OldestPendingAge > timeout) ||
+				(f.UnmaterialisedReplicas > 0 && f.UnmaterialisedAge > timeout)
+			return pastTimeout && d.PendingTimedOut && d.BackoffAction == BackoffArm
 		},
 
 		"an unavailable backlog freezes the replica count": func(f fuzzSnapshot) bool {
 			// The guards above G2 are cleared, because otherwise one of them
 			// legitimately claims the reason and the property would be
-			// asserting guard precedence instead of staleness.
+			// asserting guard precedence instead of staleness. That includes
+			// the watchdog, which acts without demand data by design.
 			f.Valid, f.HPAPresent, f.RolloutInProgress, f.ExternalDrifts = true, false, false, 0
+			f.PendingOurPods, f.UnmaterialisedReplicas = 0, 0
 			f.Backlog.Available = false
 
 			d := Decide(f.Snapshot, cfg, now)
@@ -1552,10 +1588,20 @@ func (fuzzSnapshot) Generate(rnd *rand.Rand, _ int) reflect.Value {
 		LastScaleDown: now.Add(-time.Duration(rnd.Intn(600)) * time.Second),
 
 		PendingOurPods:   int32(rnd.Intn(3)),
+		OldestPendingAge: time.Duration(rnd.Intn(300)) * time.Second,
 		UnhealthyOurPods: int32(rnd.Intn(3)),
 		UnhealthyPodAge:  time.Duration(rnd.Intn(600)) * time.Second,
 
+		LastGoodReplicas: cfg.Target.MinReplicas + int32(rnd.Intn(int(current-cfg.Target.MinReplicas+1))),
+
 		HoldBackoff: ClearBackoff(),
+	}
+
+	// Quota-blocked replicas are rarer than Pending pods, and are generated
+	// that way so most snapshots still reach the demand-driven guards.
+	if rnd.Intn(4) == 0 {
+		s.UnmaterialisedReplicas = int32(rnd.Intn(3))
+		s.UnmaterialisedAge = time.Duration(rnd.Intn(300)) * time.Second
 	}
 
 	if rnd.Intn(3) == 0 {

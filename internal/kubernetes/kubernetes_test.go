@@ -324,6 +324,102 @@ func TestObserveTarget(t *testing.T) {
 		}
 	})
 
+	// FS-10: a quota refuses to create the pods, so updatedReplicas — which
+	// counts pods that exist — stays short of spec.replicas indefinitely. That
+	// is a stuck scale, not a rollout, and must reach the watchdog as one.
+	t.Run("a scale whose pods were never created is not a rollout", func(t *testing.T) {
+		t.Parallel()
+
+		deployment := newDeployment(6, withStatus(2, 2, 2, 2), atGeneration(3, 3))
+		rs := newReplicaSet("normalizer-1", deployment, 1)
+
+		reader := &StaticReader{
+			Synced:         true,
+			DeploymentList: []*appsv1.Deployment{deployment},
+			ReplicaSetList: []*appsv1.ReplicaSet{rs},
+			PodList:        []*corev1.Pod{ownedPod("p1", rs, running()), ownedPod("p2", rs, running())},
+		}
+
+		state, err := ObserveTarget(reader, "data-pipeline", "normalizer", now)
+		if err != nil {
+			t.Fatalf("ObserveTarget: %v", err)
+		}
+		if state.RolloutInProgress {
+			t.Error("RolloutInProgress is true; G1' would hold forever and hide the stuck replicas from the watchdog")
+		}
+		if state.UnmaterialisedReplicas != 4 {
+			t.Errorf("UnmaterialisedReplicas = %d, want 4", state.UnmaterialisedReplicas)
+		}
+	})
+
+	// The same shortfall with an older ReplicaSet still holding pods is a
+	// rollout, and the gap is the Deployment controller's to close.
+	t.Run("an older ReplicaSet with replicas keeps it a rollout", func(t *testing.T) {
+		t.Parallel()
+
+		deployment := newDeployment(4, withStatus(4, 4, 4, 2), atGeneration(3, 3))
+		old := newReplicaSet("normalizer-1", deployment, 1)
+		old.Status.Replicas = 2
+		current := newReplicaSet("normalizer-2", deployment, 2)
+
+		reader := &StaticReader{
+			Synced:         true,
+			DeploymentList: []*appsv1.Deployment{deployment},
+			ReplicaSetList: []*appsv1.ReplicaSet{old, current},
+			PodList: []*corev1.Pod{
+				ownedPod("old-1", old, running()), ownedPod("old-2", old, running()),
+				ownedPod("new-1", current, running()), ownedPod("new-2", current, running()),
+			},
+		}
+
+		state, err := ObserveTarget(reader, "data-pipeline", "normalizer", now)
+		if err != nil {
+			t.Fatalf("ObserveTarget: %v", err)
+		}
+		if !state.RolloutInProgress {
+			t.Error("RolloutInProgress is false mid-rollout")
+		}
+		if state.UnmaterialisedReplicas != 0 {
+			t.Errorf("UnmaterialisedReplicas = %d mid-rollout, want 0", state.UnmaterialisedReplicas)
+		}
+	})
+
+	// Only pods the ReplicaSet controller counts are materialised. A
+	// terminating or failed pod is not capacity, and the ReplicaSet is already
+	// replacing it.
+	t.Run("terminating and failed pods are not materialised replicas", func(t *testing.T) {
+		t.Parallel()
+
+		deployment := newDeployment(3, withStatus(3, 2, 2, 3), atGeneration(1, 1))
+		rs := newReplicaSet("normalizer-1", deployment, 1)
+		failed := ownedPod("evicted", rs, running())
+		failed.Status.Phase = corev1.PodFailed
+
+		reader := &StaticReader{
+			Synced:         true,
+			DeploymentList: []*appsv1.Deployment{deployment},
+			ReplicaSetList: []*appsv1.ReplicaSet{rs},
+			PodList: []*corev1.Pod{
+				ownedPod("p1", rs, running()),
+				ownedPod("p2", rs, pending(now.Add(-time.Minute))),
+				ownedPod("going-away", rs, running(), deleting()),
+				failed,
+			},
+		}
+
+		state, err := ObserveTarget(reader, "data-pipeline", "normalizer", now)
+		if err != nil {
+			t.Fatalf("ObserveTarget: %v", err)
+		}
+		if state.ActivePods != 2 {
+			t.Errorf("ActivePods = %d, want 2 (the Pending pod exists; the terminating and failed ones do not count)",
+				state.ActivePods)
+		}
+		if state.UnmaterialisedReplicas != 1 {
+			t.Errorf("UnmaterialisedReplicas = %d, want 1", state.UnmaterialisedReplicas)
+		}
+	})
+
 	// DR-09: during a rollout, a doomed pod of the superseded ReplicaSet must
 	// not be blamed on the healthy new one.
 	t.Run("only the current ReplicaSet's pods are counted", func(t *testing.T) {

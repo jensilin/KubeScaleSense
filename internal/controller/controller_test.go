@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -708,12 +709,16 @@ func TestRun_StopsPromptlyOnAnAlreadyCancelledContext(t *testing.T) {
 type fixture struct {
 	deployment *appsv1.Deployment
 	replicaSet *appsv1.ReplicaSet
-	nodes      []*corev1.Node
-	pods       []*corev1.Pod
-	hpas       []*autoscalingv2.HorizontalPodAutoscaler
+	// olderReplicaSets are the previous revisions a rollout is moving away from.
+	olderReplicaSets []*appsv1.ReplicaSet
+	nodes            []*corev1.Node
+	pods             []*corev1.Pod
+	hpas             []*autoscalingv2.HorizontalPodAutoscaler
 
 	pressure          []int64
 	signalUnavailable bool
+	// workByPodIP is what the signal reports per pod, as the http source does.
+	workByPodIP map[string]int64
 
 	reader *kubernetesaccess.StaticReader
 	clock  *fakeClock
@@ -793,7 +798,7 @@ func newTestControllerWith(t *testing.T, f *fixture, actuator Actuator, opts ...
 	}
 	if f.deployment != nil {
 		reader.DeploymentList = []*appsv1.Deployment{f.deployment}
-		reader.ReplicaSetList = []*appsv1.ReplicaSet{f.replicaSet}
+		reader.ReplicaSetList = append([]*appsv1.ReplicaSet{f.replicaSet}, f.olderReplicaSets...)
 	}
 	f.reader = reader
 
@@ -803,9 +808,11 @@ func newTestControllerWith(t *testing.T, f *fixture, actuator Actuator, opts ...
 	}
 
 	options := Options{
-		Config:      testConfig(),
-		Reader:      reader,
-		Signal:      &scriptedSignal{values: f.pressure, unavailable: f.signalUnavailable, clock: clock},
+		Config: testConfig(),
+		Reader: reader,
+		Signal: &scriptedSignal{
+			values: f.pressure, unavailable: f.signalUnavailable, clock: clock, workByPodIP: f.workByPodIP,
+		},
 		Utilization: kssmetrics.NewUtilizationCollector(&emptyMetricsLister{}),
 		Resources:   resourceOpts,
 		Metrics:     observability.NewMetrics(),
@@ -890,6 +897,22 @@ func replicaSet(owner *appsv1.Deployment) *appsv1.ReplicaSet {
 	}
 }
 
+// previousReplicaSet is the revision before replicaSet's, still holding
+// replicas — the shape of a rollout part-way through.
+func previousReplicaSet(owner *appsv1.Deployment, replicas int32) *appsv1.ReplicaSet {
+	return &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "normalizer-0",
+			Namespace:       owner.Namespace,
+			UID:             "previous-replicaset-uid",
+			Annotations:     map[string]string{"deployment.kubernetes.io/revision": "0"},
+			OwnerReferences: []metav1.OwnerReference{{UID: owner.UID, Kind: "Deployment", Name: owner.Name}},
+		},
+		Spec:   appsv1.ReplicaSetSpec{Replicas: &replicas},
+		Status: appsv1.ReplicaSetStatus{Replicas: replicas},
+	}
+}
+
 func replicaPods(count int) []*corev1.Pod {
 	pods := make([]*corev1.Pod, 0, count)
 	for i := range count {
@@ -911,6 +934,7 @@ func replicaPods(count int) []*corev1.Pod {
 			},
 			Status: corev1.PodStatus{
 				Phase: corev1.PodRunning,
+				PodIP: podIP(i),
 				Conditions: []corev1.PodCondition{
 					{Type: corev1.PodScheduled, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(start.Add(-time.Hour))},
 					{Type: corev1.PodReady, Status: corev1.ConditionTrue, LastTransitionTime: metav1.NewTime(start.Add(-time.Hour))},
@@ -919,6 +943,11 @@ func replicaPods(count int) []*corev1.Pod {
 		})
 	}
 	return pods
+}
+
+// podIP is the address replicaPods gives its i-th pod.
+func podIP(i int) string {
+	return "10.244.0." + strconv.Itoa(i+1)
 }
 
 func node(name string, cpuMilli, memoryMiB, pods int64) *corev1.Node {
@@ -975,6 +1004,7 @@ type scriptedSignal struct {
 	values      []int64
 	unavailable bool
 	clock       func() time.Time
+	workByPodIP map[string]int64
 
 	mu     sync.Mutex
 	cursor int
@@ -1002,7 +1032,7 @@ func (s *scriptedSignal) Collect(ctx context.Context) (kssmetrics.Sample, error)
 	if s.clock != nil {
 		at = s.clock()
 	}
-	return kssmetrics.Sample{PressureItems: value, SampledAt: at, Available: true}, nil
+	return kssmetrics.Sample{PressureItems: value, SampledAt: at, Available: true, WorkByPodIP: s.workByPodIP}, nil
 }
 
 func (s *scriptedSignal) Close() error { return nil }
