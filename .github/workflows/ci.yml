@@ -53,10 +53,15 @@ jobs:
       # restricted to golangci-lint v1, so `latest` there resolves to v1.64.8,
       # which cannot parse the schema v2 `.golangci.yml`. v9 is the v2 line.
       # Pinned rather than `latest` so a new release cannot break CI on its own.
+      #
+      # The pin is also coupled to GO_VERSION, which resolves to the newest
+      # patch: golangci-lint must be able to read the export data that release
+      # writes. v2.13.2 cannot read go1.27.2's ("export data version 5 is
+      # greater than maximum supported version 4"), whatever Go built it.
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.13.2
+          version: v2.15.0
 
       # The design set is heavily cross-referenced, so broken anchors are a
       # build failure (test-plan section 10).
