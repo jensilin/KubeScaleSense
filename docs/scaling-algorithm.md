@@ -342,7 +342,7 @@ This is the gate that distinguishes KubeScaleSense from a standard HPA
 Δ_req = target − R_cur                       // already step-limited
 
 if F >= Δ_req:
-    write(R_cur + Δ_req);  reason = ScaleUp;  resetBackoff()      // complete scale-up only
+    write(R_cur + Δ_req);  reason = ScaleUp;  carryBackoff()      // cleared once its pods are placed
 
 else if F > 0 and allowPartialScaleUp:
     write(R_cur + F);      reason = ScaleUpPartial
@@ -367,6 +367,13 @@ Properties this gives us:
   recovery, so it arms or advances the backoff instead. Treating it as a success would clear the backoff on the
   same reconcile that armed it, restoring the retry storm backoff exists to prevent
   ([DR-02](design-review.md#dr-02-partial-scale-up-both-arms-and-resets-the-backoff)).
+- **And a complete scale-up resets it only once its pods are placed.** Writing the replica count proves the
+  *estimate* said yes, not that the scheduler agrees. Until every new replica exists and is scheduled, the
+  attempt count is carried without holding anything (`BackoffCarry`); placement then clears it. Without this,
+  a fit estimate the [watchdog](#5-step-3--stability-gates) keeps disproving — an unmodelled predicate such as
+  pod anti-affinity — is retried at the initial interval forever, because each scale-up cleared the count the
+  previous revert had armed. The live IT-07 run on kind showed exactly that, every `pendingPodTimeout` + 30 s
+  ([P3 as-built](implementation-plan.md#p3-as-built)).
 
 After a write the controller sets `LastScaleUp = now` and records `lastGoodReplicas = R_cur` (the *pre*-scale
 value), which is the revert target if the new pods turn out to be unschedulable
@@ -480,14 +487,22 @@ stateDiagram-v2
     [*] --> Clear
     Clear --> Armed: infeasible scale-up (Hold or Partial)
     Armed --> Armed: still infeasible, interval doubles (30s→60s→…→15m cap)
-    Armed --> Clear: F > fitCapacityAtArm
-    Armed --> Clear: complete scale-up succeeded
     Armed --> Clear: desired fell to or below current
+    Armed --> Carried: complete scale-up (F > fitCapacityAtArm, or interval expired)
+    Carried --> Clear: every new replica created and scheduled
+    Carried --> Clear: desired fell to or below current
+    Carried --> Armed: watchdog revert, attempts += 1
     note right of Armed
         Decisions report HoldBackoff.
         F is still computed every
         reconcile, so a capacity
         increase is seen immediately.
+    end note
+    note right of Carried
+        Holds nothing. Keeps the
+        attempt count until the
+        scheduler confirms the
+        estimate.
     end note
 ```
 
@@ -500,6 +515,14 @@ armBackoff(F):
 
 resetBackoff():
     attempts = 0; nextEligible = zero; fitCapacityAtArm = −1
+
+carryBackoff():                      // on a complete scale-up
+    if attempts == 0: resetBackoff(); return
+    nextEligible = zero; fitCapacityAtArm = −1; awaitingPlacement = true   // attempts kept
+
+// every reconcile, after the watchdog and before the freshness gate
+if awaitingPlacement and pendingOurPods == 0 and unmaterialisedReplicas == 0:
+    resetBackoff()
 ```
 
 `fitCapacityAtArm` is what makes the reset condition expressible: "capacity increased" is meaningless without
@@ -508,11 +531,13 @@ pure function of the snapshot.
 
 ### 9.2 Reset is level-triggered on capacity, not timer-driven
 
-The reset conditions matter more than the growth curve. `Armed → Clear` on **fit capacity increased** means
-that when an operator adds a node or a neighbouring workload releases resources, the informer sees it within
-milliseconds and the next reconcile (≤ 15 s) acts — the controller does not sit out the remainder of a
+The reset conditions matter more than the growth curve. The hold ends on **fit capacity increased**, which
+means that when an operator adds a node or a neighbouring workload releases resources, the informer sees it
+within milliseconds and the next reconcile (≤ 15 s) acts — the controller does not sit out the remainder of a
 15-minute backoff ([ADR-11](architecture.md#adr-11-how-do-we-avoid-repeatedly-attempting-an-impossible-scale)).
-The backoff exists to suppress *futile retries*, not to delay *recovery*.
+The backoff exists to suppress *futile retries*, not to delay *recovery*. The attempt count itself survives
+that scale-up until its pods are placed, so that a capacity reading the scheduler then contradicts is not
+forgotten (§ 6).
 
 This is only true because `F` is recomputed on every scale-up-direction reconcile, **including while backoff is
 armed** ([§5](#5-step-3--stability-gates)). Evaluating feasibility after the backoff gate — the obvious
@@ -554,6 +579,11 @@ func Decide(s Snapshot, c Config, now time.Time) Decision {
         if target < s.CurrentReplicas { return scale(target, RevertPendingPods, armBackoff) }
     }
 
+    // A complete scale-up carried the attempt count; its pods being placed is what clears it
+    if s.HoldBackoff.AwaitingPlacement && s.PendingOurPods == 0 && s.UnmaterialisedReplicas == 0 {
+        resetBackoff()
+    }
+
     // G2: freshness
     if !s.Backlog.Fresh(c.MetricsStaleAfter, now) { return hold(HoldStaleMetrics) }
 
@@ -590,7 +620,7 @@ func Decide(s Snapshot, c Config, now time.Time) Decision {
 
         switch {
         case s.FitCapacity >= delta:
-            return scale(target, ScaleUp, resetBackoff)              // complete: reset
+            return scale(target, ScaleUp, carryBackoff)              // complete: reset once placed
         case s.FitCapacity > 0 && c.AllowPartialScaleUp:
             return scale(s.CurrentReplicas+s.FitCapacity, ScaleUpPartial, armBackoff)
         default:

@@ -61,10 +61,17 @@ func (s Signal[T]) Age(now time.Time) time.Duration {
 // all: "capacity increased" is meaningless without recording the level it
 // increased from. Keeping it in the snapshot is what keeps the reset a pure
 // function rather than a side effect (I-10, FR-33).
+//
+// AwaitingPlacement marks attempts carried through a complete scale-up. The
+// write proves nothing about whether its pods can be placed, so the count
+// survives it, without holding anything, until every replica exists and is
+// scheduled. A watchdog revert in between then advances the count instead of
+// restarting it at the initial interval.
 type BackoffState struct {
-	Attempts         int
-	NextEligible     time.Time
-	FitCapacityAtArm int32
+	Attempts          int
+	NextEligible      time.Time
+	FitCapacityAtArm  int32
+	AwaitingPlacement bool
 }
 
 // ClearBackoff is the zero state. FitCapacityAtArm is -1 rather than 0 so that

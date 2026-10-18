@@ -374,7 +374,36 @@ E2E runs are not, and the split is worth stating precisely rather than reporting
 | `pod-deletion-cost` refresh before scale-down | **Done** — each Ready pod's cost is its own queued + in-flight work, from the `http` source; all-or-none; best-effort. Needs `pods` `patch`, now granted and narrowed by a body-validating transport (`internal/kubernetes/deletioncost.go`) |
 | Kubernetes events with rate limiting | **Done** — `events.k8s.io` `create` only, through a POST-only transport (`internal/kubernetes/events.go`); repeating holds follow the hold-backoff cadence per reason (`internal/controller/events.go`) |
 | `make demo-scenario-1..5` | **Not done** — `demo-spike`, `demo-actuate` and `measure-items-per-replica` cover the scale-up, scale-down and measurement narratives; the five scripted scenarios and the HPA side-by-side are not written |
-| Exit-criteria runs (`IT-04`, `IT-07`, `IT-08` against kind; `E2E-*`; `DI-*`) | **Not done** — covered by unit and controller-level tests with fake clients, not yet by live runs |
+| Exit-criteria runs (`IT-04`, `IT-07`, `IT-08` against kind; `E2E-*`; `DI-*`) | **Partly done** — `IT-04`, `IT-07` (`revert` mode) and `IT-08` passed live on the kind cluster ([below](#p3-live-run)); `freeze`/`none` modes, `E2E-*` and `DI-*` are covered by unit and controller-level tests only |
+
+<a id="p3-live-run"></a>
+
+**Live run on kind (2026-10-18), controller in `dryRun: false`:**
+
+- **`IT-04` events.** The API server accepted every `events.k8s.io/v1` object the controller wrote: `ScaledUp`,
+  `ScaledDown`, `HoldCooldown`, `HoldStabilizationWindow`, `HoldPendingPods`, `HoldAtMaxReplicas`,
+  `MetricsUnavailable`, `PodPendingTimeout`, and `ExternalScaleDetected` with action `AdoptBaseline`. Repeated
+  holds were rate-limited on the backoff cadence (+30 s, then +60 s). `kubectl auth can-i` confirmed the
+  ServiceAccount can create events and patch pods in `data-pipeline` only, and still cannot delete, create or
+  update pods or update the Deployment.
+- **`IT-07` forced `Unschedulable`.** A required pod anti-affinity (one Normalizer per node) is a predicate the
+  estimator does not model ([resource-calculation § 6](resource-calculation.md#6-predicates-modelled-and-predicates-ignored)),
+  so the controller scaled 1 → 5 into three workers. `HoldPendingPods` fired on the next reconcile; after 2m1s
+  `RevertPendingPods` took 5 → 3, removing only the two stuck replicas, through the scale subresource;
+  `kss_pending_pod_remediations_total{action="revert"}` counted it once.
+- **`IT-08` quota.** With a `ResourceQuota` one pod above the namespace's count, a 3 → 7 scale-up created one
+  pod and left three replicas unmaterialised with no Pending pod; `HoldPendingPods` named them, and after 2m0s
+  the revert took 7 → 4.
+- **Deletion cost.** Annotations were written to every Ready pod before each scale-down, with zero failures,
+  and unchanged values were skipped. Victim selection by differing costs was not observed: any load heavy
+  enough to give pods different costs also kept demand too high to scale down.
+
+**Found by the live run and fixed:** a watchdog revert armed the backoff, the scale-up after it cleared the
+backoff on writing, and the next revert armed it at the initial interval again — so under sustained demand the
+`IT-07` setup repeated scale-up → Pending → revert every `pendingPodTimeout` + 30 s without ever growing the
+interval. A complete scale-up now carries the attempt count until its pods are placed
+([scaling-algorithm § 6](scaling-algorithm.md#6-step-4--scale-up-logic-and-the-feasibility-gate)), which
+refines [I-10](design-review.md#5-immutable-phase-1-decisions).
 
 **Deviations from the design, made while building the watchdog:**
 

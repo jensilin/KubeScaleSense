@@ -116,6 +116,14 @@ func Decide(s Snapshot, c *config.Config, now time.Time) Decision {
 		return d
 	}
 
+	// A complete scale-up carried the attempt count instead of clearing it.
+	// Every replica existing and scheduled is the success that clears it, and
+	// it needs no demand data, so it is not lost to a metrics outage.
+	if s.HoldBackoff.AwaitingPlacement && s.PendingOurPods == 0 && s.UnmaterialisedReplicas == 0 {
+		d.Backoff = ClearBackoff()
+		d.BackoffAction = BackoffReset
+	}
+
 	// ── G2: never compute a decision from data known to be stale. This is the
 	// fail-safe that makes "unknown" mean freeze rather than zero (I-7).
 	if !s.Backlog.Fresh(staleAfter, now) {
@@ -227,8 +235,21 @@ func (d Decision) scaleUpPath(s Snapshot, c *config.Config, now time.Time) Decis
 	switch {
 	case s.FitCapacity >= d.RequestedDelta:
 		d.TargetReplicas = d.StepLimited
-		d.Backoff = ClearBackoff()
-		d.BackoffAction = BackoffReset
+		// Complete, but only as an estimate: the attempt count is carried
+		// until the new replicas are placed. Clearing it here would let a
+		// fit estimate the watchdog keeps disproving retry at the initial
+		// interval forever, which is the retry storm by another route.
+		if d.Backoff.Armed() {
+			d.Backoff = BackoffState{
+				Attempts:          d.Backoff.Attempts,
+				FitCapacityAtArm:  -1,
+				AwaitingPlacement: true,
+			}
+			d.BackoffAction = BackoffCarry
+		} else {
+			d.Backoff = ClearBackoff()
+			d.BackoffAction = BackoffReset
+		}
 		return d.with(ReasonScaleUp)
 
 	case s.FitCapacity > 0 && c.Scaling.AllowPartialScaleUp:
@@ -241,13 +262,13 @@ func (d Decision) scaleUpPath(s Snapshot, c *config.Config, now time.Time) Decis
 		// arms the backoff rather than resetting it. Treating it as a success
 		// would clear the backoff on the same reconcile that armed it and
 		// restore the retry storm backoff exists to prevent (DR-02).
-		d.Backoff, d.BackoffInterval = armBackoff(s.HoldBackoff, s.FitCapacity, c.Scaling.HoldBackoff, now)
+		d.Backoff, d.BackoffInterval = armBackoff(d.Backoff, s.FitCapacity, c.Scaling.HoldBackoff, now)
 		d.BackoffAction = BackoffArm
 		return d.with(ReasonScaleUpPartial)
 
 	default:
 		d.Deficit = d.RequestedDelta
-		d.Backoff, d.BackoffInterval = armBackoff(s.HoldBackoff, s.FitCapacity, c.Scaling.HoldBackoff, now)
+		d.Backoff, d.BackoffInterval = armBackoff(d.Backoff, s.FitCapacity, c.Scaling.HoldBackoff, now)
 		d.BackoffAction = BackoffArm
 		return d.with(ReasonHoldInsufficientResources)
 	}
@@ -353,7 +374,7 @@ func (d Decision) watchdog(s Snapshot, c *config.Config, now time.Time) (Decisio
 	// at the level it currently reports, so the next scale-up must wait for
 	// capacity to rise above that level or for the backoff to expire, rather
 	// than reissue the request that just failed (ADR-13).
-	d.Backoff, d.BackoffInterval = armBackoff(s.HoldBackoff, s.FitCapacity, c.Scaling.HoldBackoff, now)
+	d.Backoff, d.BackoffInterval = armBackoff(d.Backoff, s.FitCapacity, c.Scaling.HoldBackoff, now)
 	d.BackoffAction = BackoffArm
 	return d.with(ReasonRevertPendingPods), true
 }

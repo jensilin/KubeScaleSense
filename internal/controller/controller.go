@@ -706,7 +706,7 @@ func (c *Controller) applyDecisionState(decision scaling.Decision, now time.Time
 	}
 
 	switch decision.BackoffAction {
-	case scaling.BackoffArm, scaling.BackoffReset:
+	case scaling.BackoffArm, scaling.BackoffReset, scaling.BackoffCarry:
 		c.state.backoff = decision.Backoff
 	case scaling.BackoffUnchanged:
 	}

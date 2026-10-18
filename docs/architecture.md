@@ -790,7 +790,11 @@ decision log.
 **Decision.** Exponential backoff on infeasible scale-ups: 30 s → 60 s → … → 15 m cap, `factor 2`. While
 backoff is active the decision is `HoldBackoff` and no `scale` write is attempted. Backoff resets immediately
 when any of these changes materially: fit capacity increases, a scale action succeeds, or desired replicas
-falls to or below current. Events are emitted once per backoff cycle, not per reconcile.
+falls to or below current. Events are emitted once per backoff cycle, not per reconcile. *As built (P3):* a
+scale-up "succeeds" when its pods are placed, not when the count is written; until then the attempt count is
+carried, so a revert by the [pending watchdog](#adr-13-what-happens-if-a-newly-created-pod-stays-pending)
+advances the backoff instead of restarting it
+([scaling-algorithm § 6](scaling-algorithm.md#6-step-4--scale-up-logic-and-the-feasibility-gate)).
 
 **Rationale.** Without backoff, an infeasible demand produces a decision every `interval` forever: log spam,
 event spam (which itself pressures the API server), and a metrics series that cannot distinguish "one problem

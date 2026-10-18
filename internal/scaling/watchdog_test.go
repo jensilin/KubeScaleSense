@@ -218,6 +218,47 @@ func TestWatchdog_TheSoleOwnershipGuardsStillWin(t *testing.T) {
 	}
 }
 
+// Found by the live IT-07 run on kind: the revert armed the backoff, the
+// scale-up after it cleared the backoff on writing, and the next revert armed
+// it at the initial interval again — so a fit estimate the watchdog kept
+// disproving was retried every pendingPodTimeout + 30 s indefinitely. With the
+// count carried through the scale-up, each episode waits longer (FR-18).
+func TestWatchdog_RepeatedEpisodesGrowTheBackoff(t *testing.T) {
+	t.Parallel()
+
+	cfg := baseConfig()
+	backoff := ClearBackoff()
+
+	for episode, wantInterval := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute} {
+		stuck := stuckAfterScaleUp(3, 7, 4)
+		stuck.HoldBackoff = backoff
+
+		d := Decide(stuck, cfg, now)
+		if d.Reason != ReasonRevertPendingPods {
+			t.Fatalf("episode %d: Reason = %s, want %s", episode+1, d.Reason, ReasonRevertPendingPods)
+		}
+		if d.Backoff.Attempts != episode+1 || d.BackoffInterval != wantInterval {
+			t.Fatalf("episode %d: revert armed attempt %d for %s, want attempt %d for %s",
+				episode+1, d.Backoff.Attempts, d.BackoffInterval, episode+1, wantInterval)
+		}
+
+		// The interval runs out with demand still high and the same estimate,
+		// so one retry is allowed — and it must not forget the count.
+		expired := d.Backoff
+		expired.NextEligible = now.Add(-time.Second)
+		retry := scaleUpWanted()
+		retry.CurrentReplicas, retry.ReadyReplicas = 3, 3
+		retry.HoldBackoff = expired
+
+		d = Decide(retry, cfg, now)
+		if d.Reason != ReasonScaleUp || d.BackoffAction != BackoffCarry {
+			t.Fatalf("episode %d: retry = %s with backoff %s, want %s with %s",
+				episode+1, d.Reason, d.BackoffAction, ReasonScaleUp, BackoffCarry)
+		}
+		backoff = d.Backoff
+	}
+}
+
 func TestWatchdog_RevertRespectsMinReplicas(t *testing.T) {
 	t.Parallel()
 

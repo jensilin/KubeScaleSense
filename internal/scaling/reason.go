@@ -131,4 +131,7 @@ const (
 	BackoffUnchanged BackoffAction = "unchanged"
 	BackoffArm       BackoffAction = "arm"
 	BackoffReset     BackoffAction = "reset"
+	// BackoffCarry keeps the attempt count through a complete scale-up until
+	// its replicas are placed; see BackoffState.AwaitingPlacement.
+	BackoffCarry BackoffAction = "carry"
 )

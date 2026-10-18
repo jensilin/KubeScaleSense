@@ -82,7 +82,7 @@ Three principles govern what gets tested where:
 | UT-06 | Step limits | `maxScaleUpStep`/`maxScaleDownStep` applied after clamping; a corrupt backlog of 10⁶ cannot exceed one step |
 | UT-07 | Guard precedence | Full ordering G0→G11 ([scaling-algorithm § 5](scaling-algorithm.md#5-step-3--stability-gates)); with several guards matching, the *first* wins — e.g. pending pods + cooldown + backoff all true → `HoldPendingPods` |
 | UT-08 | Feasibility gate | `F ≥ Δ` → `ScaleUp`; `0 < F < Δ` → `ScaleUpPartial` to `current+F`; `F = 0` → `HoldInsufficientResources`; `allowPartialScaleUp: false` routes partial → hold |
-| UT-09 | Backoff | Growth 30→60→120→…→900 s cap; reset on capacity increase, on successful scale, and on demand falling; **no** reset from mere elapsed time |
+| UT-09 | Backoff | Growth 30→60→120→…→900 s cap; reset on capacity increase, on successful scale (its pods placed, not merely written), and on demand falling; **no** reset from mere elapsed time; repeated watchdog reverts grow the interval |
 | UT-10 | Stabilization window | `max()` over the window; a single high sample inside `W` blocks scale-down; expiry of that sample permits it (matches the trace in [scaling-algorithm § 8.5](scaling-algorithm.md#85-worked-oscillation-trace)) |
 | UT-11 | Cooldowns | Asymmetric enforcement; a scale-down cannot follow a scale-up within `C_down`; boundary at exactly the cooldown |
 | UT-12 | Stale / missing signals | Backlog missing or `age > metricsStaleAfter` → `HoldStaleMetrics` in **both** directions; utilization missing alone → degrade, keep scaling |

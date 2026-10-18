@@ -65,6 +65,19 @@ symptoms, one cause. `fs.inotify.max_user_watches` is usually already high
 enough; it is the *instances* limit that runs out. This is
 [kind's own documented known issue](https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files).
 
+Behind a TLS-intercepting proxy the host's Docker may trust the corporate CA
+while the kind nodes do not. Images the scripts build are loaded with
+`kind load` and are unaffected; images the nodes pull themselves fail with
+`x509: certificate signed by unknown authority`, which `demo-up.sh` reports as
+metrics-server timing out. Pull them on the host and load them into the nodes:
+
+```bash
+docker pull registry.k8s.io/metrics-server/metrics-server:v0.9.0
+docker pull registry.k8s.io/pause:3.10
+kind load docker-image --name kubescalesense-demo \
+  registry.k8s.io/metrics-server/metrics-server:v0.9.0 registry.k8s.io/pause:3.10
+```
+
 Short of memory? `make demo-spike MODE=http` drives the same workload straight
 at `normalizer-service` with NiFi out of the path. That exercises the controller,
 the signal, the feasibility calculation, and the dry-run guarantee — everything
@@ -140,10 +153,10 @@ MODE=http CONCURRENCY=32 tests/e2e/demo-spike.sh
 
 | Variable | Default | Controls |
 | --- | --- | --- |
-| `RECORDS` | 1200 | total records |
-| `LOW_RATE` | 20 | records/second in the LOW phases |
-| `HIGH_RATE` | 200 | records/second in the HIGH phase |
-| `PHASE` | 60s | duration of each phase |
+| `RECORDS` | 2000 | total records |
+| `LOW_RATE` | 5 | records/second in the LOW phases |
+| `HIGH_RATE` | 120 | records/second in the HIGH phase |
+| `PHASE` | 90s | duration of each phase |
 | `BURST` | 10 | records per batch — bursty arrival, not a metronome |
 | `PAD` | 0 | extra bytes per record, for payload-size effects |
 | `CONCURRENCY` | 16 | in-flight requests (`MODE=http` only) |
@@ -151,6 +164,13 @@ MODE=http CONCURRENCY=32 tests/e2e/demo-spike.sh
 The LOW → HIGH → LOW shape is the point. A constant load shows a controller
 scaling up once; a spike shows scale-up, the fit ceiling, the cooldown, and the
 asymmetric scale-down — which is where the design's actual behaviour lives.
+
+In `MODE=http` the pressure the controller sees can never exceed
+`CONCURRENCY`, so the default of 16 stays under one replica's measured 40 items
+and never asks for a second. To watch it scale, raise it:
+`MODE=http CONCURRENCY=160 HIGH_RATE=600 PHASE=180s RECORDS=80000` reached the
+fit ceiling on the demo cluster. `HIGH_RATE` must exceed `LOW_RATE`; the
+generator rejects a flat profile.
 
 ## Input, and the SFTP path it stands in for
 

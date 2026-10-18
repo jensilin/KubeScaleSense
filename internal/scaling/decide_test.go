@@ -785,8 +785,9 @@ func TestDecide_PartialScaleUpArmsRatherThanResets(t *testing.T) {
 	}
 }
 
-// A successful scale-up clears the backoff outright.
-func TestDecide_SuccessfulScaleUpResetsTheBackoff(t *testing.T) {
+// A complete scale-up stops holding but keeps the attempt count: writing the
+// replica count is an estimate succeeding, not the pods being placed.
+func TestDecide_CompleteScaleUpCarriesTheBackoffUntilPlaced(t *testing.T) {
 	t.Parallel()
 
 	s := baseSnapshot()
@@ -799,8 +800,57 @@ func TestDecide_SuccessfulScaleUpResetsTheBackoff(t *testing.T) {
 	if got.Reason != ReasonScaleUp {
 		t.Fatalf("Reason = %q, want %q", got.Reason, ReasonScaleUp)
 	}
-	if got.BackoffAction != BackoffReset || got.Backoff.Armed() {
+	want := BackoffState{Attempts: 5, FitCapacityAtArm: -1, AwaitingPlacement: true}
+	if got.BackoffAction != BackoffCarry || got.Backoff != want {
+		t.Errorf("BackoffAction = %q, Backoff = %+v; want %q with %+v", got.BackoffAction, got.Backoff, BackoffCarry, want)
+	}
+	// Nothing to carry: the cleared state stays cleared.
+	s.HoldBackoff = ClearBackoff()
+	if got := Decide(s, baseConfig(), now); got.BackoffAction != BackoffReset || got.Backoff != ClearBackoff() {
 		t.Errorf("BackoffAction = %q, Backoff = %+v; want a reset to the cleared state", got.BackoffAction, got.Backoff)
+	}
+}
+
+// The carried count is cleared by the scale-up being placed — every replica
+// created and scheduled — and by nothing short of that. Placement needs no
+// demand data, so it is recognised through a metrics outage too.
+func TestDecide_CarriedBackoffClearsOnlyOncePlaced(t *testing.T) {
+	t.Parallel()
+
+	carried := BackoffState{Attempts: 3, FitCapacityAtArm: -1, AwaitingPlacement: true}
+
+	for _, tc := range []struct {
+		name      string
+		mutate    func(*Snapshot)
+		wantClear bool
+	}{
+		{"placed", func(*Snapshot) {}, true},
+		{"placed during a metrics outage", func(s *Snapshot) { s.Backlog = Signal[int64]{} }, true},
+		{"a pod still Pending", func(s *Snapshot) { s.PendingOurPods, s.OldestPendingAge = 1, 5*time.Second }, false},
+		{"a replica not yet created", func(s *Snapshot) { s.UnmaterialisedReplicas, s.UnmaterialisedAge = 1, 5*time.Second }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := scaleUpWanted()
+			s.LastScaleUp = now // in cooldown, so nothing else touches the backoff
+			s.HoldBackoff = carried
+			tc.mutate(&s)
+
+			got := Decide(s, baseConfig(), now)
+			if tc.wantClear {
+				if got.BackoffAction != BackoffReset || got.Backoff != ClearBackoff() {
+					t.Errorf("BackoffAction = %q, Backoff = %+v; want it cleared", got.BackoffAction, got.Backoff)
+				}
+				return
+			}
+			if got.Backoff != carried {
+				t.Errorf("Backoff = %+v, want the carried %+v until the scale-up is placed", got.Backoff, carried)
+			}
+			if got.Reason != ReasonHoldPendingPods {
+				t.Errorf("Reason = %q, want %q", got.Reason, ReasonHoldPendingPods)
+			}
+		})
 	}
 }
 
@@ -1481,6 +1531,17 @@ func TestDecide_Properties(t *testing.T) {
 			return pastTimeout && d.PendingTimedOut && d.BackoffAction == BackoffArm
 		},
 
+		"a carried backoff never holds, and a revert always advances it": func(f fuzzSnapshot) bool {
+			if !f.HoldBackoff.AwaitingPlacement {
+				return true
+			}
+			d := Decide(f.Snapshot, cfg, now)
+			if d.Reason == ReasonHoldBackoff {
+				return false
+			}
+			return d.Reason != ReasonRevertPendingPods || d.Backoff.Attempts == f.HoldBackoff.Attempts+1
+		},
+
 		"an unavailable backlog freezes the replica count": func(f fuzzSnapshot) bool {
 			// The guards above G2 are cleared, because otherwise one of them
 			// legitimately claims the reason and the property would be
@@ -1604,12 +1665,15 @@ func (fuzzSnapshot) Generate(rnd *rand.Rand, _ int) reflect.Value {
 		s.UnmaterialisedAge = time.Duration(rnd.Intn(300)) * time.Second
 	}
 
-	if rnd.Intn(3) == 0 {
+	switch rnd.Intn(6) {
+	case 0, 1:
 		s.HoldBackoff = BackoffState{
 			Attempts:         1 + rnd.Intn(6),
 			NextEligible:     now.Add(time.Duration(rnd.Intn(600)-300) * time.Second),
 			FitCapacityAtArm: int32(rnd.Intn(6)),
 		}
+	case 2:
+		s.HoldBackoff = BackoffState{Attempts: 1 + rnd.Intn(6), FitCapacityAtArm: -1, AwaitingPlacement: true}
 	}
 
 	// A history of random length, sometimes covering the window and sometimes
