@@ -33,6 +33,17 @@ const (
 	testRetryPeriod   = 100 * time.Millisecond
 )
 
+// The tests that assert a release stop the leader between renewals, never
+// during one. A renewal abandoned by cancellation can still be applied by the
+// server after release has re-read the lease, and then the release's update is
+// rejected as stale and the lease is left to expire. A one-second retry period
+// leaves a wide gap to stop in.
+const (
+	releaseLeaseDuration = 5 * time.Second
+	releaseRenewDeadline = 2 * time.Second
+	releaseRetryPeriod   = time.Second
+)
+
 func TestLeaseName_IsKeyedOnTheTarget(t *testing.T) {
 	t.Parallel()
 
@@ -149,7 +160,7 @@ func TestElection_AcquiresAndReleasesThroughTheGuardedClient(t *testing.T) {
 	started := make(chan struct{})
 	election, err := NewElection(ElectionConfig{
 		Client: client, Namespace: testNamespace, Name: testLease, Identity: "controller-a",
-		LeaseDuration: testLeaseDuration, RenewDeadline: testRenewDeadline, RetryPeriod: testRetryPeriod,
+		LeaseDuration: releaseLeaseDuration, RenewDeadline: releaseRenewDeadline, RetryPeriod: releaseRetryPeriod,
 		OnStartedLeading: func(context.Context) { close(started) },
 	})
 	if err != nil {
@@ -169,6 +180,7 @@ func TestElection_AcquiresAndReleasesThroughTheGuardedClient(t *testing.T) {
 		t.Errorf("IsLeader = %v, Leader = %q after acquiring", election.IsLeader(), election.Leader())
 	}
 
+	api.betweenRenewals(t)
 	cancel()
 	select {
 	case <-done:
@@ -203,24 +215,29 @@ func TestElection_AcquiresAndReleasesThroughTheGuardedClient(t *testing.T) {
 func TestElection_OneLeaderAndACleanHandover(t *testing.T) {
 	t.Parallel()
 
-	client := guardedLeaseClient(t, newLeaseServer())
+	api := newLeaseServer()
+	client := guardedLeaseClient(t, api)
+	timings := ElectionConfig{
+		LeaseDuration: releaseLeaseDuration, RenewDeadline: releaseRenewDeadline, RetryPeriod: releaseRetryPeriod,
+	}
 
-	a := startCandidate(t, client, "controller-a")
+	a := startCandidateWith(t, client, "controller-a", timings)
 	waitFor(t, "controller-a to lead", a.leading)
 
-	b := startCandidate(t, client, "controller-b")
-	time.Sleep(3 * testRetryPeriod)
+	b := startCandidateWith(t, client, "controller-b", timings)
+	waitFor(t, "the standby to observe controller-a", func() bool { return b.election.Leader() == "controller-a" })
 	if b.leading() {
 		t.Fatal("two candidates lead at once")
 	}
-	if got := b.election.Leader(); got != "controller-a" {
-		t.Errorf("the standby sees %q as leader, want controller-a", got)
-	}
 
+	api.betweenRenewals(t)
 	stoppedAt := time.Now()
 	a.stop(t)
+	if holder := deref(api.current(t).Spec.HolderIdentity); holder != "" {
+		t.Fatalf("after controller-a stopped the lease is still held by %q", holder)
+	}
 	waitFor(t, "controller-b to take over", b.leading)
-	if took := time.Since(stoppedAt); took >= testLeaseDuration {
+	if took := time.Since(stoppedAt); took >= releaseLeaseDuration {
 		t.Errorf("handover took %v, at least the lease duration; the lease was not released", took)
 	}
 	b.stop(t)
@@ -316,11 +333,19 @@ type candidate struct {
 
 func startCandidate(t *testing.T, client kubernetes.Interface, identity string) *candidate {
 	t.Helper()
+	return startCandidateWith(t, client, identity, ElectionConfig{
+		LeaseDuration: testLeaseDuration, RenewDeadline: testRenewDeadline, RetryPeriod: testRetryPeriod,
+	})
+}
+
+// startCandidateWith takes its timings from the durations in timings.
+func startCandidateWith(t *testing.T, client kubernetes.Interface, identity string, timings ElectionConfig) *candidate {
+	t.Helper()
 
 	c := &candidate{done: make(chan struct{}), stopped: make(chan struct{})}
 	election, err := NewElection(ElectionConfig{
 		Client: client, Namespace: testNamespace, Name: testLease, Identity: identity,
-		LeaseDuration: testLeaseDuration, RenewDeadline: testRenewDeadline, RetryPeriod: testRetryPeriod,
+		LeaseDuration: timings.LeaseDuration, RenewDeadline: timings.RenewDeadline, RetryPeriod: timings.RetryPeriod,
 		OnStartedLeading: func(ctx context.Context) {
 			c.mu.Lock()
 			c.ctx = ctx
@@ -378,6 +403,7 @@ type leaseServer struct {
 	mu       sync.Mutex
 	lease    []byte
 	version  int
+	writes   int
 	requests []string
 }
 
@@ -399,7 +425,8 @@ func (s *leaseServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(s.lease)
 	case r.Method == http.MethodPost && s.lease != nil:
 		w.WriteHeader(http.StatusConflict)
-		_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"AlreadyExists","code":409}`))
+		_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"AlreadyExists",` +
+			`"message":"lease already exists","code":409}`))
 	case r.Method == http.MethodPut && s.lease == nil:
 		w.WriteHeader(http.StatusNotFound)
 	case r.Method == http.MethodPost || r.Method == http.MethodPut:
@@ -413,10 +440,13 @@ func (s *leaseServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// sends it back to read who holds the lease now.
 		if r.Method == http.MethodPut && lease.ResourceVersion != strconv.Itoa(s.version) {
 			w.WriteHeader(http.StatusConflict)
-			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Conflict","code":409}`))
+			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"Conflict",` +
+				`"message":"resourceVersion ` + lease.ResourceVersion + ` is stale, the lease is at ` +
+				strconv.Itoa(s.version) + `","code":409}`))
 			return
 		}
 		s.version++
+		s.writes++
 		lease.ResourceVersion = strconv.Itoa(s.version)
 		s.lease, _ = json.Marshal(&lease)
 		if r.Method == http.MethodPost {
@@ -444,6 +474,22 @@ func (s *leaseServer) seize(t *testing.T, holder string) {
 	s.version++
 	lease.ResourceVersion = strconv.Itoa(s.version)
 	s.lease, _ = json.Marshal(&lease)
+}
+
+// betweenRenewals returns just after the leader's next renewal has been
+// answered, when the next one is a whole retry period away: the moment a stop
+// cannot race a renewal in flight.
+func (s *leaseServer) betweenRenewals(t *testing.T) {
+	t.Helper()
+	before := s.writeCount()
+	waitFor(t, "the leader's next renewal", func() bool { return s.writeCount() > before })
+	time.Sleep(50 * time.Millisecond)
+}
+
+func (s *leaseServer) writeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.writes
 }
 
 func (s *leaseServer) seen() []string {
