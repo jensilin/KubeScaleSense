@@ -69,6 +69,7 @@ var clientPackages = []string{
 	"k8s.io/client-go/tools/clientcmd",
 	"k8s.io/client-go/dynamic",
 	"k8s.io/client-go/scale",
+	"k8s.io/client-go/tools/leaderelection",
 	"k8s.io/metrics/pkg/client/clientset/versioned",
 	"sigs.k8s.io/controller-runtime",
 }
@@ -367,11 +368,15 @@ func TestNoMutatingCallsOutsideTheKubernetesPackage(t *testing.T) {
 // "file apiGroups resources", with its exact verbs line.
 //
 // All of them are in the namespaced Role, so every write is confined to the
-// target's namespace. Each matches one entry of wantWriteSites.
+// target's namespace. Each matches one entry of wantWriteSites, except leases:
+// those writes are client-go's leader election (resourcelock.LeaseLock), not a
+// call in this repository, and are bounded instead by the lease transport in
+// internal/kubernetes/lease.go, which permits only the one named lease.
 var wantWriteRules = map[string]string{
-	`role.yaml ["apps"] ["deployments/scale"]`: `verbs: ["get", "update", "patch"]`,
-	`role.yaml ["events.k8s.io"] ["events"]`:   `verbs: ["create"]`,
-	`role.yaml [""] ["pods"]`:                  `verbs: ["patch"]`,
+	`role.yaml ["apps"] ["deployments/scale"]`:     `verbs: ["get", "update", "patch"]`,
+	`role.yaml ["events.k8s.io"] ["events"]`:       `verbs: ["create"]`,
+	`role.yaml [""] ["pods"]`:                      `verbs: ["patch"]`,
+	`role.yaml ["coordination.k8s.io"] ["leases"]`: `verbs: ["get", "create", "update"]`,
 }
 
 // The RBAC manifests must grant exactly the enumerated write rules.

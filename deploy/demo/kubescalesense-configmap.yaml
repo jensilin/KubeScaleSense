@@ -29,7 +29,7 @@ data:
     controller:
       interval: 15s
       leaderElection: true
-      # P2 is dry-run, without exception. The binary has no actuator to enable.
+      # Switched by demo-actuate.sh, which rewrites only this line.
       dryRun: true
       metricsAddr: ":8080"
       healthAddr: ":8081"

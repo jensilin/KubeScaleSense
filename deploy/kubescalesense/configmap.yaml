@@ -22,9 +22,11 @@ data:
   kubescalesense.yaml: |
     controller:
       interval: 15s
+      # The Deployment runs two replicas; the lease is what makes one of them
+      # the only writer. Turning it off is only safe with exactly one replica.
       leaderElection: true
-      # true until P3 builds a write path, and false is rejected rather than
-      # ignored: this binary has no actuator to disable (CR-6).
+      # Observe first: set false to let the controller write, once its
+      # reported decisions have been checked against the cluster.
       dryRun: true
       metricsAddr: ":8080"
       healthAddr: ":8081"

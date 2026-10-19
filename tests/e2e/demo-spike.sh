@@ -90,8 +90,9 @@ $(log "spike finished")
 
   What to look at, and what it should say:
 
-    The pressure the controller saw, summed over pods:
-      kubectl --context ${CONTEXT} -n kubescalesense logs deployment/kubescalesense | tail -40
+    The pressure the controller saw, summed over pods (from the lease
+    holder, when the controller is live):
+      tests/e2e/controller-logs.sh --tail=40
 
     The replica count, which must NOT have changed:
       kubectl --context ${CONTEXT} -n ${NAMESPACE} get deployment normalizer

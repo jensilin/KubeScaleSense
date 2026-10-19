@@ -11,6 +11,9 @@
 // scale subresource of the one configured Deployment. In dry-run — still the
 // default — no actuation client is built at all, so the process holds nothing
 // that could write.
+//
+// From P4 a live process also campaigns for a Lease named after the target and
+// decides only while it holds it, so any number of replicas have one writer.
 package main
 
 import (
@@ -24,6 +27,8 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+
+	"k8s.io/klog/v2"
 
 	"github.com/jensilin/KubeScaleSense/internal/config"
 	"github.com/jensilin/KubeScaleSense/internal/controller"
@@ -39,7 +44,7 @@ const AppName = "kubescalesense"
 // Phase names the implementation phase in logs and in kss_config_info, so that
 // a stray log file is self-describing about what the process could and could not
 // do.
-const Phase = "P3"
+const Phase = "P4"
 
 // version is overridden at build time with -ldflags "-X main.version=...".
 var version = "dev"
@@ -60,9 +65,10 @@ const cacheSyncTimeout = 60 * time.Second
 // `kubectl describe` without reading logs. Configuration failures are the
 // common case (FS-19) and are worth their own code.
 const (
-	exitOK            = 0
-	exitConfigInvalid = 1
-	exitRuntimeError  = 2
+	exitOK             = 0
+	exitConfigInvalid  = 1
+	exitRuntimeError   = 2
+	exitLostLeadership = 3
 )
 
 func main() {
@@ -109,12 +115,29 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitOK
 	}
 
+	// client-go logs through klog, which writes plain text to stderr. Routed
+	// through the same handler, so `kubectl logs` stays one JSON object per
+	// line and the demo's jq pipelines do not stop at the elector's first
+	// message.
+	klog.SetSlogLogger(log.With(slog.String("component", "client-go")))
+
+	forcedReadOnly := forceReadOnlyForOnce(cfg, opts)
 	logStartup(log, cfg, src)
+	if forcedReadOnly {
+		log.Info("-once is read-only: dry-run forced for this run",
+			slog.String("detail", "a single reconcile for inspection must not write, and would do so outside "+
+				"the leader lease"),
+		)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if err := serve(ctx, log, cfg, opts); err != nil {
+		if errors.Is(err, errLostLeadership) {
+			log.Warn("controller stopped: leadership lost", slog.Any("error", err))
+			return exitLostLeadership
+		}
 		log.Error("controller stopped with an error", slog.Any("error", err))
 		return exitRuntimeError
 	}
@@ -298,28 +321,43 @@ func serve(ctx context.Context, log *slog.Logger, cfg *config.Config, opts optio
 		slog.String("checks", "pod template declares CPU and memory requests; no HorizontalPodAutoscaler targets it"),
 	)
 
-	server := observability.NewServer(cfg, metrics, ctrl.Ready, log)
-	server.Start()
-
 	if opts.once {
 		// A single observation, for inspecting a cluster by hand. Exercises the
-		// entire read path and the whole decision, and writes nothing.
-		if _, err := ctrl.Reconcile(ctx); err != nil {
+		// entire read path and the whole decision, and writes nothing: run
+		// forced dry-run, so no write client and no lease exist.
+		server := observability.NewServer(cfg, metrics, ctrl.Ready, log)
+		server.Start()
+		if _, err = ctrl.Reconcile(ctx); err != nil {
 			return fmt.Errorf("single reconcile: %w", err)
 		}
 		return shutdownServer(log, server)
 	}
 
-	loopDone := make(chan error, 1)
-	go func() { loopDone <- ctrl.Run(ctx) }()
-
-	log.Info("waiting for shutdown signal", slog.String("signals", "SIGINT, SIGTERM"))
-	<-ctx.Done()
-
-	if err := shutdownServer(log, server); err != nil {
+	leader, err := buildLeadership(cfg, opts, metrics, log)
+	if err != nil {
 		return err
 	}
-	return <-loopDone
+
+	ready := ctrl.Ready
+	if leader != nil {
+		ready = standbyReady(leader.leading.Load, reader.HasSynced, ctrl.Ready)
+	}
+	server := observability.NewServer(cfg, metrics, ready, log)
+	server.Start()
+
+	log.Info("waiting for shutdown signal", slog.String("signals", "SIGINT, SIGTERM"))
+
+	var runErr error
+	if leader == nil {
+		runErr = ctrl.Run(ctx)
+	} else {
+		runErr = lead(ctx, leader, ctrl.Run)
+	}
+
+	if err := shutdownServer(log, server); err != nil && runErr == nil {
+		return err
+	}
+	return runErr
 }
 
 // buildActuator selects the actuator for this process's configuration.

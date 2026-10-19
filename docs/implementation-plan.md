@@ -471,6 +471,30 @@ events client and the pod client each have their own transport guard, user agent
 - Documentation reconciliation: measured values folded back into the defaults; any design decision that
   changed during implementation updated in these documents (and its ADR amended rather than silently edited).
 
+**Progress.** Leader election is built ([architecture § 7](architecture.md#7-kubernetes-permissions-and-rbac),
+"Leadership as built"). The controller runs two replicas with a rolling update, and one `Lease` per target,
+`kubescalesense-<deployment>` in the target's namespace, elects the single writer. The `leases` rule is
+granted, and its client's transport permits only that one lease. `kss_leader` is registered. Dry-run and
+`-once` never campaign, and `-once` is now forced read-only. The other deliverables are not started.
+
+**Live run on kind (2026-10-19, Kubernetes v1.36.1), `IT-09`:**
+
+- **Dry-run.** No lease was created; both replicas reported decisions and both read `kss_leader` 0.
+- **Live.** One replica acquired the lease within 15 ms of starting; the other logged that it was standing by
+  and made no decision. Both were Ready, so the rolling update did not stall. `kubectl auth can-i` confirmed
+  `get`, `create` and `update` on leases in `data-pipeline`, and no `delete`, `patch` or `list`, nor any lease
+  access in other namespaces. Every log line, client-go's included, was JSON.
+- **Failover.** Deleting the leader's pod released the lease on shutdown, and the standby took over 0.9 s
+  later. Its first decisions were ordinary holds, with no `ExternalScaleDetected`: the baseline was adopted
+  silently.
+- **Lease loss.** With the lease overwritten by a foreign holder, the leader failed to renew, stopped its
+  loop at the 10 s renew deadline, and exited with code 3. It restarted as a standby, and the other replica
+  acquired the lease once the foreign holder's 15 s had run out. The overwrite skipped the expiry wait a
+  real successor must observe, so the old leader's decisions in that window, up to 2 s before it stopped,
+  are expected. Through the protocol, the 5 s gap between renew deadline and lease duration separates the
+  two terms, and the `resourceVersion` precondition rejects any write that still crosses it
+  ([FS-26](failure-scenarios.md#fs-26-leadership-handoff-races-with-an-in-flight-write)).
+
 **Exit criteria**
 
 - Full test matrix green; every reason code observed at least once in `SK-01`.

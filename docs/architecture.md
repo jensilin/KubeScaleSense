@@ -426,31 +426,41 @@ cluster-scoped resource discovery, and a namespaced `Role` for the target and co
 Pod hardening: non-root, read-only root filesystem, all capabilities dropped, `seccompProfile:
 RuntimeDefault`, no service account token beyond the controller's own.
 
-**As built in P3.** The table above is the design target for the finished controller. The shipped manifests
-grant all of it except `leases`, because a permission is granted when the code that needs it exists and not
-before:
+**As built in P4.** The shipped manifests grant the whole table. Each permission arrived with the code that
+needs it, not before: the reads in P1, `deployments/scale`, `events` and the `pods` patch in P3, and
+`leases` with leader election in P4. Single-writer safety now rests on the lease rather than on
+`replicas: 1`, so the Deployment runs two replicas with a rolling update.
 
-| Granted now | Still deferred |
-| --- | --- |
-| Everything read-only in the table | `leases` — arrives with leader election in P4 |
-| `deployments/scale` get, update, patch — namespaced | |
-| `events.k8s.io` `events` create — namespaced | |
-| `pods` patch — namespaced | |
-
-Until the lease arrives, single-writer safety rests on `replicas: 1` plus `strategy: Recreate`.
-`deploy/kubescalesense/role.yaml` records the same table next to the rules.
+The lease is `kubescalesense-<deployment>` in the target's namespace. It is keyed on the target rather than on
+the installation, so two installations pointed at one Deployment also elect a single writer. Its timings are
+client-go's usual 15 s duration, 10 s renew deadline and 2 s retry. Only a live process campaigns: dry-run
+writes nothing, so there is no writer to elect, and every dry-run replica reports its own decisions.
 
 Each write permission has its own client in `internal/kubernetes`, and each client's transport refuses
 everything but its one request shape: PUT/PATCH to the target's scale path; POST to the namespace's
-`events.k8s.io` collection, with no reads at all; and a JSON merge patch of one pod whose body sets
-`controller.kubernetes.io/pod-deletion-cost` to an integer and nothing else. Dry-run builds none of them.
-Only the first can change how many pods run.
+`events.k8s.io` collection, with no reads at all; a JSON merge patch of one pod whose body sets
+`controller.kubernetes.io/pod-deletion-cost` to an integer and nothing else; and GET/PUT of the one named
+lease, plus a POST creating it whose body names exactly that lease. Dry-run builds none of them. Only the first
+can change how many pods run.
 
 Two tests hold this shut rather than trusting review: one asserts that the manifests' write rules are exactly
-the three above with exactly those verbs, and one asserts that the repository's mutating client-go calls are
+the four above with exactly those verbs, and one asserts that the repository's mutating client-go calls are
 exactly `UpdateScale` in `scale.go`, `Create` in `events.go`, and `Patch` in `deletioncost.go`, once each.
-Widening RBAC or adding a write path therefore fails the build until the enumeration in
-`internal/controller/nowrite_test.go` is changed on purpose.
+The lease's writes are client-go's own leader election, not calls in this repository, which is why its
+guard is the transport in `lease.go`. Widening RBAC or adding a write path therefore fails the build until
+the enumeration in `internal/controller/nowrite_test.go` is changed on purpose.
+
+**Leadership as built.** The reconcile loop runs only while the lease is held, and is stopped and waited
+for *before* the lease is released, so it is only ever given up by a process that has stopped acting under
+it. A leader that cannot renew stops deciding when its 10 s renew deadline expires, which is 5 s before any
+successor can acquire an unrenewed 15 s lease, and exits with code 3 rather than campaigning again. Its
+restart is a fresh standby, cooled down with an empty history, and a successor adopts the
+current replica count as its baseline without reporting it as external drift
+([FS-17](failure-scenarios.md#fs-17-controller-crash-restart-or-leadership-change)). A write still in flight
+across a handover is caught by the `resourceVersion` precondition
+([FS-26](failure-scenarios.md#fs-26-leadership-handoff-races-with-an-in-flight-write)). A standby is ready
+once its caches have synced, because a standby reported unready would stall every rolling update. `-once`
+is always read-only, so a one-off inspection can never write beside a running leader.
 
 ---
 
@@ -487,7 +497,7 @@ Widening RBAC or adding a write path therefore fails the build until the enumera
 | `kss_external_scale_changes_total` | counter | — | Replica writes by other actors ([FR-31](requirements.md#review-driven-requirements-v011)) |
 | `kss_backoff_fit_capacity_at_arm` | gauge | — | Capacity level the active backoff is a statement about; reset compares `F` against it ([FR-33](requirements.md#review-driven-requirements-v011)) |
 | `kss_api_errors_total` | counter | `resource`, `verb`, `code` | API health ([FS-09](failure-scenarios.md#fs-09-kubernetes-api-failure)) |
-| `kss_leader` | gauge | — | 1 if this replica is leader |
+| `kss_leader` | gauge | — | 1 while this replica holds the lease; 0 on a standby, and in dry-run or with leader election disabled, where none is held |
 | `kss_config_info` | gauge | key config values | Correlate behaviour with configuration in the demo |
 
 ### 8.2 Kubernetes Events
@@ -1402,7 +1412,7 @@ flowchart TB
     end
 
     subgraph N2["namespace: kubescalesense"]
-        KSS["kubescalesense<br/>Deployment · 1 replica + Lease"]
+        KSS["kubescalesense<br/>Deployment · 2 replicas<br/>one holds the Lease"]
     end
 
     subgraph N3["kube-system"]

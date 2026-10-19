@@ -23,10 +23,6 @@ import (
 var now = time.Date(2026, 3, 14, 12, 0, 0, 0, time.UTC)
 
 // documentedMetrics is the metric set of architecture § 8.1.
-//
-// kss_leader is deliberately absent: there is no Lease until P4, and a gauge
-// reporting leadership in a binary that has no leader election would be a
-// fabricated signal.
 var documentedMetrics = []string{
 	"kss_reconcile_total",
 	"kss_reconcile_duration_seconds",
@@ -60,6 +56,7 @@ var documentedMetrics = []string{
 	"kss_external_scale_changes_total",
 	"kss_backoff_fit_capacity_at_arm",
 	"kss_api_errors_total",
+	"kss_leader",
 	"kss_config_info",
 }
 
@@ -288,6 +285,27 @@ func TestRecordReconcile_BackoffGauges(t *testing.T) {
 			t.Errorf("kss_backoff_fit_capacity_at_arm = %v, want -1", got)
 		}
 	})
+}
+
+// kss_leader is exposed from the start at 0: a replica that never acquires the
+// lease, or never campaigns, must read as "not the leader", not as missing.
+func TestSetLeader_FollowsTheLease(t *testing.T) {
+	t.Parallel()
+
+	m := NewMetrics()
+	leader := func() float64 { return gaugeValue(gatherByName(t, m)["kss_leader"]) }
+
+	if got := leader(); got != 0 {
+		t.Fatalf("kss_leader before any election = %v, want 0", got)
+	}
+	m.SetLeader(true)
+	if got := leader(); got != 1 {
+		t.Errorf("kss_leader while leading = %v, want 1", got)
+	}
+	m.SetLeader(false)
+	if got := leader(); got != 0 {
+		t.Errorf("kss_leader after losing the lease = %v, want 0", got)
+	}
 }
 
 // A node that left the cluster must stop reporting a stale free-capacity

@@ -1,13 +1,16 @@
-# Controller Deployment — Phase 1, not applied by any automation.
+# Controller Deployment — not applied by any automation.
 #
-# What this pod does today: watches nodes, pods, the target Deployment, its
-# ReplicaSets, and HorizontalPodAutoscalers; reads pod metrics; and reports the
-# scaling decision it would make. It scales nothing. Its Kubernetes client
-# rejects mutating requests at the transport layer and its ServiceAccount has
-# no write permission, so the read-only claim holds even if the code is wrong.
+# Each pod watches nodes, pods, the target Deployment, its ReplicaSets, and
+# HorizontalPodAutoscalers; reads pod metrics; and decides a replica count. In
+# dry-run (the shipped default) it only reports that decision. Live, it writes
+# through deployments/scale, and only the holder of the Lease
+# data-pipeline/kubescalesense-normalizer decides at all (FR-26).
 #
-# replicas is 1 and stays 1 until P4 adds leader election (FR-26). Two replicas
-# without a Lease would be two controllers writing the same replica count.
+# Two replicas, so losing the leader's pod or node costs one lease duration
+# (15s) rather than a reschedule and an image pull. The standby keeps its caches
+# synced and is ready, but makes no decision until it holds the lease; a leader
+# that loses the lease exits and restarts as a standby. In dry-run neither
+# campaigns and both report, which writes nothing either way.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,9 +20,15 @@ metadata:
     app.kubernetes.io/name: kubescalesense
     app.kubernetes.io/component: controller
 spec:
-  replicas: 1
+  replicas: 2
+  # RollingUpdate is safe because the lease, not the pod count, bounds the
+  # writers: a new pod stands by until the old leader stops and releases. One
+  # pod at a time, so a rollout never removes both and leaves no standby.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: kubescalesense
@@ -73,7 +82,10 @@ spec:
               cpu: 500m
               memory: 64Mi
           # /healthz answers as soon as the listener is up; /readyz waits for
-          # the informer caches to sync and for a recent successful reconcile.
+          # the informer caches to sync and, on the leader, for a recent
+          # successful reconcile. A standby is ready once synced: otherwise a
+          # rollout would wait forever for a pod that can only lead after the
+          # old one has gone.
           # The startup probe carries the cold cache list, so a slow first
           # sync on a large cluster is not read as a liveness failure.
           startupProbe:

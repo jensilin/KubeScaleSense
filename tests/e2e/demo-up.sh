@@ -155,8 +155,9 @@ $(log "the demonstration environment is up")
   Replicas start at 1 and KubeScaleSense will NOT change them yet: the
   environment comes up in dry-run, so everything below observes.
 
-  Watch the decision the controller would make:
-    kubectl --context ${CONTEXT} -n ${CONTROLLER_NAMESPACE} logs -f deployment/kubescalesense
+  Watch the decision the controller would make (the lease holder's log once
+  it is live; in dry-run every replica reports):
+    tests/e2e/controller-logs.sh -f
 
   Drive a spike through the full pipeline (files -> NiFi -> HTTP -> Normalizer):
     make demo-spike

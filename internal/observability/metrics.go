@@ -70,6 +70,7 @@ type Metrics struct {
 	externalScaleChanges prometheus.Counter
 	backoffFitCapacity   prometheus.Gauge
 	apiErrorsTotal       *prometheus.CounterVec
+	leader               prometheus.Gauge
 	configInfo           *prometheus.GaugeVec
 }
 
@@ -238,6 +239,11 @@ func NewMetrics() *Metrics {
 		Help: "Kubernetes API errors by resource, verb, and status code.",
 	}, []string{"resource", "verb", "code"})
 
+	m.leader = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "kss_leader",
+		Help: "1 while this replica holds the target's leader lease. 0 on a standby, and in dry-run or with leader election disabled, where no lease is held. The decision series of a replica reporting 0 describe nothing it acted on.",
+	})
+
 	m.configInfo = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "kss_config_info",
 		Help: "Always 1. Labels carry the configuration values needed to correlate behaviour with settings.",
@@ -257,7 +263,7 @@ func NewMetrics() *Metrics {
 		m.freeCPU, m.freeMemory, m.nodeFreeCPU,
 		m.insufficientHolds, m.holdBackoffSeconds,
 		m.pendingTargetPods, m.unhealthyTargetPods, m.remediationsTotal,
-		m.externalScaleChanges, m.backoffFitCapacity, m.apiErrorsTotal, m.configInfo,
+		m.externalScaleChanges, m.backoffFitCapacity, m.apiErrorsTotal, m.leader, m.configInfo,
 	)
 
 	m.initialiseLabelValues()
@@ -459,6 +465,15 @@ func (m *Metrics) RecordPendingRemediation(action string) {
 // make.
 func (m *Metrics) RecordExternalScaleChange() {
 	m.externalScaleChanges.Inc()
+}
+
+// SetLeader reports whether this replica holds the leader lease.
+func (m *Metrics) SetLeader(leading bool) {
+	if leading {
+		m.leader.Set(1)
+		return
+	}
+	m.leader.Set(0)
 }
 
 // RecordAPIError counts a failed Kubernetes read.

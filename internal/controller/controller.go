@@ -257,6 +257,13 @@ func (c *Controller) Run(ctx context.Context) error {
 	defer ticker.Stop()
 
 	for {
+		// Checked before deciding rather than only between ticks: a context
+		// cancelled before the first reconcile means the lease was lost before
+		// the loop began, and no decision may be made under it.
+		if ctx.Err() != nil {
+			c.log.Info("reconcile loop stopping", slog.Int("reconciles", c.reconcileCount()))
+			return nil
+		}
 		if _, err := c.Reconcile(ctx); err != nil {
 			if ctx.Err() != nil {
 				return nil

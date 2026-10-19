@@ -125,8 +125,7 @@ demo-down: ## Delete the kind demo cluster
 
 .PHONY: demo-observe
 demo-observe: ## Follow the controller's decisions while a spike runs
-	@kubectl --context kind-kubescalesense-demo -n kubescalesense \
-		logs -l app.kubernetes.io/name=kubescalesense -f --tail=20
+	@tests/e2e/controller-logs.sh -f --tail=20
 
 ## --- Phase 3: actuation ---------------------------------------------------
 #
@@ -147,5 +146,4 @@ demo-dry-run: ## Return the demo controller to observing only (dryRun: true)
 demo-replicas: ## Show the target's replica count and the controller's last decision
 	@kubectl --context kind-kubescalesense-demo -n data-pipeline \
 		get deployment normalizer -o custom-columns=NAME:.metadata.name,DESIRED:.spec.replicas,READY:.status.readyReplicas
-	@kubectl --context kind-kubescalesense-demo -n kubescalesense \
-		logs -l app.kubernetes.io/name=kubescalesense --tail=1
+	@tests/e2e/controller-logs.sh --tail=1

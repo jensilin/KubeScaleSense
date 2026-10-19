@@ -1,10 +1,10 @@
 # Namespaced permissions on the target workload's namespace.
 #
 # THIS ROLE GRANTS EXACTLY ONE MUTATION OF THE WORKLOAD: `deployments/scale`.
-# The two other writes cannot change how many pods run: `create` on
-# events.k8s.io events (announcements about the target), and `patch` on pods,
+# The three other writes cannot change how many pods run: `create` on
+# events.k8s.io events (announcements about the target), `patch` on pods,
 # which the controller's transport confines to the pod-deletion-cost
-# annotation. Everything else here is a read. See the reasoning in clusterrole.yaml: this rule set is the
+# annotation, and the leader lease. Everything else here is a read. See the reasoning in clusterrole.yaml: this rule set is the
 # enforcement that holds even if the controller's code is wrong, and
 # internal/controller/nowrite_test.go fails if a write rule is added or widened
 # without being enumerated there.
@@ -22,16 +22,8 @@
 # scale-down goes through the ReplicaSet controller and PodDisruptionBudgets,
 # graceful termination, and preStop hooks all still apply (I-11).
 #
-# Deferred namespaced rules, from the canonical table in
-# docs/architecture.md § 7:
-#
-#   | Resource | API group            | Verbs               | Added in | Why                                  |
-#   |----------|----------------------|---------------------|----------|--------------------------------------|
-#   | leases   | coordination.k8s.io  | get, create, update | P4       | Leader election (FR-26)              |
-#
-# Its absence is visible in behaviour rather than hidden: a second replica
-# would compete rather than stand by — which is why the Deployment runs a
-# single replica with the Recreate strategy until the lease arrives in P4.
+# With the lease (P4) the canonical table in docs/architecture.md § 7 is fully
+# granted; nothing is deferred any more.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -42,7 +34,7 @@ metadata:
   labels:
     app.kubernetes.io/name: kubescalesense
     app.kubernetes.io/component: controller
-    kubescalesense.io/phase: "P3"
+    kubescalesense.io/phase: "P4"
 rules:
   # Spec, status, and pod template of the target. The template supplies the
   # effective pod request that the whole fit calculation is built on (A-03),
@@ -88,6 +80,19 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["patch"]
+
+  # Leader election (FR-26, P4). Replicas campaign for one Lease named after the
+  # target, kubescalesense-<deployment>, in this namespace; only its holder
+  # decides and writes. Keying it on the target rather than the installation
+  # means two installations pointed at one Deployment also elect a single
+  # writer. `get` and `update` read and renew it, `create` makes it on first
+  # start. RBAC cannot confine `create` to a name, so the controller's lease
+  # client refuses any request but those for that one lease
+  # (internal/kubernetes/lease.go). No `delete`: a lease is released by
+  # clearing its holder, not by removing it.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
 
   # Needed to tell the target's *current* pods from those of a previous
   # ReplicaSet during a rollout (DR-09). Without this, a rolling update makes

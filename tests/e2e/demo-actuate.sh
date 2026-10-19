@@ -105,21 +105,39 @@ kubectl -n "${CONTROLLER_NAMESPACE}" rollout status deployment/kubescalesense --
 # ConfigMap. The ConfigMap says what we asked for; the log says what the
 # process believes, which is the thing that matters.
 log "confirming the mode from the controller's startup log"
+
+# Live replicas elect one writer (FR-26); the decisions are in its log, not the
+# standby's. A holder appears within a lease duration of the old leader going.
+if [[ "${mode}" == "on" ]]; then
+  holder=""
+  for _ in $(seq 1 30); do
+    holder="$(kubectl -n "${NAMESPACE}" get lease kubescalesense-normalizer \
+      -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)"
+    [[ -n "${holder}" ]] && break
+    sleep 1
+  done
+  if [[ -n "${holder}" ]]; then
+    log "${holder%%_*} holds the leader lease and is the one replica that writes"
+  else
+    warn "no replica acquired lease ${NAMESPACE}/kubescalesense-normalizer within 30s"
+  fi
+fi
+
 sleep 2
-banner="$(kubectl -n "${CONTROLLER_NAMESPACE}" logs deployment/kubescalesense --tail=50 2>/dev/null || true)"
+banner="$(tests/e2e/controller-logs.sh --tail=50 2>/dev/null || true)"
 
 if [[ "${mode}" == "on" ]]; then
   if grep -q "live actuation is enabled" <<<"${banner}"; then
     log "the controller is LIVE and will change the replica count of ${NAMESPACE}/normalizer"
   else
     warn "the controller did not announce live actuation. Check:"
-    warn "  kubectl --context ${CONTEXT} -n ${CONTROLLER_NAMESPACE} logs deployment/kubescalesense"
+    warn "  tests/e2e/controller-logs.sh"
   fi
 else
   if grep -q "no scaling will be performed" <<<"${banner}"; then
     log "the controller is back in dry-run and writes nothing"
   else
     warn "the controller did not announce dry-run. Check:"
-    warn "  kubectl --context ${CONTEXT} -n ${CONTROLLER_NAMESPACE} logs deployment/kubescalesense"
+    warn "  tests/e2e/controller-logs.sh"
   fi
 fi

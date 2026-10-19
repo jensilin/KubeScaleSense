@@ -12,10 +12,9 @@
 // candidate node count, and why nodes were excluded are all exported for exactly
 // that question.
 //
-// Three metrics from architecture § 8.1 report zero throughout Phase 1, and that
-// is a truthful value rather than a stub: kss_scale_actions_total and
+// Some series report zero for as long as the thing they count has not happened,
+// and that is a truthful value rather than a stub: kss_scale_actions_total and
 // kss_pending_pod_remediations_total count real mutations, of which a dry-run
-// phase performs none. kss_leader is deliberately *not* registered, because
-// leader election arrives with P4 and a gauge claiming leadership that no lease
-// backs would be a fabrication.
+// process performs none. kss_leader is 1 only while a lease is actually held,
+// so it reads 0 in dry-run and with leader election disabled, where none is.
 package observability

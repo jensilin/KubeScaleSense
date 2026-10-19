@@ -84,8 +84,9 @@ fit capacity to zero. Two report periods is the window, so one missed status wri
 C2 is therefore a guard against a **stale view** — a silently desynced watch, or a kubelet that has stopped
 reporting status altogether — and not against node death. Node death is C1's job: when a lease expires the
 node controller writes `Ready=Unknown`, which arrives on the same watch. Reading the `Lease` directly would be
-more precise, but it is not needed for correctness here and `leases` access is deferred to
-[P4](implementation-plan.md#p4--hardening-and-operability-poc-complete).
+more precise, but it is not needed for correctness here, and the only `leases` access the controller has —
+from [P4](implementation-plan.md#p4--hardening-and-operability-poc-complete) — is to its own leader lease in
+the target's namespace, not to `kube-node-lease`.
 
 ### 2.1 Taints and tolerations (C4)
 
