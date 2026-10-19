@@ -374,11 +374,11 @@ E2E runs are not, and the split is worth stating precisely rather than reporting
 | `pod-deletion-cost` refresh before scale-down | **Done** — each Ready pod's cost is its own queued + in-flight work, from the `http` source; all-or-none; best-effort. Needs `pods` `patch`, now granted and narrowed by a body-validating transport (`internal/kubernetes/deletioncost.go`) |
 | Kubernetes events with rate limiting | **Done** — `events.k8s.io` `create` only, through a POST-only transport (`internal/kubernetes/events.go`); repeating holds follow the hold-backoff cadence per reason (`internal/controller/events.go`) |
 | `make demo-scenario-1..5` | **Not done** — `demo-spike`, `demo-actuate` and `measure-items-per-replica` cover the scale-up, scale-down and measurement narratives; the five scripted scenarios and the HPA side-by-side are not written |
-| Exit-criteria runs (`IT-04`, `IT-07`, `IT-08` against kind; `E2E-*`; `DI-*`) | **Partly done** — `IT-04`, `IT-07` (`revert` mode) and `IT-08` passed live on the kind cluster ([below](#p3-live-run)); `freeze`/`none` modes, `E2E-*` and `DI-*` are covered by unit and controller-level tests only |
+| Exit-criteria runs (`IT-04`, `IT-07`, `IT-08`, `IT-15` against kind; `E2E-*`; `DI-*`) | **Partly done** — `IT-04`, `IT-07` (all three `onPendingTimeout` modes), `IT-08` and `IT-15` passed live on the kind cluster ([below](#p3-live-run)); `E2E-*` and `DI-*` are covered by unit and controller-level tests only |
 
 <a id="p3-live-run"></a>
 
-**Live run on kind (2026-10-18), controller in `dryRun: false`:**
+**Live run on kind (2026-10-18/19, Kubernetes v1.36.1), controller in `dryRun: false`:**
 
 - **`IT-04` events.** The API server accepted every `events.k8s.io/v1` object the controller wrote: `ScaledUp`,
   `ScaledDown`, `HoldCooldown`, `HoldStabilizationWindow`, `HoldPendingPods`, `HoldAtMaxReplicas`,
@@ -390,13 +390,27 @@ E2E runs are not, and the split is worth stating precisely rather than reporting
   estimator does not model ([resource-calculation § 6](resource-calculation.md#6-predicates-modelled-and-predicates-ignored)),
   so the controller scaled 1 → 5 into three workers. `HoldPendingPods` fired on the next reconcile; after 2m1s
   `RevertPendingPods` took 5 → 3, removing only the two stuck replicas, through the scale subresource;
-  `kss_pending_pod_remediations_total{action="revert"}` counted it once.
+  `kss_pending_pod_remediations_total{action="revert"}` counted it once. The same setup under `freeze`
+  (2 → 6, three pods stuck) and `none` (1 → 4, one pod stuck) raised `PodPendingTimeout` after 2m0s, wrote
+  nothing, kept holding scale-ups, and counted `action="freeze"` and `action="none"` once each.
+- **`IT-15` scheduled but never Ready.** An invalid `NORMALIZER_COST_ROUNDS` in `normalizer-config` made every
+  new pod exit at startup (`CrashLoopBackOff` rather than the test plan's `ImagePullBackOff`; the controller
+  sees the same signal, scheduled and not Ready), while the one running pod kept serving. The controller
+  scaled 1 → 2 → 6 while the broken pods were young, then settled at 6. After `podStartupTimeout`, demand was
+  raised above 6 and every reconcile returned `HoldUnhealthyPods` with no write, emitting `PodStartupFailure`
+  ("5 pods scheduled but not Ready for 5m54s"); the broken replicas were not reverted. Raising demand took a
+  configuration change: with one working pod at its CPU limit the utilization signal saturates at
+  ⌈1 × 400 / 70⌉ = 6, and in `MODE=http` the backlog is bounded by the load generator's concurrency, so the
+  run lowered `itemsPerReplica` from 40 to 10 instead of growing the backlog. G5′ only matters once demand
+  exceeds the current count, which in this state only the backlog signal can cause.
 - **`IT-08` quota.** With a `ResourceQuota` one pod above the namespace's count, a 3 → 7 scale-up created one
   pod and left three replicas unmaterialised with no Pending pod; `HoldPendingPods` named them, and after 2m0s
   the revert took 7 → 4.
 - **Deletion cost.** Annotations were written to every Ready pod before each scale-down, with zero failures,
-  and unchanged values were skipped. Victim selection by differing costs was not observed: any load heavy
-  enough to give pods different costs also kept demand too high to scale down.
+  and unchanged values were skipped. Victim selection by differing costs could not be observed through the
+  controller: any load heavy enough to give pods different costs also kept demand too high to scale down. With
+  hand-set costs (300, −50, 1000, 20) on four Ready pods and three scale-downs to 1, the ReplicaSet removed
+  the lowest remaining cost each time and kept the 1000 pod.
 
 **Found by the live run and fixed:** a watchdog revert armed the backoff, the scale-up after it cleared the
 backoff on writing, and the next revert armed it at the initial interval again — so under sustained demand the
